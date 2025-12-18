@@ -9,7 +9,6 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use constant_time_eq::constant_time_eq;
-use hex;
 use http::header::AUTHORIZATION;
 use pingora::protocols::http::ServerSession;
 use time::{
@@ -188,7 +187,7 @@ pub fn validate_sigv4(sess: &ServerSession) -> Result<String> {
         tracing::info!("sign hdr {}: {}", k, v);
     }
 
-    
+
     // 6. Payload: support UNSIGNED-PAYLOAD and precomputed hashes
     let payload_header = req
         .headers

@@ -17,11 +17,42 @@ impl ServeHttp for S3ProxyApp {
     async fn response(&self, sess: &mut ServerSession) -> Response<Vec<u8>> {
         match sigv4::validate_sigv4(sess) {
             Ok(user_id) => {
-                // SigV4 OK
-                let body = format!("SigV4 OK, mapped to: {user_id}\n");
+                // Simple routing:
+                let req = sess.req_header();
+
+                tracing::info!("Signed for user {user_id}");
+
+                // --- Case 1: ListBuckets (GET /)
+                if req.method == "GET" && req.uri.path() == "/" {
+                    let body = r#"<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner>
+    <ID>{user_id}</ID>
+    <DisplayName>{user_id}</DisplayName>
+  </Owner>
+  <Buckets>
+    <Bucket>
+      <Name>dummy-bucket</Name>
+      <CreationDate>2025-01-01T00:00:00.000Z</CreationDate>
+    </Bucket>
+  </Buckets>
+</ListAllMyBucketsResult>"#;
+
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/xml")
+                        .header("Connection", "close")
+                        .body(body.as_bytes().to_vec())
+                        .unwrap();
+                }
+
+                // --- Default dummy response for now:
+                let body = format!(
+                    "<DummyResponse><User>{}</User><OK>true</OK></DummyResponse>\n",
+                    user_id,
+                );
                 Response::builder()
                     .status(StatusCode::OK)
-                    .header("Content-Type", "text/plain")
+                    .header("Content-Type", "application/xml")
                     .body(body.into_bytes())
                     .unwrap()
             }
