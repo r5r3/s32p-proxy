@@ -37,11 +37,14 @@ impl ServeHttp for S3ProxyApp {
   </Buckets>
 </ListAllMyBucketsResult>"#;
 
+                    let body_bytes = body.as_bytes().to_vec();
+                    let len = body_bytes.len().to_string();
+
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/xml")
-                        .header("Connection", "close")
-                        .body(body.as_bytes().to_vec())
+                        .header("Content-Length", len)
+                        .body(body_bytes)
                         .unwrap();
                 }
 
