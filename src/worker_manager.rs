@@ -203,33 +203,40 @@ impl WorkerManager {
     }
 
     async fn spawn_worker(&self, user: &UserRecord) -> Result<Arc<WorkerHandle>> {
-        // Pick a local port (best-effort). Race is acceptable for now.
         let port = pick_free_port().context("failed to pick a free local port")?;
         let addr: SocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .map_err(|e| anyhow!("bad addr: {e}"))?;
 
+        let euid_is_root = unsafe { libc::geteuid() == 0 };
+
         let mut cmd = Command::new(&self.cfg.restricted_exec);
-        //cmd.arg("--user")
-        //    .arg(&user.username)
+
+        if euid_is_root {
+            tracing::debug!(
+                uid = user.uid,
+                username = user.username.as_str(),
+                "running as root: passing --user to restricted-exec"
+            );
+            cmd.arg("--user").arg(&user.username);
+        } else {
+            tracing::debug!(
+                uid = user.uid,
+                username = user.username.as_str(),
+                "not running as root: launching without --user (worker runs as current user)"
+            );
+        }
+
         cmd.arg("--")
             .arg(&self.cfg.versitygw)
             .arg("--port")
-            .arg(format!("127.0.0.1:{port}"));
-
-        // Shared config/root:
-        // VersityGW quickstart uses: versitygw --port :10000 posix /path/to/root
-        // We'll do: ... posix <posix_root>
-        cmd.args(&self.cfg.extra_versity_args)
+            .arg(format!("127.0.0.1:{port}"))
+            .args(&self.cfg.extra_versity_args)
             .arg("posix")
-            .arg(&self.cfg.posix_root);
-
-        // Credentials for this per-user worker:
-        cmd.env("ROOT_ACCESS_KEY", &user.access_key)
-            .env("ROOT_SECRET_KEY", &user.secret_key);
-
-        // Don't inherit stdin; capture stderr for debugging if needed.
-        cmd.stdin(Stdio::null())
+            .arg(&self.cfg.posix_root)
+            .env("ROOT_ACCESS_KEY", &user.access_key)
+            .env("ROOT_SECRET_KEY", &user.secret_key)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -243,9 +250,7 @@ impl WorkerManager {
             child: Mutex::new(child),
         });
 
-        // Wait until TCP accepts connections (small grace window)
         wait_until_ready(addr, Duration::from_secs(2)).await?;
-
         Ok(handle)
     }
 
