@@ -32,3 +32,7 @@ constant_time_eq = "0.4"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# others
+dashmap = "6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "sync"] }
+
