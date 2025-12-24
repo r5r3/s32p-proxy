@@ -83,9 +83,39 @@ pub fn parse_authorization(req: &RequestHeader) -> Result<SigV4Auth> {
     })
 }
 
-/// Cheap routing helper: parse only access key (no signature check)
+/// Cheap routing helper: extract only the access key from Authorization header.
+/// (No SigV4 validation, no SignedHeaders parsing.)
 pub fn extract_access_key(req: &RequestHeader) -> Result<String> {
-    Ok(parse_authorization(req)?.access_key)
+    let auth = req
+        .headers
+        .get("authorization")
+        .ok_or_else(|| anyhow!("missing Authorization"))?
+        .to_str()
+        .map_err(|_| anyhow!("bad Authorization"))?;
+
+    // Look for "Credential=.../YYYYMMDD/region/service/aws4_request"
+    let cred_pos = auth
+        .find("Credential=")
+        .ok_or_else(|| anyhow!("missing Credential in Authorization"))?;
+    let after = &auth[cred_pos + "Credential=".len()..];
+
+    // Credential value ends at ',' or whitespace
+    let end = after
+        .find(|c: char| c == ',' || c.is_whitespace())
+        .unwrap_or(after.len());
+    let cred_val = &after[..end];
+
+    // Access key is the first segment before '/'
+    let access_key = cred_val
+        .split('/')
+        .next()
+        .ok_or_else(|| anyhow!("bad Credential value"))?;
+
+    if access_key.is_empty() {
+        return Err(anyhow!("empty access key in Credential"));
+    }
+
+    Ok(access_key.to_string())
 }
 
 /// Verify SigV4 *without reading the body*, using client x-amz-content-sha256.

@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 # Pingora stack
-pingora        = "0.6"
-pingora-core   = "0.6"
-pingora-http   = "0.6"
+pingora = { version = "0.6.0", features = ["proxy"] }
+bytes = "1"
 
 # HTTP types (align with Pingora's http 1.x)
 http           = "1"
