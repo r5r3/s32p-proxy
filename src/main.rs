@@ -15,6 +15,7 @@ mod responses;
 mod sigv4;
 mod user_db;
 mod worker_manager;
+mod classifier;
 
 use user_db::{UserDb, UserRecord};
 use worker_manager::{WorkerHandle, WorkerManager, WorkerManagerConfig};
@@ -57,7 +58,17 @@ impl ProxyHttp for S3ProxyApp {
         self.workers.start_sweeper();
 
         let start = Instant::now();
+
+        // IMPORTANT: clone header so we don't hold an immutable borrow of `session`
         let req: RequestHeader = session.req_header().clone();
+
+        // Classify each request (no body required)
+        let class = classifier::classify(&req);
+        if let Some(reason) = classifier::not_implemented_reason(&class) {
+            tracing::debug!(?class, reason, "request classified as not implemented (will validate first)");
+        } else {
+            tracing::debug!(?class, "request classified");
+        }
 
         let method = req.method.as_str();
         let path = req.uri.path();
@@ -116,6 +127,17 @@ impl ProxyHttp for S3ProxyApp {
         };
         ctx.set_user(&user);
 
+        // 2b) If this request is currently "NotImplemented": validate first, then reply NotImplemented.
+        if let Some(reason) = classifier::not_implemented_reason(&class) {
+            // Validate first. Only reply NotImplemented if request is valid.
+            if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
+                return Ok(true); // already responded with auth/signature error
+            }
+
+            responses::respond_not_implemented(session, reason, Some(req.uri.path()), None).await?;
+            return Ok(true);
+        }
+
         // 3) If worker already running: NO proxy-side SigV4 verify (just route)
         if let Some(h) = self.workers.get_running(user.uid).await {
             h.touch();
@@ -133,45 +155,8 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 4) Worker not running: parse full Authorization + verify header-only before spawn
-        let auth = match sigv4::parse_authorization(&req) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(uid = user.uid, error = %e, "failed to parse Authorization");
-                responses::respond_s3_error(
-                    session,
-                    StatusCode::FORBIDDEN,
-                    responses::error_code::ACCESS_DENIED,
-                    &e.to_string(),
-                    Some(req.uri.path()),
-                    None,
-                )
-                .await?;
-                return Ok(true);
-            }
-        };
-
-        if let Err(e) = sigv4::verify_sigv4_header_only(
-            &req,
-            &auth,
-            &user.secret_key,
-            &self.public_scheme,
-        ) {
-            tracing::warn!(
-                uid = user.uid,
-                username = user.username.as_str(),
-                error = %e,
-                "sigv4 header-only verification failed; rejecting without spawning worker"
-            );
-            responses::respond_s3_error(
-                session,
-                StatusCode::FORBIDDEN,
-                responses::error_code::SIGNATURE_DOES_NOT_MATCH,
-                &e.to_string(),
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-            return Ok(true);
+        if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
+            return Ok(true); // already responded with auth/signature error, no spawn
         }
 
         // 5) Start worker on demand
@@ -298,6 +283,53 @@ impl ProxyHttp for S3ProxyApp {
             );
         }
     }
+}
+
+async fn validate_sigv4_header_only_or_reject(
+    session: &mut Session,
+    req: &RequestHeader,
+    user: &UserRecord,
+    public_scheme: &str,
+) -> PResult<bool> {
+    // Parse full Authorization (for SignedHeaders/scope/region/service/signature)
+    let auth = match sigv4::parse_authorization(req) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(uid = user.uid, error = %e, "failed to parse Authorization");
+            responses::respond_s3_error(
+                session,
+                StatusCode::FORBIDDEN,
+                responses::error_code::ACCESS_DENIED,
+                &e.to_string(),
+                Some(req.uri.path()),
+                None,
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+
+    // Validate header-only SigV4 using client x-amz-content-sha256
+    if let Err(e) = sigv4::verify_sigv4_header_only(req, &auth, &user.secret_key, public_scheme) {
+        tracing::warn!(
+            uid = user.uid,
+            username = user.username.as_str(),
+            error = %e,
+            "sigv4 header-only verification failed"
+        );
+        responses::respond_s3_error(
+            session,
+            StatusCode::FORBIDDEN,
+            responses::error_code::SIGNATURE_DOES_NOT_MATCH,
+            &e.to_string(),
+            Some(req.uri.path()),
+            None,
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    Ok(false) // valid
 }
 
 fn main() -> Result<()> {

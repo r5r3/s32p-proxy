@@ -39,4 +39,5 @@ libc = "0.2"
 # for responses
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.38", features = ["serialize"] }
+url = "2"
 
