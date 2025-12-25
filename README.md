@@ -1,8 +1,8 @@
 # s3-proxy-manager
 
-`s3-proxy-manager` is a **Rust-based S3-compatible proxy and manager** built on top of **Cloudflare Pingora**. It authenticates incoming S3 requests using **AWS Signature Version 4 (SigV4)**, maps S3 identities to **Unix users**, and routes requests to **per-user S3 gateway workers** (e.g. VersityGW) that access a **shared POSIX filesystem** with kernel-enforced permissions.
+`s3-proxy-manager` is a **Rust-based S3-compatible proxy + worker manager** built on **Cloudflare Pingora**. It accepts S3 client requests, maps S3 identities to **Unix users**, and routes traffic to **per-user VersityGW workers** that expose a **shared POSIX filesystem** with kernel-enforced permissions.
 
-The project is designed to safely expose a POSIX filesystem via the S3 API while preserving Unix security semantics.
+A central design goal is to preserve Unix security semantics: **all filesystem access happens inside a process already running as the target Unix user**.
 
 ---
 
@@ -11,8 +11,9 @@ The project is designed to safely expose a POSIX filesystem via the S3 API while
 * Provide an **S3-compatible endpoint** backed by a POSIX filesystem
 * Enforce **per-user isolation using Unix UIDs/GIDs** (kernel-level security)
 * Support **standard S3 clients** (AWS CLI, MinIO client, SDKs)
-* Start **one S3 gateway worker per user on demand**
-* Keep the proxy logic and filesystem access **cleanly separated**
+* Start **one VersityGW per user on demand**, then reuse it
+* Prevent easy **DoS via worker spawn storms**
+* Keep the proxy (auth/routing/management) separate from storage I/O
 
 ---
 
@@ -22,60 +23,75 @@ The project is designed to safely expose a POSIX filesystem via the S3 API while
         ┌──────────────┐
         │  S3 Clients  │  (aws cli, mc, SDKs)
         └──────┬───────┘
-               │  HTTPS / HTTP
+               │  HTTP(S)
                ▼
-┌─────────────────────────────────┐
-│        s3-proxy-manager         │
-│  (Pingora-based Rust service)   │
-│                                 │
-│  • SigV4 validation             │
-│  • S3 request routing           │
-│  • access_key → uid mapping     │
-│  • worker lifecycle management  │
-└──────────────┬──────────────────┘
-               │ internal HTTP
+┌──────────────────────────────────────┐
+│           s3-proxy-manager           │
+│       (Pingora-based Rust proxy)     │
+│                                      │
+│  • access_key → unix user mapping    │
+│  • spawn & supervise per-user worker │
+│  • gate worker spawn with SigV4      │
+│    header-only validation            │
+│  • reverse proxy to worker           │
+│  • optional response header rewriting│
+└──────────────┬───────────────────────┘
+               │ internal HTTP (loopback)
                ▼
-   ┌──────────────────────────┐
-   │  Per-user S3 workers     │   (e.g. VersityGW)
-   │  running as Unix users   │
-   │  uid=1001, uid=1002, …   │
-   └──────────────┬───────────┘
+   ┌──────────────────────────────┐
+   │    Per-user VersityGW        │
+   │  (unmodified, validates SigV4│
+   │   again, runs as unix user)  │
+   │   uid=1001, uid=1002, …      │
+   └──────────────┬───────────────┘
                   │ POSIX syscalls
                   ▼
-        ┌──────────────────────┐
-        │  Shared POSIX FS     │
-        │  (/srv/s3root/…)     │
-        └──────────────────────┘
+        ┌────────────────────────┐
+        │     Shared POSIX FS    │
+        │       (/tmp/s3 …)      │
+        └────────────────────────┘
 ```
 
 ### Key idea
 
-> **All filesystem access is performed by processes already running as the target Unix user.**
+> **All filesystem access is performed by the per-user worker process running as the corresponding Unix user.**
 
-The proxy never performs filesystem I/O itself and never switches UID per request.
+`s3-proxy-manager` does not perform filesystem I/O.
 
 ---
 
-## Current Status
+## Current Status (December 2025)
 
-**Implemented:**
+### Implemented
 
-* Pingora-based HTTP server
-* Full AWS SigV4 request validation
-* Compatible with MinIO client (`mc`) and AWS-style tooling
-* Correct handling of:
+* **User mapping**: `access_key → {username, uid, gid, secret_key}` (currently demo in-memory DB)
+* **Worker lifecycle management**
 
-  * `GET /` (ListBuckets)
-  * Request framing (`Content-Length`)
-* Clean request logging and debugging support
+  * On-demand worker start (singleflight per uid)
+  * Starts workers via: `restricted-exec --user USERNAME -- versitygw ...`
 
-**In progress / planned:**
+    * The `--user` flag is only passed when the proxy runs as **root**
+  * Loopback binding for workers (`127.0.0.1:<port>`)
+  * Worker readiness probing (connect loop)
+  * Idle shutdown after **10 minutes**
+  * Background sweeper that removes dead workers from the registry
+* **SigV4 spawn gating**
 
-* On-demand spawning of per-user S3 gateway workers
-* Reverse proxying requests to workers
-* Full S3 API coverage (ListObjectsV2, PUT/GET objects, etc.)
-* Persistent user/account configuration
-* Production hardening (timeouts, limits, TLS)
+  * If a worker is **not running**, the proxy performs **header-only SigV4 verification** using the client-supplied `x-amz-content-sha256` (no request-body buffering) before spawning
+  * If a worker **is running**, the proxy only extracts the access key for routing; the worker (VersityGW) remains the authoritative validator
+* **Logging & debugging** for request flow, worker lifecycle, and failures
+
+### In progress
+
+* **Streaming reverse proxying** to workers (Pingora proxy mode), preserving SigV4-critical headers (especially `Host`) and streaming request/response bodies
+* **Response customization hooks** (e.g., add/remove/replace headers; later potentially rewrite some XML bodies)
+
+### Planned
+
+* Persistent configuration (file/DB) for users and per-user worker settings
+* Better limits/rate controls (max workers, max concurrent starts, negative caching of failures)
+* TLS termination options and forwarding policy
+* Production hardening (timeouts, observability, metrics)
 
 ---
 
@@ -83,26 +99,22 @@ The proxy never performs filesystem I/O itself and never switches UID per reques
 
 Pingora provides:
 
-* High-performance async HTTP handling
-* Backpressure-aware streaming
+* High-performance async HTTP proxying
+* Backpressure-aware streaming (important for large S3 objects)
 * A clean Rust-native service model
-* Fine-grained control over request parsing and routing
-
-This makes it a good fit for implementing an S3-compatible control plane.
+* Fine-grained control over request routing and response filtering
 
 ---
 
 ## Why per-user workers?
 
-S3 has no native concept of Unix users, but POSIX does.
-
-Instead of emulating permissions in userspace, this project relies on the kernel:
+S3 has no native concept of Unix users, but POSIX does. Instead of emulating permissions in userspace, this project relies on the kernel:
 
 * Each worker process runs as a **single Unix UID/GID**
-* The kernel enforces file permissions automatically
-* Bugs in one worker cannot affect another user’s data
+* The kernel enforces permissions automatically
+* Bugs in one worker are contained to that user’s OS permissions
 
-This avoids the complexity and risk of per-request `setuid()` or `setfsuid()` switching.
+This avoids risky per-request UID switching inside a shared process.
 
 ---
 
@@ -111,20 +123,17 @@ This avoids the complexity and risk of per-request `setuid()` or `setfsuid()` sw
 A typical shared POSIX root looks like:
 
 ```
-/srv/s3root/
+/tmp/s3/
   alice/
   bob/
-  service-x/
 ```
 
-With permissions such as:
+Example permissions:
 
 ```bash
-chown alice:alice /srv/s3root/alice
-chmod 700 /srv/s3root/alice
+chown alice:alice /tmp/s3/alice
+chmod 700 /tmp/s3/alice
 ```
-
-Each user’s S3 buckets live inside their own subtree.
 
 ---
 
@@ -139,51 +148,45 @@ cargo build
 ## Running (development)
 
 ```bash
-cargo run
+RUST_LOG=s3_proxy_manager=debug cargo run
 ```
 
-By default, the proxy listens on:
+Default listener:
 
 ```
 http://localhost:9000
 ```
+
+Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`).
 
 ---
 
 ## Testing with MinIO Client
 
 ```bash
-mc alias set S3PM http://localhost:9000 TESTACCESSKEY123 TESTSECRETKEY456
-mc ls S3PM
+mcli alias set S3PM http://localhost:9000 TESTACCESSKEY123 TESTSECRETKEY456
+mcli ls --debug S3PM
 ```
 
-You should see the dummy bucket response immediately.
+Notes:
 
----
-
-## Configuration (planned)
-
-Future versions will support:
-
-* Declarative mapping of `access_key → uid/gid`
-* Configurable worker commands (e.g. VersityGW)
-* Idle timeouts for worker shutdown
-* TLS termination and forwarding headers
+* The proxy **may** validate SigV4 (header-only) on the first request to gate worker startup.
+* VersityGW will validate SigV4 again.
 
 ---
 
 ## Security Notes
 
-* The proxy should start with enough privilege to spawn workers as different users
-* After startup, it should drop privileges where possible
-* Workers should **never** run as root
-* POSIX permissions are the primary security boundary
+* Run the proxy as **root** if you want `restricted-exec --user` to switch to the target Unix user.
+* If the proxy is not root, workers will start as the proxy’s user (development convenience).
+* Workers should never run as root in production.
+* Keep worker listeners loopback-only (or move to Unix domain sockets later).
 
 ---
 
 ## Non-Goals
 
-* Reimplementing a full object store
+* Reimplement an object store
 * Userspace permission checks
 * Multi-tenant access within a single worker process
 
@@ -191,7 +194,7 @@ Future versions will support:
 
 ## License
 
-TBD (choose MIT / Apache-2.0 / etc.)
+TBD
 
 ---
 
@@ -199,14 +202,12 @@ TBD (choose MIT / Apache-2.0 / etc.)
 
 * Cloudflare Pingora
 * AWS SigV4 specification
-* MinIO client and ecosystem
+* MinIO client ecosystem
 * VersityGW
 
 ---
 
 ## Project Direction
 
-`s3-proxy-manager` is intended as a **control plane** and **security boundary**, not a storage backend.
-
-If you want a POSIX filesystem exposed safely over S3 — while respecting Unix users — this project aims to provide the missing glue.
+`s3-proxy-manager` is the **control plane** (auth/routing/worker lifecycle) for per-user S3 access to a shared filesystem. VersityGW remains the storage-facing component and continues to perform the authoritative SigV4 validation.
 
