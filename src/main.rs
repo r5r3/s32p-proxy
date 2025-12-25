@@ -1,6 +1,5 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use bytes::Bytes;
 
 use pingora::http::{RequestHeader, ResponseHeader, StatusCode};
 use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
@@ -12,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod responses;
 mod sigv4;
 mod user_db;
 mod worker_manager;
@@ -57,7 +57,7 @@ impl ProxyHttp for S3ProxyApp {
         self.workers.start_sweeper();
 
         let start = Instant::now();
-        let req: &RequestHeader = session.req_header();
+        let req: RequestHeader = session.req_header().clone();
 
         let method = req.method.as_str();
         let path = req.uri.path();
@@ -80,11 +80,19 @@ impl ProxyHttp for S3ProxyApp {
         );
 
         // 1) Extract access key cheaply (no SigV4 check yet)
-        let access_key = match sigv4::extract_access_key(req) {
+        let access_key = match sigv4::extract_access_key(&req) {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to extract access key");
-                reject_xml(session, StatusCode::FORBIDDEN, "AccessDenied", &e.to_string()).await?;
+                responses::respond_s3_error(
+                    session,
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::ACCESS_DENIED,
+                    &e.to_string(),
+                    Some(req.uri.path()),
+                    None,
+                )
+                .await?;
                 return Ok(true);
             }
         };
@@ -94,11 +102,13 @@ impl ProxyHttp for S3ProxyApp {
             Some(u) => u.clone(),
             None => {
                 tracing::warn!(access_key = access_key.as_str(), "unknown access key");
-                reject_xml(
+                responses::respond_s3_error(
                     session,
                     StatusCode::FORBIDDEN,
-                    "InvalidAccessKeyId",
+                    responses::error_code::INVALID_ACCESS_KEY_ID,
                     "unknown access key",
+                    Some(req.uri.path()),
+                    None,
                 )
                 .await?;
                 return Ok(true);
@@ -123,17 +133,25 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 4) Worker not running: parse full Authorization + verify header-only before spawn
-        let auth = match sigv4::parse_authorization(req) {
+        let auth = match sigv4::parse_authorization(&req) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(uid = user.uid, error = %e, "failed to parse Authorization");
-                reject_xml(session, StatusCode::FORBIDDEN, "AccessDenied", &e.to_string()).await?;
+                responses::respond_s3_error(
+                    session,
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::ACCESS_DENIED,
+                    &e.to_string(),
+                    Some(req.uri.path()),
+                    None,
+                )
+                .await?;
                 return Ok(true);
             }
         };
 
         if let Err(e) = sigv4::verify_sigv4_header_only(
-            req,
+            &req,
             &auth,
             &user.secret_key,
             &self.public_scheme,
@@ -144,11 +162,13 @@ impl ProxyHttp for S3ProxyApp {
                 error = %e,
                 "sigv4 header-only verification failed; rejecting without spawning worker"
             );
-            reject_xml(
+            responses::respond_s3_error(
                 session,
                 StatusCode::FORBIDDEN,
-                "SignatureDoesNotMatch",
+                responses::error_code::SIGNATURE_DOES_NOT_MATCH,
                 &e.to_string(),
+                Some(req.uri.path()),
+                None,
             )
             .await?;
             return Ok(true);
@@ -164,11 +184,13 @@ impl ProxyHttp for S3ProxyApp {
                     error = %e,
                     "failed to start worker"
                 );
-                reject_xml(
+                responses::respond_s3_error(
                     session,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "ServiceUnavailable",
+                    responses::error_code::SERVICE_UNAVAILABLE,
                     &format!("failed to start worker: {e:#}"),
+                    Some(req.uri.path()),
+                    None,
                 )
                 .await?;
                 return Ok(true);
@@ -203,7 +225,7 @@ impl ProxyHttp for S3ProxyApp {
 
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PResult<()>
@@ -278,31 +300,6 @@ impl ProxyHttp for S3ProxyApp {
     }
 }
 
-async fn reject_xml(
-    session: &mut Session,
-    status: StatusCode,
-    code: &str,
-    message: &str,
-) -> PResult<()> {
-    // Avoid draining big bodies on auth failures: close the connection after response
-    session.set_keepalive(None);
-    session.set_close_on_response_before_downstream_finish(true);
-
-    let body = format!(
-        r#"<Error>
-  <Code>{}</Code>
-  <Message>{}</Message>
-</Error>"#,
-        code, message
-    );
-
-    let mut resp = ResponseHeader::build(status, Some(body.len()))?;
-    resp.insert_header("Content-Type", "application/xml")?;
-
-    session.write_error_response(resp, Bytes::from(body)).await?;
-    Ok(())
-}
-
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
@@ -335,4 +332,3 @@ fn main() -> Result<()> {
     tracing::info!("s3-proxy-manager listening on 0.0.0.0:9000");
     server.run_forever();
 }
-
