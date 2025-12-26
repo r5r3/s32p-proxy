@@ -24,7 +24,8 @@ use worker_manager::{WorkerHandle, WorkerManager};
 struct S3ProxyApp {
     user_db: UserDb,
     workers: Arc<WorkerManager>,
-    public_scheme: String, // "http" in dev; "https" behind TLS
+    public_scheme: String, // from config.server.public_scheme
+    routing: config::RoutingConfig,
 }
 
 #[derive(Clone, Default)]
@@ -33,6 +34,8 @@ struct ProxyCtx {
     username: Option<String>,
     // Preserve original host EXACTLY (important for SigV4 verification in worker)
     orig_host: Option<String>,
+    // Selected worker profile (used as part of worker key)
+    worker_profile: Option<String>,
     // Selected upstream (per-user worker)
     upstream: Option<SocketAddr>,
     // Optional handle (for touch/logging)
@@ -43,6 +46,14 @@ impl ProxyCtx {
     fn set_user(&mut self, user: &UserRecord) {
         self.uid = Some(user.uid);
         self.username = Some(user.username.clone());
+    }
+}
+
+fn class_key(class: &classifier::S3RequestClass) -> &'static str {
+    match &class.op {
+        classifier::S3Op::Multipart(_) => "multipart",
+        classifier::S3Op::Versioning(_) => "versioning",
+        classifier::S3Op::Other => "other",
     }
 }
 
@@ -63,13 +74,19 @@ impl ProxyHttp for S3ProxyApp {
         // IMPORTANT: clone header so we don't hold an immutable borrow of `session`
         let req: RequestHeader = session.req_header().clone();
 
-        // Classify each request (no body required)
+        // Classify (no body required)
         let class = classifier::classify(&req);
-        if let Some(reason) = classifier::not_implemented_reason(&class) {
-            tracing::debug!(?class, reason, "request classified as not implemented (will validate first)");
-        } else {
-            tracing::debug!(?class, "request classified");
-        }
+        let key = class_key(&class);
+
+        // Determine route action from config
+        let action = self.routing.class_map.get(key).ok_or_else(|| {
+            Error::explain(
+                ErrorType::InternalError,
+                format!("no routing configured for class '{key}'"),
+            )
+        })?;
+
+        tracing::debug!(?class, class_key = key, ?action, "classified request and selected route action");
 
         let method = req.method.as_str();
         let path = req.uri.path();
@@ -128,18 +145,23 @@ impl ProxyHttp for S3ProxyApp {
         };
         ctx.set_user(&user);
 
-        // 2b) If this request is currently "NotImplemented": validate first, then reply NotImplemented.
-        if let Some(reason) = classifier::not_implemented_reason(&class) {
-            // Validate first. Only reply NotImplemented if request is valid.
+        // 2b) If routing says NotImplemented: validate first, then reply NotImplemented.
+        if let config::RouteAction::NotImplemented { message } = action {
+            // Only send NotImplemented for VALID requests.
             if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
                 return Ok(true); // already responded with auth/signature error
             }
 
-            responses::respond_not_implemented(session, reason, Some(req.uri.path()), None).await?;
+            responses::respond_not_implemented(session, message, Some(req.uri.path()), None).await?;
             return Ok(true);
         }
 
-        let profile = "versitygw-default"; // later: selected from routing config
+        // 2c) Routing says Proxy: select worker profile
+        let profile = match action {
+            config::RouteAction::Proxy { worker_profile } => worker_profile.as_str(),
+            config::RouteAction::NotImplemented { .. } => unreachable!(),
+        };
+        ctx.worker_profile = Some(profile.to_string());
 
         // 3) If worker already running: NO proxy-side SigV4 verify (just route)
         if let Some(h) = self.workers.get_running(user.uid, profile).await {
@@ -150,6 +172,7 @@ impl ProxyHttp for S3ProxyApp {
             tracing::debug!(
                 uid = user.uid,
                 username = user.username.as_str(),
+                profile = profile,
                 addr = %ctx.upstream.unwrap(),
                 elapsed_ms = start.elapsed().as_millis(),
                 "worker already running; routing without proxy-side sigv4 verify"
@@ -157,18 +180,19 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(false);
         }
 
-        // 4) Worker not running: parse full Authorization + verify header-only before spawn
+        // 4) Worker not running: verify header-only before spawn
         if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
             return Ok(true); // already responded with auth/signature error, no spawn
         }
 
-        // 5) Start worker on demand
+        // 5) Start worker on demand (profile-specific)
         let h = match self.workers.ensure_running(&user, profile).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(
                     uid = user.uid,
                     username = user.username.as_str(),
+                    profile = profile,
                     error = %e,
                     "failed to start worker"
                 );
@@ -192,6 +216,7 @@ impl ProxyHttp for S3ProxyApp {
         tracing::info!(
             uid = user.uid,
             username = user.username.as_str(),
+            profile = profile,
             addr = %ctx.upstream.unwrap(),
             elapsed_ms = start.elapsed().as_millis(),
             "worker started; routing request"
@@ -232,11 +257,9 @@ impl ProxyHttp for S3ProxyApp {
         upstream_request.remove_header("te");
         upstream_request.remove_header("upgrade");
 
-        // (Optional) if you add any headers here, be careful:
-        // adding/removing a header that appears in SignedHeaders will break SigV4 in versitygw.
-
         tracing::debug!(
             uid = ctx.uid.unwrap_or(0),
+            profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
             upstream = %ctx.upstream.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
             "sending request upstream"
         );
@@ -253,11 +276,9 @@ impl ProxyHttp for S3ProxyApp {
     where
         Self::CTX: Send + Sync,
     {
-        // Example “future requirement”: modify headers here.
-        // (This is safe and doesn’t affect SigV4: response isn’t signed.)
+        // Response is not signed; safe to modify headers here.
         upstream_response.insert_header("Server", "s3-proxy-manager")?;
         upstream_response.remove_header("alt-svc");
-
         Ok(())
     }
 
@@ -271,6 +292,7 @@ impl ProxyHttp for S3ProxyApp {
             tracing::warn!(
                 uid = ctx.uid.unwrap_or(0),
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
+                profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
                 error = %err,
                 "{}",
@@ -280,6 +302,7 @@ impl ProxyHttp for S3ProxyApp {
             tracing::info!(
                 uid = ctx.uid.unwrap_or(0),
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
+                profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
                 "{}",
                 session.request_summary()
@@ -343,21 +366,24 @@ fn main() -> Result<()> {
     let user_db = UserDb::demo();
 
     let cfg = config::Config::from_path("etc/s3-proxy-manager.yaml")?;
+    let listen = cfg.server.listen.clone();
+
     let workers = WorkerManager::new(cfg.workers.clone());
 
     let app = S3ProxyApp {
         user_db,
         workers,
-        public_scheme: "http".to_string(),
+        public_scheme: cfg.server.public_scheme.clone(),
+        routing: cfg.routing.clone(),
     };
 
     let mut server = Server::new(None)?;
     server.bootstrap();
 
     let mut proxy = http_proxy_service(&server.configuration, app);
-    proxy.add_tcp("0.0.0.0:9000");
+    proxy.add_tcp(&listen);
     server.add_service(proxy);
 
-    tracing::info!("s3-proxy-manager listening on 0.0.0.0:9000");
+    tracing::info!("s3-proxy-manager listening on {}", listen);
     server.run_forever();
 }
