@@ -21,10 +21,60 @@ pub struct ServerConfig {
     pub log: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// Path to a user database file (future); optional for now.
-    pub users_file: Option<String>,
+    /// Which directory backend to use.
+    #[serde(default)]
+    pub backend: AuthBackend,
+
+    /// YAML backend options
+    pub yaml: Option<YamlAuthConfig>,
+
+    /// OpenBao backend options (AppRole + KV v2 + indices)
+    pub openbao: Option<OpenBaoAuthConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthBackend {
+    Yaml,
+    OpenBao,
+}
+
+impl Default for AuthBackend {
+    fn default() -> Self {
+        AuthBackend::Yaml
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct YamlAuthConfig {
+    /// Path to the YAML directory file.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenBaoAuthConfig {
+    /// Base URL of OpenBao, e.g. "http://127.0.0.1:8200"
+    pub address: String,
+
+    /// Auth mount for AppRole, usually "approle"
+    #[serde(default = "default_approle_mount")]
+    pub approle_mount: String,
+
+    /// Files containing role_id/secret_id (recommended over inline secrets in YAML)
+    pub role_id_file: String,
+    pub secret_id_file: String,
+
+    /// KV v2 mount name, e.g. "secret"
+    pub kv_mount: String,
+
+    /// Prefix under that mount, e.g. "s3pm"
+    pub prefix: String,
+}
+
+fn default_approle_mount() -> String {
+    "approle".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +168,29 @@ impl Config {
                 return Err(anyhow!(
                     "server.public_scheme must be 'http' or 'https' (got '{other}')"
                 ))
+            }
+        }
+
+        match self.auth.backend {
+            AuthBackend::Yaml => {
+                let y = self.auth.yaml.as_ref().ok_or_else(|| anyhow::anyhow!(
+                    "auth.backend is 'yaml' but auth.yaml is missing"
+                ))?;
+                if y.path.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.yaml.path must not be empty"));
+                }
+            }
+            AuthBackend::OpenBao => {
+                let o = self.auth.openbao.as_ref().ok_or_else(|| anyhow::anyhow!(
+                    "auth.backend is 'open_bao'/'openbao' but auth.openbao is missing"
+                ))?;
+
+                if o.address.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.address must not be empty")); }
+                if o.approle_mount.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.approle_mount must not be empty")); }
+                if o.role_id_file.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.role_id_file must not be empty")); }
+                if o.secret_id_file.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.secret_id_file must not be empty")); }
+                if o.kv_mount.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.kv_mount must not be empty")); }
+                if o.prefix.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.prefix must not be empty")); }
             }
         }
 

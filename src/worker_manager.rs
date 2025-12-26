@@ -17,18 +17,18 @@ use tokio::{
 };
 
 use crate::config::{WorkerProfile, WorkersConfig};
-use crate::user_db::UserRecord;
+use crate::directory::types::UserDoc;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WorkerKey {
-    pub uid: u32,
+    pub access_key: String,
     pub profile: String,
 }
 
 impl WorkerKey {
-    pub fn new(uid: u32, profile: &str) -> Self {
+    pub fn new(access_key: &str, profile: &str) -> Self {
         Self {
-            uid,
+            access_key: access_key.to_string(),
             profile: profile.to_string(),
         }
     }
@@ -122,8 +122,8 @@ impl WorkerManager {
     }
 
     /// Returns Some(handle) if the worker is running and alive; otherwise None.
-    pub async fn get_running(&self, uid: u32, profile: &str) -> Option<Arc<WorkerHandle>> {
-        let key = WorkerKey::new(uid, profile);
+    pub async fn get_running(&self, access_key: &str, profile: &str) -> Option<Arc<WorkerHandle>> {
+        let key = WorkerKey::new(access_key, profile);
         let slot = self.slots.get(&key)?;
         let maybe = {
             let state = slot.state.lock().await;
@@ -146,8 +146,8 @@ impl WorkerManager {
     }
 
     /// Ensure a worker exists for (user, profile). Uses singleflight per key (concurrent callers wait).
-    pub async fn ensure_running(&self, user: &UserRecord, profile: &str) -> Result<Arc<WorkerHandle>> {
-        let key = WorkerKey::new(user.uid, profile);
+    pub async fn ensure_running(&self, user: &UserDoc, profile: &str) -> Result<Arc<WorkerHandle>> {
+        let key = WorkerKey::new(user.access_key.as_str(), profile);
 
         let slot = self
             .slots
@@ -210,7 +210,7 @@ impl WorkerManager {
         }
     }
 
-    async fn spawn_worker(&self, user: &UserRecord, profile_name: &str) -> Result<Arc<WorkerHandle>> {
+    async fn spawn_worker(&self, user: &UserDoc, profile_name: &str) -> Result<Arc<WorkerHandle>> {
         let profile = self
             .cfg
             .profiles
@@ -275,7 +275,7 @@ impl WorkerManager {
         let child = cmd.spawn().context("failed to spawn launcher/worker")?;
 
         let handle = Arc::new(WorkerHandle {
-            key: WorkerKey::new(user.uid, profile_name),
+            key: WorkerKey::new(user.access_key.as_str(), profile_name),
             username: user.username.clone(),
             addr,
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
@@ -317,7 +317,7 @@ impl WorkerManager {
             let last_used = h.last_used_unix();
             if now.saturating_sub(last_used) >= idle_secs {
                 tracing::info!(
-                    uid = h.key.uid,
+                    access_key = h.key.access_key.as_str(),
                     profile = h.key.profile.as_str(),
                     "idle timeout reached; terminating worker"
                 );

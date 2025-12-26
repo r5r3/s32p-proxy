@@ -6,7 +6,16 @@ server:
   log: "info"
 
 auth:
-  users_file: "/etc/s3pm/users.yaml"
+  backend: "yaml"
+  yaml:
+    path: "etc/directory.yaml"
+  openbao:
+    address: "http://127.0.0.1:8200"
+    approle_mount: "approle"
+    role_id_file: "/etc/s3pm/role_id"
+    secret_id_file: "/etc/s3pm/secret_id"
+    kv_mount: "secret"
+    prefix: "s3pm"
 
 workers:
   posix_root: "/tmp/s3"

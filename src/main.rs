@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use pingora::http::{RequestHeader, ResponseHeader, StatusCode};
@@ -10,19 +10,23 @@ use pingora::upstreams::peer::HttpPeer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use std::fs;
 
 mod responses;
 mod sigv4;
-mod user_db;
 mod worker_manager;
 mod classifier;
 mod config;
+mod directory;
 
-use user_db::{UserDb, UserRecord};
+use directory::Directory;
+use directory::types::UserDoc;
+use directory::yaml::YamlDirectory;
+use directory::openbao::OpenBaoDirectory;
 use worker_manager::{WorkerHandle, WorkerManager};
 
 struct S3ProxyApp {
-    user_db: UserDb,
+    directory: Arc<dyn Directory>,
     workers: Arc<WorkerManager>,
     public_scheme: String, // from config.server.public_scheme
     routing: config::RoutingConfig,
@@ -43,7 +47,7 @@ struct ProxyCtx {
 }
 
 impl ProxyCtx {
-    fn set_user(&mut self, user: &UserRecord) {
+    fn set_user(&mut self, user: &UserDoc) {
         self.uid = Some(user.uid);
         self.username = Some(user.username.clone());
     }
@@ -127,10 +131,12 @@ impl ProxyHttp for S3ProxyApp {
         };
 
         // 2) Map access key -> unix user
-        let user = match self.user_db.get(&access_key) {
-            Some(u) => u.clone(),
+        let user = match self.directory.user_by_access_key(&access_key).await.map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("directory error: {e:#}"))
+        })? {
+            Some(u) => u,
             None => {
-                tracing::warn!(access_key = access_key.as_str(), "unknown access key");
+                // InvalidAccessKeyId
                 responses::respond_s3_error(
                     session,
                     StatusCode::FORBIDDEN,
@@ -138,8 +144,7 @@ impl ProxyHttp for S3ProxyApp {
                     "unknown access key",
                     Some(req.uri.path()),
                     None,
-                )
-                .await?;
+                ).await?;
                 return Ok(true);
             }
         };
@@ -164,7 +169,7 @@ impl ProxyHttp for S3ProxyApp {
         ctx.worker_profile = Some(profile.to_string());
 
         // 3) If worker already running: NO proxy-side SigV4 verify (just route)
-        if let Some(h) = self.workers.get_running(user.uid, profile).await {
+        if let Some(h) = self.workers.get_running(user.access_key.as_str(), profile).await {
             h.touch();
             ctx.upstream = Some(h.addr);
             ctx.worker = Some(h);
@@ -314,7 +319,7 @@ impl ProxyHttp for S3ProxyApp {
 async fn validate_sigv4_header_only_or_reject(
     session: &mut Session,
     req: &RequestHeader,
-    user: &UserRecord,
+    user: &UserDoc,
     public_scheme: &str,
 ) -> PResult<bool> {
     // Parse full Authorization (for SignedHeaders/scope/region/service/signature)
@@ -362,16 +367,44 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
-
-    let user_db = UserDb::demo();
-
     let cfg = config::Config::from_path("etc/s3-proxy-manager.yaml")?;
+
+    // Build directory backend
+    let directory: Arc<dyn Directory> = match cfg.auth.backend {
+        config::AuthBackend::Yaml => {
+            let y = cfg.auth.yaml.as_ref().context("auth.yaml missing")?;
+            Arc::new(YamlDirectory::from_path(&y.path)?)
+        }
+        config::AuthBackend::OpenBao => {
+            let o = cfg.auth.openbao.as_ref().context("auth.openbao missing")?;
+
+            let role_id = fs::read_to_string(&o.role_id_file)
+                .with_context(|| format!("failed to read role_id_file {}", o.role_id_file))?
+                .trim()
+                .to_string();
+
+            let secret_id = fs::read_to_string(&o.secret_id_file)
+                .with_context(|| format!("failed to read secret_id_file {}", o.secret_id_file))?
+                .trim()
+                .to_string();
+
+            Arc::new(OpenBaoDirectory::new(
+                o.address.clone(),
+                o.approle_mount.clone(),
+                role_id,
+                secret_id,
+                o.kv_mount.clone(),
+                o.prefix.clone(),
+            ))
+        }
+    };
+
     let listen = cfg.server.listen.clone();
 
     let workers = WorkerManager::new(cfg.workers.clone());
 
     let app = S3ProxyApp {
-        user_db,
+        directory,
         workers,
         public_scheme: cfg.server.public_scheme.clone(),
         routing: cfg.routing.clone(),

@@ -1,0 +1,23 @@
+version: 1
+
+users:
+  - access_key: "TESTACCESSKEY123"
+    secret_key: "TESTSECRETKEY456"
+    username: "alice"
+    uid: 1001
+    gid: 1001
+
+buckets:
+  - id: "bkt-photos-alice"
+    name: "photos"
+    data_path: "/srv/s3/alice/photos"
+    acl:
+      - principal: { type: "access_key", access_key: "AKIA_ALICE_1" }
+        access: "read_write"
+
+  - id: "bkt-team"
+    name: "team"
+    data_path: "/srv/s3/team"
+    acl:
+      - principal: { type: "group_name", name: "s3-team" }
+        access: "read_write"
