@@ -16,21 +16,27 @@ use tokio::{
     time,
 };
 
+use crate::config::{WorkerProfile, WorkersConfig};
 use crate::user_db::UserRecord;
 
-#[derive(Clone, Debug)]
-pub struct WorkerManagerConfig {
-    pub restricted_exec: String,
-    pub versitygw: String,
-    pub posix_root: String,
-    pub extra_versity_args: Vec<String>,
-    pub idle_timeout: Duration,
-    pub sweep_interval: Duration,
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct WorkerKey {
+    pub uid: u32,
+    pub profile: String,
+}
+
+impl WorkerKey {
+    pub fn new(uid: u32, profile: &str) -> Self {
+        Self {
+            uid,
+            profile: profile.to_string(),
+        }
+    }
 }
 
 pub struct WorkerManager {
-    cfg: WorkerManagerConfig,
-    slots: DashMap<u32, Arc<WorkerSlot>>, // keyed by uid
+    cfg: WorkersConfig,
+    slots: DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (uid, worker_profile)
     sweeper_started: AtomicBool,
 }
 
@@ -46,7 +52,7 @@ enum SlotState {
 }
 
 pub struct WorkerHandle {
-    pub uid: u32,
+    pub key: WorkerKey,
     pub username: String,
     pub addr: SocketAddr,
     last_used_unix: AtomicU64,
@@ -80,16 +86,13 @@ impl WorkerHandle {
 
     pub async fn terminate(&self) {
         let mut child = self.child.lock().await;
-
-        // Try a graceful stop first (SIGKILL fallback).
-        // `kill()` on tokio Child is SIGKILL on Unix.
-        let _ = child.kill().await;
+        let _ = child.kill().await; // SIGKILL on Unix
         let _ = child.wait().await;
     }
 }
 
 impl WorkerManager {
-    pub fn new(cfg: WorkerManagerConfig) -> Arc<Self> {
+    pub fn new(cfg: WorkersConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             slots: DashMap::new(),
@@ -108,17 +111,20 @@ impl WorkerManager {
         }
 
         let mgr = Arc::clone(self);
+        let sweep_interval = Duration::from_secs(mgr.cfg.lifecycle.sweep_interval_secs);
+
         tokio::spawn(async move {
             loop {
-                time::sleep(mgr.cfg.sweep_interval).await;
+                time::sleep(sweep_interval).await;
                 mgr.sweep_once().await;
             }
         });
     }
 
     /// Returns Some(handle) if the worker is running and alive; otherwise None.
-    pub async fn get_running(&self, uid: u32) -> Option<Arc<WorkerHandle>> {
-        let slot = self.slots.get(&uid)?;
+    pub async fn get_running(&self, uid: u32, profile: &str) -> Option<Arc<WorkerHandle>> {
+        let key = WorkerKey::new(uid, profile);
+        let slot = self.slots.get(&key)?;
         let maybe = {
             let state = slot.state.lock().await;
             match &*state {
@@ -135,15 +141,17 @@ impl WorkerManager {
 
         // Worker died; remove slot.
         drop(slot);
-        self.slots.remove(&uid);
+        self.slots.remove(&key);
         None
     }
 
-    /// Ensure a worker exists. Uses singleflight per uid (concurrent callers wait).
-    pub async fn ensure_running(&self, user: &UserRecord) -> Result<Arc<WorkerHandle>> {
+    /// Ensure a worker exists for (user, profile). Uses singleflight per key (concurrent callers wait).
+    pub async fn ensure_running(&self, user: &UserRecord, profile: &str) -> Result<Arc<WorkerHandle>> {
+        let key = WorkerKey::new(user.uid, profile);
+
         let slot = self
             .slots
-            .entry(user.uid)
+            .entry(key.clone())
             .or_insert_with(|| {
                 Arc::new(WorkerSlot {
                     state: Mutex::new(SlotState::Stopped),
@@ -184,7 +192,7 @@ impl WorkerManager {
             }
 
             // We are responsible for starting it
-            let start_res = self.spawn_worker(user).await;
+            let start_res = self.spawn_worker(user, profile).await;
 
             let mut state = slot.state.lock().await;
             match start_res {
@@ -202,48 +210,72 @@ impl WorkerManager {
         }
     }
 
-    async fn spawn_worker(&self, user: &UserRecord) -> Result<Arc<WorkerHandle>> {
+    async fn spawn_worker(&self, user: &UserRecord, profile_name: &str) -> Result<Arc<WorkerHandle>> {
+        let profile = self
+            .cfg
+            .profiles
+            .get(profile_name)
+            .ok_or_else(|| anyhow!("unknown worker profile '{profile_name}'"))?;
+
         let port = pick_free_port().context("failed to pick a free local port")?;
-        let addr: SocketAddr = format!("127.0.0.1:{port}")
+        let bind_addr = format!("127.0.0.1:{port}");
+        let addr: SocketAddr = bind_addr
             .parse()
-            .map_err(|e| anyhow!("bad addr: {e}"))?;
+            .map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
 
         let euid_is_root = unsafe { libc::geteuid() == 0 };
 
-        let mut cmd = Command::new(&self.cfg.restricted_exec);
+        let mut cmd = Command::new(&self.cfg.launcher.path);
 
-        if euid_is_root {
+        if self.cfg.launcher.pass_user_flag_if_root && euid_is_root {
             tracing::debug!(
                 uid = user.uid,
                 username = user.username.as_str(),
-                "running as root: passing --user to restricted-exec"
+                profile = profile_name,
+                "running as root: passing --user to launcher"
             );
             cmd.arg("--user").arg(&user.username);
         } else {
             tracing::debug!(
                 uid = user.uid,
                 username = user.username.as_str(),
-                "not running as root: launching without --user (worker runs as current user)"
+                profile = profile_name,
+                "launching without --user (either not root or disabled in config)"
             );
         }
 
+        let vars = TemplateVars {
+            username: &user.username,
+            uid: user.uid,
+            gid: user.gid,
+            access_key: &user.access_key,
+            secret_key: &user.secret_key,
+            posix_root: &self.cfg.posix_root,
+            port,
+            bind_addr: &bind_addr,
+        };
+
+        let rendered_args = render_args(&profile.args, &vars)
+            .with_context(|| format!("failed to render args for profile '{profile_name}'"))?;
+        let rendered_env = render_env(&profile.env, &vars)
+            .with_context(|| format!("failed to render env for profile '{profile_name}'"))?;
+
+        // launcher -- <exec> <args...>
         cmd.arg("--")
-            .arg(&self.cfg.versitygw)
-            .arg("--port")
-            .arg(format!("127.0.0.1:{port}"))
-            .args(&self.cfg.extra_versity_args)
-            .arg("posix")
-            .arg(&self.cfg.posix_root)
-            .env("ROOT_ACCESS_KEY", &user.access_key)
-            .env("ROOT_SECRET_KEY", &user.secret_key)
+            .arg(&profile.exec)
+            .args(rendered_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let child = cmd.spawn().context("failed to spawn restricted-exec/versitygw")?;
+        for (k, v) in rendered_env {
+            cmd.env(k, v);
+        }
+
+        let child = cmd.spawn().context("failed to spawn launcher/worker")?;
 
         let handle = Arc::new(WorkerHandle {
-            uid: user.uid,
+            key: WorkerKey::new(user.uid, profile_name),
             username: user.username.clone(),
             addr,
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
@@ -256,13 +288,13 @@ impl WorkerManager {
 
     async fn sweep_once(self: &Arc<Self>) {
         let now = WorkerHandle::now_unix();
-        let idle_secs = self.cfg.idle_timeout.as_secs();
+        let idle_secs = self.cfg.lifecycle.idle_timeout_secs;
 
         // Collect keys first to avoid holding iter borrows over awaits.
-        let uids: Vec<u32> = self.slots.iter().map(|e| *e.key()).collect();
+        let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
 
-        for uid in uids {
-            let Some(slot) = self.slots.get(&uid) else { continue };
+        for key in keys {
+            let Some(slot) = self.slots.get(&key) else { continue };
 
             let handle = {
                 let state = slot.state.lock().await;
@@ -277,20 +309,101 @@ impl WorkerManager {
             // Remove dead workers
             if !h.is_alive().await {
                 drop(slot);
-                self.slots.remove(&uid);
+                self.slots.remove(&key);
                 continue;
             }
 
             // Idle timeout
             let last_used = h.last_used_unix();
             if now.saturating_sub(last_used) >= idle_secs {
+                tracing::info!(
+                    uid = h.key.uid,
+                    profile = h.key.profile.as_str(),
+                    "idle timeout reached; terminating worker"
+                );
                 h.terminate().await;
                 drop(slot);
-                self.slots.remove(&uid);
+                self.slots.remove(&key);
             }
         }
     }
+
+    /// Optional helper: expose the configured posix root for other modules.
+    pub fn posix_root(&self) -> &str {
+        &self.cfg.posix_root
+    }
+
+    /// Optional helper: check if a profile exists (useful for routing validation at runtime).
+    pub fn has_profile(&self, profile: &str) -> bool {
+        self.cfg.profiles.contains_key(profile)
+    }
 }
+
+/* ---------------- templating ---------------- */
+
+struct TemplateVars<'a> {
+    username: &'a str,
+    uid: u32,
+    gid: u32,
+    access_key: &'a str,
+    secret_key: &'a str,
+    posix_root: &'a str,
+    port: u16,
+    bind_addr: &'a str,
+}
+
+fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
+    args.iter().map(|a| render_template(a, vars)).collect()
+}
+
+fn render_env(env: &std::collections::BTreeMap<String, String>, vars: &TemplateVars<'_>) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(env.len());
+    for (k, v) in env {
+        out.push((k.clone(), render_template(v, vars)?));
+    }
+    Ok(out)
+}
+
+/// Strict, safe placeholder replacement.
+/// Supports tokens like: {{username}}, {{uid}}, {{gid}}, {{access_key}}, {{secret_key}},
+/// {{posix_root}}, {{port}}, {{bind_addr}}.
+/// Unknown tokens cause an error.
+fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while let Some(start) = input[i..].find("{{") {
+        let start = i + start;
+        out.push_str(&input[i..start]);
+
+        let after = start + 2;
+        let Some(end_rel) = input[after..].find("}}") else {
+            return Err(anyhow!("unterminated template token in '{input}'"));
+        };
+        let end = after + end_rel;
+        let name = input[after..end].trim();
+
+        let value = match name {
+            "username" => vars.username.to_string(),
+            "uid" => vars.uid.to_string(),
+            "gid" => vars.gid.to_string(),
+            "access_key" => vars.access_key.to_string(),
+            "secret_key" => vars.secret_key.to_string(),
+            "posix_root" => vars.posix_root.to_string(),
+            "port" => vars.port.to_string(),
+            "bind_addr" => vars.bind_addr.to_string(),
+            other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
+        };
+
+        out.push_str(&value);
+        i = end + 2;
+    }
+
+    out.push_str(&input[i..]);
+    Ok(out)
+}
+
+/* ---------------- utils ---------------- */
 
 fn pick_free_port() -> Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;

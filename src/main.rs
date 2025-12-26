@@ -16,9 +16,10 @@ mod sigv4;
 mod user_db;
 mod worker_manager;
 mod classifier;
+mod config;
 
 use user_db::{UserDb, UserRecord};
-use worker_manager::{WorkerHandle, WorkerManager, WorkerManagerConfig};
+use worker_manager::{WorkerHandle, WorkerManager};
 
 struct S3ProxyApp {
     user_db: UserDb,
@@ -138,8 +139,10 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(true);
         }
 
+        let profile = "versitygw-default"; // later: selected from routing config
+
         // 3) If worker already running: NO proxy-side SigV4 verify (just route)
-        if let Some(h) = self.workers.get_running(user.uid).await {
+        if let Some(h) = self.workers.get_running(user.uid, profile).await {
             h.touch();
             ctx.upstream = Some(h.addr);
             ctx.worker = Some(h);
@@ -160,7 +163,7 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 5) Start worker on demand
-        let h = match self.workers.ensure_running(&user).await {
+        let h = match self.workers.ensure_running(&user, profile).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(
@@ -339,14 +342,8 @@ fn main() -> Result<()> {
 
     let user_db = UserDb::demo();
 
-    let workers = WorkerManager::new(WorkerManagerConfig {
-        restricted_exec: "../restricted-exec/target/debug/restricted-exec".to_string(),
-        versitygw: "../versity-patched/versitygw".to_string(),
-        posix_root: "/tmp/s3".to_string(),
-        extra_versity_args: vec![],
-        idle_timeout: std::time::Duration::from_secs(10 * 60),
-        sweep_interval: std::time::Duration::from_secs(10),
-    });
+    let cfg = config::Config::from_path("etc/s3-proxy-manager.yaml")?;
+    let workers = WorkerManager::new(cfg.workers.clone());
 
     let app = S3ProxyApp {
         user_db,

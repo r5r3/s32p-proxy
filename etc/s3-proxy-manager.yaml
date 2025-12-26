@@ -1,0 +1,45 @@
+version: 1
+
+server:
+  listen: "0.0.0.0:9000"
+  public_scheme: "http"
+  log: "info"
+
+auth:
+  users_file: "/etc/s3pm/users.yaml"
+
+workers:
+  posix_root: "/tmp/s3"
+
+  launcher:
+    path: "../restricted-exec/target/debug/restricted-exec"
+    pass_user_flag_if_root: true
+
+  lifecycle:
+    idle_timeout_secs: 600
+    sweep_interval_secs: 10
+
+  profiles:
+    versitygw-default:
+      exec: "../versity-patched/versitygw"
+      args:
+        - "--port"
+        - "{{bind_addr}}"
+        - "posix"
+        - "{{posix_root}}"
+      env:
+        ROOT_ACCESS_KEY: "{{access_key}}"
+        ROOT_SECRET_KEY: "{{secret_key}}"
+
+routing:
+  class_map:
+    multipart:
+      action: "not_implemented"
+      message: "multipart uploads are not implemented"
+    versioning:
+      action: "not_implemented"
+      message: "versioning is not implemented"
+    other:
+      action: "proxy"
+      worker_profile: "versitygw-default"
+
