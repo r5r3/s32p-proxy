@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use std::{
+    fs,
     net::{SocketAddr, TcpListener},
+    os::unix::fs as unix_fs,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,9 +19,10 @@ use tokio::{
     sync::{Mutex, Notify},
     time,
 };
+use tempfile::TempDir;
 
 use crate::config::{WorkerProfile, WorkersConfig};
-use crate::directory::types::UserDoc;
+use crate::directory::{UserDoc, BucketView};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WorkerKey {
@@ -55,6 +60,8 @@ pub struct WorkerHandle {
     pub key: WorkerKey,
     pub username: String,
     pub addr: SocketAddr,
+    pub posix_root: PathBuf,
+    tempdir: Mutex<Option<TempDir>>,
     last_used_unix: AtomicU64,
     child: Mutex<Child>,
 }
@@ -88,6 +95,13 @@ impl WorkerHandle {
         let mut child = self.child.lock().await;
         let _ = child.kill().await; // SIGKILL on Unix
         let _ = child.wait().await;
+        drop(child);
+
+        // Remove temp dir immediately (even if the handle lives longer via Arc)
+        let mut td = self.tempdir.lock().await;
+        if let Some(dir) = td.take() {
+            let _ = dir.close(); // ignore error; best-effort cleanup
+        }
     }
 }
 
@@ -146,7 +160,7 @@ impl WorkerManager {
     }
 
     /// Ensure a worker exists for (user, profile). Uses singleflight per key (concurrent callers wait).
-    pub async fn ensure_running(&self, user: &UserDoc, profile: &str) -> Result<Arc<WorkerHandle>> {
+    pub async fn ensure_running(&self, user: &UserDoc, buckets: &[BucketView], profile: &str) -> Result<Arc<WorkerHandle>> {
         let key = WorkerKey::new(user.access_key.as_str(), profile);
 
         let slot = self
@@ -192,7 +206,7 @@ impl WorkerManager {
             }
 
             // We are responsible for starting it
-            let start_res = self.spawn_worker(user, profile).await;
+            let start_res = self.spawn_worker(user, buckets, profile).await;
 
             let mut state = slot.state.lock().await;
             match start_res {
@@ -210,7 +224,7 @@ impl WorkerManager {
         }
     }
 
-    async fn spawn_worker(&self, user: &UserDoc, profile_name: &str) -> Result<Arc<WorkerHandle>> {
+    async fn spawn_worker(&self, user: &UserDoc, buckets: &[BucketView], profile_name: &str) -> Result<Arc<WorkerHandle>> {
         let profile = self
             .cfg
             .profiles
@@ -224,6 +238,18 @@ impl WorkerManager {
             .map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
 
         let euid_is_root = unsafe { libc::geteuid() == 0 };
+
+        // Create fresh staged root with bucket links
+        let (tempdir, staged_root) = create_staged_posix_root(
+            &self.cfg.posix_root,       // treating cfg.posix_root as "runtime_root" base
+            user.uid,
+            user.gid,
+            &user.access_key,
+            buckets,
+        )?;
+        let staged_root_str = staged_root
+            .to_str()
+            .ok_or_else(|| anyhow!("staged root is not valid UTF-8: {}", staged_root.display()))?;
 
         let mut cmd = Command::new(&self.cfg.launcher.path);
 
@@ -250,7 +276,7 @@ impl WorkerManager {
             gid: user.gid,
             access_key: &user.access_key,
             secret_key: &user.secret_key,
-            posix_root: &self.cfg.posix_root,
+            posix_root: &staged_root_str,
             port,
             bind_addr: &bind_addr,
         };
@@ -278,6 +304,8 @@ impl WorkerManager {
             key: WorkerKey::new(user.access_key.as_str(), profile_name),
             username: user.username.clone(),
             addr,
+            posix_root: staged_root.clone(),
+            tempdir: Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
             child: Mutex::new(child),
         });
@@ -423,5 +451,113 @@ async fn wait_until_ready(addr: SocketAddr, timeout: Duration) -> Result<()> {
             }
         }
     }
+}
+
+fn validate_bucket_link_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("bucket name must not be empty"));
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err(anyhow!("bucket name contains invalid characters: {name:?}"));
+    }
+    if name == "." || name == ".." {
+        return Err(anyhow!("bucket name is not allowed: {name:?}"));
+    }
+    Ok(())
+}
+
+fn lchown_if_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let euid_is_root = unsafe { libc::geteuid() == 0 };
+    if !euid_is_root {
+        return Ok(());
+    }
+    use std::ffi::CString;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("path contains NUL: {}", path.display()))?;
+    let rc = unsafe { libc::lchown(c.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(anyhow!("lchown failed for {}: errno={}", path.display(), rc));
+    }
+    Ok(())
+}
+
+fn chown_if_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let euid_is_root = unsafe { libc::geteuid() == 0 };
+    if !euid_is_root {
+        return Ok(());
+    }
+    use std::ffi::CString;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("path contains NUL: {}", path.display()))?;
+    let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(anyhow!("chown failed for {}: errno={}", path.display(), rc));
+    }
+    Ok(())
+}
+
+/// Create a fresh temp dir under cfg.posix_root (used as "runtime root"),
+/// chown it to the target user if running as root, and add symlinks:
+///   <temp>/<bucket_name> -> <bucket.data_path>
+fn create_staged_posix_root(
+    runtime_root: &str,
+    user_uid: u32,
+    user_gid: u32,
+    access_key: &str,
+    buckets: &[BucketView],
+) -> Result<(TempDir, PathBuf)> {
+    // Ensure base exists
+    fs::create_dir_all(runtime_root)
+        .with_context(|| format!("failed to create runtime_root {runtime_root}"))?;
+
+    // Fresh temp dir
+    let td = tempfile::Builder::new()
+        .prefix(&format!("s3pm-{}-", access_key))
+        .tempdir_in(runtime_root)
+        .with_context(|| format!("failed to create tempdir in {runtime_root}"))?;
+
+    let root = td.path().to_path_buf();
+
+    // IMPORTANT: tempfile creates 0700 owned by current user.
+    // If proxy runs as root but worker runs as user, the worker won't be able to traverse unless we chown.
+    chown_if_root(&root, user_uid, user_gid)?;
+
+    // Create symlinks
+    let mut seen = std::collections::HashSet::new();
+    for b in buckets {
+        validate_bucket_link_name(&b.bucket_name)?;
+
+        if !seen.insert(&b.bucket_name) {
+            return Err(anyhow!("duplicate bucket name in staging set: {}", b.bucket_name));
+        }
+
+        let target = Path::new(&b.data_path);
+        if !target.is_absolute() {
+            return Err(anyhow!(
+                "bucket {} data_path must be absolute (got {})",
+                b.bucket_name,
+                b.data_path
+            ));
+        }
+
+        let link_final = root.join(&b.bucket_name);
+        let link_tmp = root.join(format!(".{}.tmp", b.bucket_name));
+
+        // best effort cleanup if exists
+        let _ = fs::remove_file(&link_tmp);
+        let _ = fs::remove_file(&link_final);
+
+        unix_fs::symlink(target, &link_tmp)
+            .with_context(|| format!("failed to symlink {} -> {}", link_tmp.display(), target.display()))?;
+
+        // If you care about link ownership (usually not required), lchown it when root.
+        // Directory ownership is the important part.
+        let _ = lchown_if_root(&link_tmp, user_uid, user_gid);
+
+        fs::rename(&link_tmp, &link_final)
+            .with_context(|| format!("failed to rename {} -> {}", link_tmp.display(), link_final.display()))?;
+    }
+
+    Ok((td, root))
 }
 

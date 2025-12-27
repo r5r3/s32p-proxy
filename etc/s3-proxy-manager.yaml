@@ -35,6 +35,7 @@ workers:
         - "--port"
         - "{{bind_addr}}"
         - "posix"
+        - "--bucketlinks"
         - "{{posix_root}}"
       env:
         ROOT_ACCESS_KEY: "{{access_key}}"

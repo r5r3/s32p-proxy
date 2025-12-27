@@ -191,7 +191,11 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 5) Start worker on demand (profile-specific)
-        let h = match self.workers.ensure_running(&user, profile).await {
+        let buckets = self.directory.buckets_for_access_key(&access_key).await
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("directory buckets error: {e:#}")))?;
+
+        // Start worker with staged root
+        let h = match self.workers.ensure_running(&user, &buckets, profile).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(
@@ -214,6 +218,7 @@ impl ProxyHttp for S3ProxyApp {
             }
         };
 
+        let posix_root = h.posix_root.display().to_string();
         h.touch();
         ctx.upstream = Some(h.addr);
         ctx.worker = Some(h);
@@ -222,6 +227,7 @@ impl ProxyHttp for S3ProxyApp {
             uid = user.uid,
             username = user.username.as_str(),
             profile = profile,
+            root = %posix_root,
             addr = %ctx.upstream.unwrap(),
             elapsed_ms = start.elapsed().as_millis(),
             "worker started; routing request"

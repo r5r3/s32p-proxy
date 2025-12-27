@@ -8,16 +8,16 @@ users:
     gid: 1001
 
 buckets:
-  - id: "bkt-photos-alice"
-    name: "photos"
-    data_path: "/srv/s3/alice/photos"
+  - id: "bkt-test"
+    name: "test"
+    data_path: "/tmp/s3/test"
     acl:
-      - principal: { type: "access_key", access_key: "AKIA_ALICE_1" }
+      - principal: { type: "access_key", access_key: "TESTACCESSKEY123" }
         access: "read_write"
 
   - id: "bkt-team"
     name: "team"
-    data_path: "/srv/s3/team"
+    data_path: "/tmp/s3/team"
     acl:
       - principal: { type: "group_name", name: "s3-team" }
         access: "read_write"
