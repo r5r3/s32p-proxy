@@ -22,7 +22,7 @@ use tokio::{
 use tempfile::TempDir;
 
 use crate::config::{WorkerProfile, WorkersConfig};
-use crate::directory::{UserDoc, BucketView};
+use s3pm_directory::{UserDoc, BucketView};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WorkerKey {

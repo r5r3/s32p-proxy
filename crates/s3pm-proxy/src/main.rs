@@ -17,12 +17,12 @@ mod sigv4;
 mod worker_manager;
 mod classifier;
 mod config;
-mod directory;
 
-use directory::Directory;
-use directory::types::UserDoc;
-use directory::yaml::YamlDirectory;
-use directory::openbao::OpenBaoDirectory;
+use s3pm_directory::Directory;
+use s3pm_directory::{UserDoc, BucketView};
+use s3pm_directory::yaml::YamlDirectory;
+use s3pm_directory::openbao::OpenBaoDirectory;
+
 use worker_manager::{WorkerHandle, WorkerManager};
 
 struct S3ProxyApp {
