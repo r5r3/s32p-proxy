@@ -1,34 +1,14 @@
 use anyhow::{anyhow, Context, Result};
-use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::{HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use serde::Serialize;
+use std::collections::HashSet;
 use uuid::Uuid;
 
-use s3pm_directory::{
-    DirectoryLayout,
-    IndexDoc,
-    DirectoryFileV1,
-    parse_directory_yaml_str,
-    render_directory_yaml_string,
-    normalize_acl,
-    principal_key,
-};
+use s3pm_directory::directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
+use s3pm_directory::openbao_client::OpenBaoClient;
+pub use s3pm_directory::openbao_client::OpenBaoAuth;
 use s3pm_directory::types::{AclEntry, BucketDoc, Principal, UserDoc};
-
-#[derive(Clone, Debug)]
-pub enum OpenBaoAuth {
-    Token(String),
-    AppRole {
-        mount: String,
-        role_id: String,
-        secret_id: String,
-    },
-}
+use s3pm_directory::{DirectoryFileV1, parse_directory_yaml_str, render_directory_yaml_string};
 
 #[derive(Clone, Debug)]
 pub struct AppRoleCredentials {
@@ -45,22 +25,10 @@ pub struct SetupResult {
 
 #[derive(Clone)]
 pub struct OpenBaoAdmin {
-    address: String,
     kv_mount: String,
     layout: DirectoryLayout,
-    auth: OpenBaoAuth,
-
-    http: reqwest::Client,
-    token_state: Arc<Mutex<TokenState>>,
+    client: OpenBaoClient,
 }
-
-#[derive(Debug)]
-struct TokenState {
-    token: Option<String>,
-    expires_at: Option<Instant>,
-}
-
-/* ----------------------------- helpers ----------------------------- */
 
 fn trim_slashes(s: &str) -> String {
     s.trim().trim_matches('/').to_string()
@@ -73,17 +41,10 @@ impl OpenBaoAdmin {
         kv_mount: impl Into<String>,
         prefix: impl Into<String>,
     ) -> Self {
-        let token = token.into();
         Self {
-            address: address.into(),
             kv_mount: trim_slashes(&kv_mount.into()),
             layout: DirectoryLayout::new(prefix.into()),
-            auth: OpenBaoAuth::Token(token.clone()),
-            http: reqwest::Client::new(),
-            token_state: Arc::new(Mutex::new(TokenState {
-                token: Some(token),
-                expires_at: None,
-            })),
+            client: OpenBaoClient::new_token(address, token),
         }
     }
 
@@ -96,19 +57,9 @@ impl OpenBaoAdmin {
         prefix: impl Into<String>,
     ) -> Self {
         Self {
-            address: address.into(),
             kv_mount: trim_slashes(&kv_mount.into()),
             layout: DirectoryLayout::new(prefix.into()),
-            auth: OpenBaoAuth::AppRole {
-                mount: trim_slashes(&approle_mount.into()),
-                role_id: role_id.into(),
-                secret_id: secret_id.into(),
-            },
-            http: reqwest::Client::new(),
-            token_state: Arc::new(Mutex::new(TokenState {
-                token: None,
-                expires_at: None,
-            })),
+            client: OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
         }
     }
 
@@ -120,111 +71,8 @@ impl OpenBaoAdmin {
         self.layout.prefix()
     }
 
-    fn base_url(&self) -> String {
-        self.address.trim_end_matches('/').to_string()
-    }
+    /* ----------------------------- Setup ----------------------------- */
 
-    fn url(&self, api_path: &str) -> String {
-        // api_path is like "sys/auth/approle" or "secret/data/foo"
-        format!("{}/v1/{}", self.base_url(), api_path.trim_start_matches('/'))
-    }
-
-    async fn approle_login(&self, mount: &str, role_id: &str, secret_id: &str) -> Result<(String, u64)> {
-        #[derive(Debug, Serialize)]
-        struct Req<'a> {
-            role_id: &'a str,
-            secret_id: &'a str,
-        }
-
-        #[derive(Debug, Deserialize)]
-        struct Resp {
-            auth: Option<Auth>,
-        }
-
-        #[derive(Debug, Deserialize)]
-        struct Auth {
-            client_token: String,
-            lease_duration: u64,
-        }
-
-        let path = format!("auth/{}/login", trim_slashes(mount));
-        let resp = self
-            .http
-            .post(self.url(&path))
-            .json(&Req { role_id, secret_id })
-            .send()
-            .await
-            .context("approle login http send")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("approle login failed: {status} {body}"));
-        }
-
-        let r: Resp = resp.json().await.context("approle login json parse")?;
-        let a = r.auth.ok_or_else(|| anyhow!("approle login: missing auth in response"))?;
-        Ok((a.client_token, a.lease_duration))
-    }
-
-    async fn ensure_token(&self) -> Result<String> {
-        // Token auth: return immediately.
-        if let OpenBaoAuth::Token(t) = &self.auth {
-            return Ok(t.clone());
-        }
-
-        // AppRole: cache and refresh near expiry.
-        let mut st = self.token_state.lock().await;
-        let needs_login = match (&st.token, &st.expires_at) {
-            (Some(_), Some(exp)) => Instant::now() + Duration::from_secs(30) >= *exp,
-            _ => true,
-        };
-
-        if !needs_login {
-            return Ok(st.token.clone().unwrap());
-        }
-
-        let (mount, role_id, secret_id) = match &self.auth {
-            OpenBaoAuth::AppRole {
-                mount,
-                role_id,
-                secret_id,
-            } => (mount.clone(), role_id.clone(), secret_id.clone()),
-            OpenBaoAuth::Token(_) => unreachable!(),
-        };
-
-        let (token, ttl) = self.approle_login(&mount, &role_id, &secret_id).await?;
-        st.token = Some(token.clone());
-        st.expires_at = Some(Instant::now() + Duration::from_secs(ttl));
-        Ok(token)
-    }
-
-    async fn request(&self, method: Method, api_path: &str) -> Result<reqwest::RequestBuilder> {
-        let token = self.ensure_token().await?;
-        Ok(self
-            .http
-            .request(method, self.url(api_path))
-            .header("X-Vault-Token", token))
-    }
-
-    async fn send_ok(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        let resp = rb.send().await.context("openbao http send")?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(anyhow!("openbao api error: {status} {body}"))
-        }
-    }
-
-    /* ----------------------------- OpenBao setup ----------------------------- */
-
-    /// Setup OpenBao for s3pm:
-    /// - ensures AppRole auth method is enabled
-    /// - creates two policies: proxy (read-only) and admin (read-write)
-    /// - creates two AppRoles: s3pm-proxy and s3pm-admin
-    /// - returns role_id + secret_id for both
     pub async fn setup(
         address: String,
         root_token: String,
@@ -232,18 +80,15 @@ impl OpenBaoAdmin {
         kv_mount: String,
         prefix: String,
     ) -> Result<SetupResult> {
-        // Use token auth for setup.
-        let client = OpenBaoAdmin::new_token(address, root_token, kv_mount, prefix);
+        let client = OpenBaoClient::new_token(address, root_token);
 
         client.enable_auth_approle(&approle_mount).await?;
 
-        // Policies and roles are fixed names per requirement.
         let proxy_role = "s3pm-proxy";
         let admin_role = "s3pm-admin";
 
-        // Policy rules must reference the kv mount AND the kv v2 paths data/ + metadata/.
-        let kv_mount = client.kv_mount.clone();
-        let prefix = client.layout.prefix().to_string();
+        let kv_mount = trim_slashes(&kv_mount);
+        let prefix = trim_slashes(&prefix);
 
         let proxy_policy = format!(
             r#"
@@ -269,10 +114,9 @@ path "{kv_mount}/metadata/{prefix}/*" {{
 "#
         );
 
-        client.set_policy(proxy_role, &proxy_policy).await?;
-        client.set_policy(admin_role, &admin_policy).await?;
+        client.set_acl_policy(proxy_role, &proxy_policy).await?;
+        client.set_acl_policy(admin_role, &admin_policy).await?;
 
-        // Create/update AppRoles that hand out tokens with those policies.
         client
             .set_approle_role(&approle_mount, proxy_role, &[proxy_role.to_string()])
             .await?;
@@ -280,12 +124,11 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             .set_approle_role(&approle_mount, admin_role, &[admin_role.to_string()])
             .await?;
 
-        // Fetch role IDs and generate secret IDs.
-        let proxy_role_id = client.read_role_id(&approle_mount, proxy_role).await?;
-        let proxy_secret_id = client.generate_secret_id(&approle_mount, proxy_role).await?;
+        let proxy_role_id = client.read_approle_role_id(&approle_mount, proxy_role).await?;
+        let proxy_secret_id = client.generate_approle_secret_id(&approle_mount, proxy_role).await?;
 
-        let admin_role_id = client.read_role_id(&approle_mount, admin_role).await?;
-        let admin_secret_id = client.generate_secret_id(&approle_mount, admin_role).await?;
+        let admin_role_id = client.read_approle_role_id(&approle_mount, admin_role).await?;
+        let admin_secret_id = client.generate_approle_secret_id(&approle_mount, admin_role).await?;
 
         Ok(SetupResult {
             proxy: AppRoleCredentials {
@@ -301,197 +144,22 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         })
     }
 
-    async fn enable_auth_approle(&self, approle_mount: &str) -> Result<()> {
-        // POST /sys/auth/:path  { "type": "approle" }
-        let m = trim_slashes(approle_mount);
-        let api_path = format!("sys/auth/{m}");
-
-        let rb = self
-            .request(Method::POST, &api_path)
-            .await?
-            .json(&json!({ "type": "approle" }));
-
-        let resp = rb.send().await.context("enable approle auth send")?;
-        if resp.status().is_success() {
-            return Ok(());
-        }
-
-        // If already enabled, Vault/OpenBao typically returns 400 with "path is already in use".
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status == StatusCode::BAD_REQUEST && body.to_ascii_lowercase().contains("path is already in use") {
-            return Ok(());
-        }
-
-        Err(anyhow!("enable approle auth failed: {status} {body}"))
-    }
-
-    async fn set_policy(&self, policy_name: &str, policy_hcl: &str) -> Result<()> {
-        // PUT /sys/policies/acl/:name  { "policy": "..." }
-        let name = trim_slashes(policy_name);
-        let api_path = format!("sys/policies/acl/{name}");
-
-        self.send_ok(
-            self.request(Method::PUT, &api_path)
-                .await?
-                .json(&json!({ "policy": policy_hcl })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn set_approle_role(&self, approle_mount: &str, role_name: &str, token_policies: &[String]) -> Result<()> {
-        // POST /auth/:mount/role/:role_name
-        let m = trim_slashes(approle_mount);
-        let r = trim_slashes(role_name);
-        let api_path = format!("auth/{m}/role/{r}");
-
-        self.send_ok(
-            self.request(Method::POST, &api_path)
-                .await?
-                .json(&json!({
-                    "token_policies": token_policies,
-                    "token_no_default_policy": true
-                })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn read_role_id(&self, approle_mount: &str, role_name: &str) -> Result<String> {
-        #[derive(Debug, Deserialize)]
-        struct Resp {
-            data: Option<Data>,
-        }
-        #[derive(Debug, Deserialize)]
-        struct Data {
-            role_id: String,
-        }
-
-        let m = trim_slashes(approle_mount);
-        let r = trim_slashes(role_name);
-        let api_path = format!("auth/{m}/role/{r}/role-id");
-
-        let resp = self.send_ok(self.request(Method::GET, &api_path).await?).await?;
-        let r: Resp = resp.json().await.context("read role-id json parse")?;
-        let role_id = r
-            .data
-            .ok_or_else(|| anyhow!("read role-id: missing data"))?
-            .role_id;
-        Ok(role_id)
-    }
-
-    async fn generate_secret_id(&self, approle_mount: &str, role_name: &str) -> Result<String> {
-        #[derive(Debug, Deserialize)]
-        struct Resp {
-            data: Option<Data>,
-        }
-        #[derive(Debug, Deserialize)]
-        struct Data {
-            secret_id: String,
-        }
-
-        let m = trim_slashes(approle_mount);
-        let r = trim_slashes(role_name);
-        let api_path = format!("auth/{m}/role/{r}/secret-id");
-
-        let resp = self
-            .send_ok(self.request(Method::POST, &api_path).await?.json(&json!({})))
-            .await?;
-        let r: Resp = resp.json().await.context("generate secret-id json parse")?;
-        let secret_id = r
-            .data
-            .ok_or_else(|| anyhow!("generate secret-id: missing data"))?
-            .secret_id;
-        Ok(secret_id)
-    }
-
-    /* ----------------------------- KV v2 helpers ----------------------------- */
+    /* ----------------------------- KV helpers ----------------------------- */
 
     async fn kv_put<T: Serialize>(&self, rel_path: &str, doc: &T) -> Result<()> {
-        let rel_path = rel_path.trim_start_matches('/');
-        let api_path = format!("{}/data/{}", self.kv_mount, rel_path);
-
-        let data = serde_json::to_value(doc).context("serialize doc to json")?;
-        self.send_ok(self.request(Method::POST, &api_path).await?.json(&json!({ "data": data })))
-            .await?;
-        Ok(())
+        self.client.kv2_write(&self.kv_mount, rel_path, doc).await
     }
 
-    async fn kv_get_opt<T: DeserializeOwned>(&self, rel_path: &str) -> Result<Option<T>> {
-        #[derive(Debug, Deserialize)]
-        struct Resp<T> {
-            data: Option<Data<T>>,
-        }
-        #[derive(Debug, Deserialize)]
-        struct Data<T> {
-            data: T,
-        }
-
-        let rel_path = rel_path.trim_start_matches('/');
-        let api_path = format!("{}/data/{}", self.kv_mount, rel_path);
-
-        let rb = self.request(Method::GET, &api_path).await?;
-        let resp = rb.send().await.context("kv get send")?;
-
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("kv get failed: {status} {body}"));
-        }
-
-        let r: Resp<T> = resp.json().await.context("kv get json parse")?;
-        Ok(r.data.map(|d| d.data))
+    async fn kv_get_opt<T: DeserializeOwned + Send>(&self, rel_path: &str) -> Result<Option<T>> {
+        self.client.kv2_read_opt(&self.kv_mount, rel_path).await
     }
 
     async fn kv_delete_metadata(&self, rel_path: &str) -> Result<()> {
-        let rel_path = rel_path.trim_start_matches('/');
-        let api_path = format!("{}/metadata/{}", self.kv_mount, rel_path);
-
-        let rb = self.request(Method::DELETE, &api_path).await?;
-        let resp = rb.send().await.context("kv delete metadata send")?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(());
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("kv delete metadata failed: {status} {body}"));
-        }
-        Ok(())
+        self.client.kv2_delete_metadata(&self.kv_mount, rel_path).await
     }
 
     async fn kv_list_opt(&self, rel_path: &str) -> Result<Option<Vec<String>>> {
-        #[derive(Debug, Deserialize)]
-        struct Resp {
-            data: Option<Data>,
-        }
-        #[derive(Debug, Deserialize)]
-        struct Data {
-            keys: Vec<String>,
-        }
-
-        let rel_path = rel_path.trim_start_matches('/');
-        let api_path = format!("{}/metadata/{}", self.kv_mount, rel_path);
-
-        let list_method = Method::from_bytes(b"LIST").context("construct LIST method")?;
-        let rb = self.request(list_method, &api_path).await?;
-        let resp = rb.send().await.context("kv list send")?;
-
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("kv list failed: {status} {body}"));
-        }
-
-        let r: Resp = resp.json().await.context("kv list json parse")?;
-        Ok(Some(r.data.map(|d| d.keys).unwrap_or_default()))
+        self.client.kv2_list_opt(&self.kv_mount, rel_path).await
     }
 
     /* ----------------------------- Index helpers ----------------------------- */
@@ -502,7 +170,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
 
     async fn index_write(&self, rel_path: &str, idx: &IndexDoc) -> Result<()> {
         if idx.bucket_ids.is_empty() {
-            // keep storage clean, directory handles missing index as empty
             self.kv_delete_metadata(rel_path).await?;
         } else {
             self.kv_put(rel_path, idx).await?;
@@ -587,7 +254,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         }
 
         if cleanup_acls {
-            // Use the access_key index to find buckets to scrub.
             let idx = self.index_read(&self.layout.idx_access_key(ak)).await?;
             for bucket_id in idx.bucket_ids {
                 if let Some(mut b) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket_id)).await? {
@@ -603,7 +269,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             }
         }
 
-        // Delete user doc and index doc.
         self.kv_delete_metadata(&self.layout.user(ak)).await?;
         self.kv_delete_metadata(&self.layout.idx_access_key(ak)).await?;
         Ok(())
@@ -660,7 +325,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         bucket.data_path = bucket.data_path.trim().to_string();
         bucket.acl = normalize_acl(bucket.acl);
 
-        // If bucket exists, update indices based on delta of principals.
         let existing = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket.id)).await?;
         if let Some(old) = existing {
             let old_acl = normalize_acl(old.acl);
@@ -669,7 +333,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             let old_set: HashSet<String> = old_acl.iter().map(|e| principal_key(&e.principal)).collect();
             let new_set: HashSet<String> = new_acl.iter().map(|e| principal_key(&e.principal)).collect();
 
-            // Removed principals => remove from indices
             for pk in old_set.difference(&new_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
@@ -679,7 +342,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
                     }
                 }
             }
-            // Added principals => add to indices
             for pk in new_set.difference(&old_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
@@ -690,11 +352,9 @@ path "{kv_mount}/metadata/{prefix}/*" {{
                 }
             }
         } else {
-            // New bucket => add to all indices
             self.add_bucket_to_indices(&bucket.id, &bucket.acl).await?;
         }
 
-        // Write bucket doc last (authoritative ACL)
         self.kv_put(&self.layout.bucket(&bucket.id), &bucket).await?;
         Ok(())
     }
@@ -750,19 +410,19 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         Ok(())
     }
 
-    /* ----------------------------- Import / Export ----------------------------- */
+    /* ----------------------------- Import / Export (unchanged) ----------------------------- */
 
     pub async fn export_yaml_string(&self) -> Result<String> {
         let users = self.list_users().await?;
         let buckets = self.list_buckets().await?;
 
-        let doc = DirectoryFileV1 {
+        let root = DirectoryFileV1 {
             version: 1,
             users,
             buckets,
         };
 
-        render_directory_yaml_string(&doc)
+        render_directory_yaml_string(&root)
     }
 
     pub async fn export_yaml_file(&self, path: &str) -> Result<()> {
@@ -772,21 +432,10 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     async fn purge_tree(&self, rel_path: &str) -> Result<()> {
-        // rel_path is relative to prefix, e.g. "users" or "index"
-        // We walk the KV v2 "metadata" tree using LIST requests, and delete leaf metadata.
-        //
-        // NOTE: KV v2 LIST returns directory entries with a trailing slash.
-        // We do an explicit stack-based DFS to avoid async recursion (E0733).
         let mut stack: Vec<String> = vec![rel_path.trim_matches('/').to_string()];
 
         while let Some(cur_rel) = stack.pop() {
-            // Full relpath under prefix:
-            // prefix + "/" + cur_rel
-            let full = if cur_rel.is_empty() {
-                self.layout.prefix().to_string()
-            } else {
-                self.layout.join(&cur_rel)
-            };
+            let full = self.layout.join(&cur_rel);
 
             let Some(keys) = self.kv_list_opt(&full).await? else {
                 continue;
@@ -817,7 +466,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     pub async fn import_yaml_string(&self, yaml: &str, replace: bool) -> Result<()> {
-        let doc = parse_directory_yaml_str(yaml)?;
+        let root = parse_directory_yaml_str(yaml)?;
 
         if replace {
             self.purge_tree("users").await?;
@@ -825,11 +474,11 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             self.purge_tree("index").await?;
         }
 
-        for u in doc.users {
+        for u in root.users {
             self.upsert_user(u).await?;
         }
 
-        for mut b in doc.buckets {
+        for mut b in root.buckets {
             b.acl = normalize_acl(b.acl);
             self.upsert_bucket(b).await?;
         }
