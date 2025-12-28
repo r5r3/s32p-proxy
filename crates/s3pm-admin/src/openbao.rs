@@ -3,13 +3,22 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use s3pm_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
+use s3pm_directory::{
+    DirectoryLayout,
+    IndexDoc,
+    DirectoryFileV1,
+    parse_directory_yaml_str,
+    render_directory_yaml_string,
+    normalize_acl,
+    principal_key,
+};
+use s3pm_directory::types::{AclEntry, BucketDoc, Principal, UserDoc};
 
 #[derive(Clone, Debug)]
 pub enum OpenBaoAuth {
@@ -38,7 +47,7 @@ pub struct SetupResult {
 pub struct OpenBaoAdmin {
     address: String,
     kv_mount: String,
-    prefix: String,
+    layout: DirectoryLayout,
     auth: OpenBaoAuth,
 
     http: reqwest::Client,
@@ -51,46 +60,10 @@ struct TokenState {
     expires_at: Option<Instant>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct IndexDoc {
-    #[serde(default)]
-    bucket_ids: Vec<String>,
-}
-
 /* ----------------------------- helpers ----------------------------- */
 
 fn trim_slashes(s: &str) -> String {
     s.trim().trim_matches('/').to_string()
-}
-
-fn principal_key(p: &Principal) -> String {
-    match p {
-        Principal::AccessKey { access_key } => format!("ak:{access_key}"),
-        Principal::GroupName { name } => format!("group:{name}"),
-    }
-}
-
-fn normalize_acl(mut acl: Vec<AclEntry>) -> Vec<AclEntry> {
-    // Merge duplicates by taking the max access level.
-    let mut map: HashMap<String, (Principal, AccessLevel)> = HashMap::new();
-
-    for e in acl.drain(..) {
-        let k = principal_key(&e.principal);
-        map.entry(k)
-            .and_modify(|(_, cur)| {
-                *cur = std::cmp::max(*cur, e.access);
-            })
-            .or_insert((e.principal, e.access));
-    }
-
-    let mut out: Vec<AclEntry> = map
-        .into_values()
-        .map(|(principal, access)| AclEntry { principal, access })
-        .collect();
-
-    // Stable ordering helps diffs
-    out.sort_by(|a, b| principal_key(&a.principal).cmp(&principal_key(&b.principal)));
-    out
 }
 
 impl OpenBaoAdmin {
@@ -104,7 +77,7 @@ impl OpenBaoAdmin {
         Self {
             address: address.into(),
             kv_mount: trim_slashes(&kv_mount.into()),
-            prefix: trim_slashes(&prefix.into()),
+            layout: DirectoryLayout::new(prefix.into()),
             auth: OpenBaoAuth::Token(token.clone()),
             http: reqwest::Client::new(),
             token_state: Arc::new(Mutex::new(TokenState {
@@ -125,7 +98,7 @@ impl OpenBaoAdmin {
         Self {
             address: address.into(),
             kv_mount: trim_slashes(&kv_mount.into()),
-            prefix: trim_slashes(&prefix.into()),
+            layout: DirectoryLayout::new(prefix.into()),
             auth: OpenBaoAuth::AppRole {
                 mount: trim_slashes(&approle_mount.into()),
                 role_id: role_id.into(),
@@ -144,7 +117,7 @@ impl OpenBaoAdmin {
     }
 
     pub fn prefix(&self) -> &str {
-        &self.prefix
+        self.layout.prefix()
     }
 
     fn base_url(&self) -> String {
@@ -154,19 +127,6 @@ impl OpenBaoAdmin {
     fn url(&self, api_path: &str) -> String {
         // api_path is like "sys/auth/approle" or "secret/data/foo"
         format!("{}/v1/{}", self.base_url(), api_path.trim_start_matches('/'))
-    }
-
-    fn p_user(&self, access_key: &str) -> String {
-        format!("{}/users/{}", self.prefix, access_key)
-    }
-    fn p_bucket(&self, bucket_id: &str) -> String {
-        format!("{}/buckets/{}", self.prefix, bucket_id)
-    }
-    fn p_idx_access_key(&self, access_key: &str) -> String {
-        format!("{}/index/access_key/{}", self.prefix, access_key)
-    }
-    fn p_idx_group(&self, group: &str) -> String {
-        format!("{}/index/group/{}", self.prefix, group)
     }
 
     async fn approle_login(&self, mount: &str, role_id: &str, secret_id: &str) -> Result<(String, u64)> {
@@ -283,7 +243,7 @@ impl OpenBaoAdmin {
 
         // Policy rules must reference the kv mount AND the kv v2 paths data/ + metadata/.
         let kv_mount = client.kv_mount.clone();
-        let prefix = client.prefix.clone();
+        let prefix = client.layout.prefix().to_string();
 
         let proxy_policy = format!(
             r#"
@@ -346,7 +306,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         let m = trim_slashes(approle_mount);
         let api_path = format!("sys/auth/{m}");
 
-        // Setup uses token auth, so token is already present.
         let rb = self
             .request(Method::POST, &api_path)
             .await?
@@ -357,7 +316,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             return Ok(());
         }
 
-        // If already enabled, Vault/OpenBao typically returns 400 with a message like "path is already in use".
+        // If already enabled, Vault/OpenBao typically returns 400 with "path is already in use".
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if status == StatusCode::BAD_REQUEST && body.to_ascii_lowercase().contains("path is already in use") {
@@ -383,7 +342,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
 
     async fn set_approle_role(&self, approle_mount: &str, role_name: &str, token_policies: &[String]) -> Result<()> {
         // POST /auth/:mount/role/:role_name
-        // Minimal payload; you can tune TTL/period later.
         let m = trim_slashes(approle_mount);
         let r = trim_slashes(role_name);
         let api_path = format!("auth/{m}/role/{r}");
@@ -451,7 +409,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     /* ----------------------------- KV v2 helpers ----------------------------- */
 
     async fn kv_put<T: Serialize>(&self, rel_path: &str, doc: &T) -> Result<()> {
-        // POST /<mount>/data/<rel_path>  { "data": { ... } }
         let rel_path = rel_path.trim_start_matches('/');
         let api_path = format!("{}/data/{}", self.kv_mount, rel_path);
 
@@ -462,7 +419,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     async fn kv_get_opt<T: DeserializeOwned>(&self, rel_path: &str) -> Result<Option<T>> {
-        // GET /<mount>/data/<rel_path>
         #[derive(Debug, Deserialize)]
         struct Resp<T> {
             data: Option<Data<T>>,
@@ -492,7 +448,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     async fn kv_delete_metadata(&self, rel_path: &str) -> Result<()> {
-        // DELETE /<mount>/metadata/<rel_path>
         let rel_path = rel_path.trim_start_matches('/');
         let api_path = format!("{}/metadata/{}", self.kv_mount, rel_path);
 
@@ -510,7 +465,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     async fn kv_list_opt(&self, rel_path: &str) -> Result<Option<Vec<String>>> {
-        // LIST /<mount>/metadata/<rel_path>
         #[derive(Debug, Deserialize)]
         struct Resp {
             data: Option<Data>,
@@ -581,11 +535,10 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         for e in acl {
             match &e.principal {
                 Principal::AccessKey { access_key } => {
-                    self.index_add_bucket(&self.p_idx_access_key(access_key), bucket_id)
-                        .await?;
+                    self.index_add_bucket(&self.layout.idx_access_key(access_key), bucket_id).await?;
                 }
                 Principal::GroupName { name } => {
-                    self.index_add_bucket(&self.p_idx_group(name), bucket_id).await?;
+                    self.index_add_bucket(&self.layout.idx_group(name), bucket_id).await?;
                 }
             }
         }
@@ -596,11 +549,10 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         for e in acl {
             match &e.principal {
                 Principal::AccessKey { access_key } => {
-                    self.index_remove_bucket(&self.p_idx_access_key(access_key), bucket_id)
-                        .await?;
+                    self.index_remove_bucket(&self.layout.idx_access_key(access_key), bucket_id).await?;
                 }
                 Principal::GroupName { name } => {
-                    self.index_remove_bucket(&self.p_idx_group(name), bucket_id).await?;
+                    self.index_remove_bucket(&self.layout.idx_group(name), bucket_id).await?;
                 }
             }
         }
@@ -624,7 +576,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         user.secret_key = user.secret_key.trim().to_string();
         user.username = user.username.trim().to_string();
 
-        self.kv_put(&self.p_user(&user.access_key), &user).await?;
+        self.kv_put(&self.layout.user(&user.access_key), &user).await?;
         Ok(())
     }
 
@@ -636,16 +588,15 @@ path "{kv_mount}/metadata/{prefix}/*" {{
 
         if cleanup_acls {
             // Use the access_key index to find buckets to scrub.
-            let idx = self.index_read(&self.p_idx_access_key(ak)).await?;
+            let idx = self.index_read(&self.layout.idx_access_key(ak)).await?;
             for bucket_id in idx.bucket_ids {
-                if let Some(mut b) = self.kv_get_opt::<BucketDoc>(&self.p_bucket(&bucket_id)).await? {
+                if let Some(mut b) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket_id)).await? {
                     let before = b.acl.len();
                     b.acl.retain(|e| match &e.principal {
                         Principal::AccessKey { access_key } => access_key != ak,
                         _ => true,
                     });
                     if b.acl.len() != before {
-                        // Use upsert_bucket logic by calling set_bucket_acl
                         self.set_bucket_acl(&bucket_id, b.acl).await?;
                     }
                 }
@@ -653,24 +604,24 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         }
 
         // Delete user doc and index doc.
-        self.kv_delete_metadata(&self.p_user(ak)).await?;
-        self.kv_delete_metadata(&self.p_idx_access_key(ak)).await?;
+        self.kv_delete_metadata(&self.layout.user(ak)).await?;
+        self.kv_delete_metadata(&self.layout.idx_access_key(ak)).await?;
         Ok(())
     }
 
     pub async fn list_users(&self) -> Result<Vec<UserDoc>> {
         let mut out = Vec::new();
 
-        let Some(keys) = self.kv_list_opt(&format!("{}/users", self.prefix)).await? else {
+        let Some(keys) = self.kv_list_opt(&self.layout.users_root()).await? else {
             return Ok(out);
         };
 
         for k in keys {
-            let k = k.trim_end_matches('/'); // ignore directories
+            let k = k.trim_end_matches('/');
             if k.is_empty() {
                 continue;
             }
-            if let Some(u) = self.kv_get_opt::<UserDoc>(&self.p_user(k)).await? {
+            if let Some(u) = self.kv_get_opt::<UserDoc>(&self.layout.user(k)).await? {
                 out.push(u);
             }
         }
@@ -710,7 +661,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         bucket.acl = normalize_acl(bucket.acl);
 
         // If bucket exists, update indices based on delta of principals.
-        let existing = self.kv_get_opt::<BucketDoc>(&self.p_bucket(&bucket.id)).await?;
+        let existing = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket.id)).await?;
         if let Some(old) = existing {
             let old_acl = normalize_acl(old.acl);
             let new_acl = bucket.acl.clone();
@@ -722,8 +673,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             for pk in old_set.difference(&new_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
-                        "ak" => self.index_remove_bucket(&self.p_idx_access_key(value), &bucket.id).await?,
-                        "group" => self.index_remove_bucket(&self.p_idx_group(value), &bucket.id).await?,
+                        "ak" => self.index_remove_bucket(&self.layout.idx_access_key(value), &bucket.id).await?,
+                        "group" => self.index_remove_bucket(&self.layout.idx_group(value), &bucket.id).await?,
                         _ => {}
                     }
                 }
@@ -732,8 +683,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             for pk in new_set.difference(&old_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
-                        "ak" => self.index_add_bucket(&self.p_idx_access_key(value), &bucket.id).await?,
-                        "group" => self.index_add_bucket(&self.p_idx_group(value), &bucket.id).await?,
+                        "ak" => self.index_add_bucket(&self.layout.idx_access_key(value), &bucket.id).await?,
+                        "group" => self.index_add_bucket(&self.layout.idx_group(value), &bucket.id).await?,
                         _ => {}
                     }
                 }
@@ -744,7 +695,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         }
 
         // Write bucket doc last (authoritative ACL)
-        self.kv_put(&self.p_bucket(&bucket.id), &bucket).await?;
+        self.kv_put(&self.layout.bucket(&bucket.id), &bucket).await?;
         Ok(())
     }
 
@@ -754,23 +705,19 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             return Err(anyhow!("bucket_id must not be empty"));
         }
 
-        let Some(bucket) = self.kv_get_opt::<BucketDoc>(&self.p_bucket(bid)).await? else {
-            // already gone
+        let Some(bucket) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(bid)).await? else {
             return Ok(());
         };
 
-        // Remove indices first.
         self.remove_bucket_from_indices(bid, &bucket.acl).await?;
-
-        // Delete bucket doc.
-        self.kv_delete_metadata(&self.p_bucket(bid)).await?;
+        self.kv_delete_metadata(&self.layout.bucket(bid)).await?;
         Ok(())
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketDoc>> {
         let mut out = Vec::new();
 
-        let Some(keys) = self.kv_list_opt(&format!("{}/buckets", self.prefix)).await? else {
+        let Some(keys) = self.kv_list_opt(&self.layout.buckets_root()).await? else {
             return Ok(out);
         };
 
@@ -779,7 +726,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             if k.is_empty() {
                 continue;
             }
-            if let Some(b) = self.kv_get_opt::<BucketDoc>(&self.p_bucket(k)).await? {
+            if let Some(b) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(k)).await? {
                 out.push(b);
             }
         }
@@ -794,7 +741,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             return Err(anyhow!("bucket_id must not be empty"));
         }
 
-        let Some(mut bucket) = self.kv_get_opt::<BucketDoc>(&self.p_bucket(bid)).await? else {
+        let Some(mut bucket) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(bid)).await? else {
             return Err(anyhow!("bucket not found: {bid}"));
         };
 
@@ -809,13 +756,13 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         let users = self.list_users().await?;
         let buckets = self.list_buckets().await?;
 
-        let root = crate::yaml::YamlRoot {
+        let doc = DirectoryFileV1 {
             version: 1,
             users,
             buckets,
         };
 
-        crate::yaml::render_yaml_string(&root)
+        render_directory_yaml_string(&doc)
     }
 
     pub async fn export_yaml_file(&self, path: &str) -> Result<()> {
@@ -833,19 +780,20 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         let mut stack: Vec<String> = vec![rel_path.trim_matches('/').to_string()];
 
         while let Some(cur_rel) = stack.pop() {
+            // Full relpath under prefix:
+            // prefix + "/" + cur_rel
             let full = if cur_rel.is_empty() {
-                self.prefix.clone()
+                self.layout.prefix().to_string()
             } else {
-                format!("{}/{}", self.prefix, cur_rel)
+                self.layout.join(&cur_rel)
             };
 
             let Some(keys) = self.kv_list_opt(&full).await? else {
-                continue; // subtree not present
+                continue;
             };
 
             for k in keys {
                 if k.ends_with('/') {
-                    // directory: push subdir
                     let subdir = k.trim_end_matches('/');
                     let next_rel = if cur_rel.is_empty() {
                         subdir.to_string()
@@ -854,13 +802,12 @@ path "{kv_mount}/metadata/{prefix}/*" {{
                     };
                     stack.push(next_rel);
                 } else {
-                    // leaf: delete metadata entry
                     let leaf_rel = if cur_rel.is_empty() {
                         k.clone()
                     } else {
                         format!("{}/{}", cur_rel, k)
                     };
-                    let leaf_full = format!("{}/{}", self.prefix, leaf_rel);
+                    let leaf_full = self.layout.join(&leaf_rel);
                     self.kv_delete_metadata(&leaf_full).await?;
                 }
             }
@@ -870,23 +817,19 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     pub async fn import_yaml_string(&self, yaml: &str, replace: bool) -> Result<()> {
-        let root = crate::yaml::parse_yaml_str(yaml)?;
+        let doc = parse_directory_yaml_str(yaml)?;
 
         if replace {
-            // wipe known subtrees under prefix
             self.purge_tree("users").await?;
             self.purge_tree("buckets").await?;
             self.purge_tree("index").await?;
         }
 
-        // Write users first.
-        for u in root.users {
+        for u in doc.users {
             self.upsert_user(u).await?;
         }
 
-        // Write buckets and build indices.
-        // Note: upsert_bucket will create/update indices.
-        for mut b in root.buckets {
+        for mut b in doc.buckets {
             b.acl = normalize_acl(b.acl);
             self.upsert_bucket(b).await?;
         }

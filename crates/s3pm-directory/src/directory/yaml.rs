@@ -1,26 +1,19 @@
+use crate::directory::file::{parse_directory_yaml_str, DirectoryFileV1};
+use crate::directory::layout::normalize_acl;
 use crate::directory::posix_groups::groups_for_user;
 use crate::directory::{AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
 #[derive(Clone)]
 pub struct YamlDirectory {
-    users: HashMap<String, UserDoc>,        // access_key -> user
-    buckets: HashMap<String, BucketDoc>,    // bucket_id -> bucket
+    users: HashMap<String, UserDoc>,     // access_key -> user
+    buckets: HashMap<String, BucketDoc>, // bucket_id -> bucket
 
-    // indices built at load time (for fast lookup)
     index_access_key: HashMap<String, Vec<String>>, // access_key -> bucket_ids
     index_group: HashMap<String, Vec<String>>,      // group_name -> bucket_ids
-}
-
-#[derive(Debug, Deserialize)]
-struct Root {
-    version: u32,
-    users: Vec<UserDoc>,
-    buckets: Vec<BucketDoc>,
 }
 
 impl YamlDirectory {
@@ -30,13 +23,15 @@ impl YamlDirectory {
     }
 
     pub fn from_str(yaml: &str) -> Result<Self> {
-        let root: Root = serde_yaml::from_str(yaml).context("parse yaml directory")?;
-        if root.version != 1 {
-            return Err(anyhow!("unsupported yaml directory version {} (expected 1)", root.version));
-        }
+        let doc: DirectoryFileV1 = parse_directory_yaml_str(yaml)?;
+        Self::from_doc(doc)
+    }
+
+    pub fn from_doc(doc: DirectoryFileV1) -> Result<Self> {
+        doc.validate()?;
 
         let mut users = HashMap::new();
-        for u in root.users {
+        for u in doc.users {
             if u.access_key.trim().is_empty() {
                 return Err(anyhow!("user access_key must not be empty"));
             }
@@ -46,7 +41,7 @@ impl YamlDirectory {
         }
 
         let mut buckets = HashMap::new();
-        for b in root.buckets {
+        for mut b in doc.buckets {
             if b.id.trim().is_empty() {
                 return Err(anyhow!("bucket id must not be empty"));
             }
@@ -56,12 +51,14 @@ impl YamlDirectory {
             if b.data_path.trim().is_empty() {
                 return Err(anyhow!("bucket data_path must not be empty (id={})", b.id));
             }
+
+            b.acl = normalize_acl(b.acl);
+
             if buckets.insert(b.id.clone(), b).is_some() {
                 return Err(anyhow!("duplicate bucket id in yaml"));
             }
         }
 
-        // Build indices
         let mut index_access_key: HashMap<String, Vec<String>> = HashMap::new();
         let mut index_group: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -69,13 +66,25 @@ impl YamlDirectory {
             for entry in &bucket.acl {
                 match &entry.principal {
                     Principal::AccessKey { access_key } => {
-                        index_access_key.entry(access_key.clone()).or_default().push(bucket_id.clone());
+                        index_access_key
+                            .entry(access_key.clone())
+                            .or_default()
+                            .push(bucket_id.clone());
                     }
                     Principal::GroupName { name } => {
                         index_group.entry(name.clone()).or_default().push(bucket_id.clone());
                     }
                 }
             }
+        }
+
+        for v in index_access_key.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        for v in index_group.values_mut() {
+            v.sort();
+            v.dedup();
         }
 
         Ok(Self {
@@ -125,9 +134,7 @@ impl Directory for YamlDirectory {
         let groups = groups_for_user(&user.username, user.gid)?;
         let group_set: HashSet<String> = groups.into_iter().collect();
 
-        // Collect candidate bucket IDs from indices
         let mut ids: HashSet<String> = HashSet::new();
-
         if let Some(v) = self.index_access_key.get(access_key) {
             ids.extend(v.iter().cloned());
         }
@@ -137,7 +144,6 @@ impl Directory for YamlDirectory {
             }
         }
 
-        // Resolve bucket docs + ACL to effective access
         let mut out: Vec<BucketView> = Vec::new();
         let mut name_seen: HashSet<String> = HashSet::new();
 
@@ -145,11 +151,9 @@ impl Directory for YamlDirectory {
             let Some(bucket) = self.buckets.get(&id) else { continue };
 
             let Some(access) = self.effective_access(bucket, access_key, &group_set) else {
-                // index stale (shouldn't happen for YAML since we built it) => ignore
                 continue;
             };
 
-            // enforce per-access_key bucket name uniqueness (avoid ambiguous mapping)
             if !name_seen.insert(bucket.name.clone()) {
                 return Err(anyhow!(
                     "access_key {} sees multiple buckets with the same name '{}' (ambiguous)",

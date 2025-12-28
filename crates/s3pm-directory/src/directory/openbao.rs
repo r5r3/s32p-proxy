@@ -1,9 +1,10 @@
+use crate::directory::layout::{DirectoryLayout, IndexDoc};
 use crate::directory::posix_groups::groups_for_user;
 use crate::directory::{AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -22,7 +23,7 @@ pub struct OpenBaoDirectory {
 
     // KV v2
     kv_mount: String,
-    prefix: String,
+    layout: DirectoryLayout,
 
     // cached client token
     state: Arc<Mutex<ClientState>>,
@@ -31,11 +32,6 @@ pub struct OpenBaoDirectory {
 struct ClientState {
     client: Option<Arc<VaultClient>>,
     expires_at: Option<Instant>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IndexDoc {
-    bucket_ids: Vec<String>,
 }
 
 impl OpenBaoDirectory {
@@ -53,25 +49,12 @@ impl OpenBaoDirectory {
             role_id,
             secret_id,
             kv_mount,
-            prefix,
+            layout: DirectoryLayout::new(prefix),
             state: Arc::new(Mutex::new(ClientState {
                 client: None,
                 expires_at: None,
             })),
         }
-    }
-
-    fn p_user(&self, access_key: &str) -> String {
-        format!("{}/users/{}", self.prefix, access_key)
-    }
-    fn p_bucket(&self, bucket_id: &str) -> String {
-        format!("{}/buckets/{}", self.prefix, bucket_id)
-    }
-    fn p_idx_access_key(&self, access_key: &str) -> String {
-        format!("{}/index/access_key/{}", self.prefix, access_key)
-    }
-    fn p_idx_group(&self, group_name: &str) -> String {
-        format!("{}/index/group/{}", self.prefix, group_name)
     }
 
     async fn ensure_client(&self) -> Result<Arc<VaultClient>> {
@@ -118,7 +101,7 @@ impl OpenBaoDirectory {
         let c = self.ensure_client().await?;
         match kv2::read::<T>(c.as_ref(), &self.kv_mount, path).await {
             Ok(v) => Ok(Some(v)),
-            Err(_) => Ok(None), // you can tighten this later by matching "not found" vs real errors
+            Err(_) => Ok(None),
         }
     }
 
@@ -149,7 +132,7 @@ impl OpenBaoDirectory {
 #[async_trait]
 impl Directory for OpenBaoDirectory {
     async fn user_by_access_key(&self, access_key: &str) -> Result<Option<UserDoc>> {
-        self.kv_read_opt::<UserDoc>(&self.p_user(access_key)).await
+        self.kv_read_opt::<UserDoc>(&self.layout.user(access_key)).await
     }
 
     async fn buckets_for_access_key(&self, access_key: &str) -> Result<Vec<BucketView>> {
@@ -162,13 +145,16 @@ impl Directory for OpenBaoDirectory {
 
         // 1) Read index for access_key
         let mut ids: HashSet<String> = HashSet::new();
-        if let Some(idx) = self.kv_read_opt::<IndexDoc>(&self.p_idx_access_key(access_key)).await? {
+        if let Some(idx) = self
+            .kv_read_opt::<IndexDoc>(&self.layout.idx_access_key(access_key))
+            .await?
+        {
             ids.extend(idx.bucket_ids);
         }
 
-        // 2) Read indices for each group name (efficient lookup)
+        // 2) Read indices for each group name
         for g in &group_set {
-            if let Some(idx) = self.kv_read_opt::<IndexDoc>(&self.p_idx_group(g)).await? {
+            if let Some(idx) = self.kv_read_opt::<IndexDoc>(&self.layout.idx_group(g)).await? {
                 ids.extend(idx.bucket_ids);
             }
         }
@@ -178,14 +164,12 @@ impl Directory for OpenBaoDirectory {
         let mut name_seen: HashSet<String> = HashSet::new();
 
         for id in ids {
-            let Some(bucket) = self.kv_read_opt::<BucketDoc>(&self.p_bucket(&id)).await? else {
-                // stale index => ignore (or error if you want strictness)
-                continue;
+            let Some(bucket) = self.kv_read_opt::<BucketDoc>(&self.layout.bucket(&id)).await? else {
+                continue; // stale index
             };
 
             let Some(access) = Self::effective_access(&bucket, access_key, &group_set) else {
-                // index says visible but ACL does not match => stale provisioning => ignore or error
-                continue;
+                continue; // stale provisioning
             };
 
             if !name_seen.insert(bucket.name.clone()) {

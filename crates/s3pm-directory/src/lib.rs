@@ -1,6 +1,16 @@
 pub mod directory;
 
-// Re-export the important API at crate root to minimize changes in proxy.
-pub use directory::{Directory, openbao, posix_groups, types, yaml};
-pub use directory::types::{UserDoc, BucketDoc, BucketView, AclEntry, Principal, AccessLevel};
+// Modules
+pub use directory::{file, layout, openbao, posix_groups, types, yaml};
+
+// Trait + core types
+pub use directory::Directory;
+pub use directory::types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc};
+
+// Shared helpers / DTOs
+pub use directory::file::{
+    load_directory_yaml_file, parse_directory_yaml_str, render_directory_yaml_string,
+    save_directory_yaml_file, DirectoryFileV1,
+};
+pub use directory::layout::{normalize_acl, principal_key, DirectoryLayout, IndexDoc};
 

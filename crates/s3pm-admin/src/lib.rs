@@ -4,5 +4,10 @@ pub mod yaml;
 pub use s3pm_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
 
 pub use openbao::{AppRoleCredentials, OpenBaoAdmin, OpenBaoAuth, SetupResult};
-pub use yaml::{parse_yaml_str, render_yaml_string, load_yaml_file, save_yaml_file, YamlRoot};
+pub use yaml::{DirectoryFileV1,
+    load_directory_yaml_file,
+    parse_directory_yaml_str,
+    render_directory_yaml_string,
+    save_directory_yaml_file,
+};
 
