@@ -23,6 +23,17 @@ The proxy itself does not perform filesystem I/O.
 
 ---
 
+## Repository layout
+
+This repository is a Rust workspace with multiple crates:
+
+- `s3pm-proxy`: the Pingora-based proxy binary
+- `s3pm-directory`: shared Directory API + YAML/OpenBao backends + shared YAML file format
+- `s3pm-admin`: management library (OpenBao write access, import/export, etc.)
+- `s3pm-ctl`: CLI wrapper around `s3pm-admin` (operator tooling)
+
+---
+
 ## Architecture
 
 ```
@@ -273,6 +284,108 @@ The indices make `buckets_for_access_key()` efficient:
 
 ---
 
+## Administration CLI (`s3pm-ctl`)
+
+This repo includes an operator CLI, **`s3pm-ctl`**, built on top of the `s3pm-admin` library.
+
+It supports:
+
+- setting up OpenBao (KV layout + policies + AppRoles)
+- adding/removing/listing users
+- adding/removing/listing buckets
+- changing bucket ACLs
+- importing YAML â OpenBao
+- exporting OpenBao â YAML
+
+> Tip: run `s3pm-ctl --help` (and `s3pm-ctl <command> --help`) to see the exact flags supported by your current build.
+
+### OpenBao setup
+
+The setup command creates **two AppRoles**:
+
+- `s3pm-proxy`: **read-only** (used by the proxy)
+- `s3pm-admin`: **read-write** (used by operator tooling)
+
+Typical flow:
+
+```bash
+# using a root token (or other high-privilege token) just for setup
+s3pm-ctl openbao setup \
+  --address http://127.0.0.1:8200 \
+  --root-token "$OPENBAO_TOKEN" \
+  --approle-mount approle \
+  --kv-mount secret \
+  --prefix s3pm
+```
+
+The command prints the generated **Role ID** and **Secret ID** for both roles.
+Store the proxy credentials as files referenced by `s3pm-proxy` config:
+
+- `auth.openbao.role_id_file`
+- `auth.openbao.secret_id_file`
+
+### Users
+
+```bash
+# add/update a user mapping
+s3pm-ctl user add \
+  --access-key AKIA_ALICE_1 \
+  --secret-key alice_secret \
+  --username alice \
+  --uid 1001 --gid 1001
+
+# list users
+s3pm-ctl user ls
+
+# remove a user mapping (optionally scrub ACL references)
+s3pm-ctl user rm --access-key AKIA_ALICE_1
+```
+
+### Buckets
+
+```bash
+# add a bucket (requires id/name/path + initial ACL)
+s3pm-ctl bucket add \
+  --id bkt-alice-photos \
+  --name photos \
+  --data-path /srv/s3/alice/photos
+
+# list buckets
+s3pm-ctl bucket ls
+
+# remove a bucket by id
+s3pm-ctl bucket rm --id bkt-alice-photos
+```
+
+### Bucket ACLs (permissions)
+
+ACL principals are:
+
+- `access_key:<AKIA...>`
+- `group_name:<posix-group>`
+
+```bash
+# set / replace the ACL (example syntax; use --help for your exact flags)
+s3pm-ctl bucket acl set \
+  --id bkt-team \
+  --grant group_name:s3-team=read_write \
+  --grant access_key:AKIA_ALICE_1=read_only
+```
+
+The proxy computes effective access as the maximum of all matching ACL entries.
+
+### Import / Export (YAML to/from OpenBao)
+
+```bash
+# import YAML into OpenBao (optionally replace existing data)
+s3pm-ctl import-yaml --file /etc/s3pm/directory.yaml --replace
+
+# export OpenBao directory to YAML
+s3pm-ctl export-yaml --file /etc/s3pm/directory.yaml
+```
+
+---
+
 ## Building
 
 ```bash
@@ -284,7 +397,7 @@ cargo build
 ## Running (development)
 
 ```bash
-RUST_LOG=s3_proxy_manager=debug cargo run
+RUST_LOG=s3_proxy_manager=debug cargo run -p s3pm-proxy
 ```
 
 The proxy binds to the address configured in `etc/s3-proxy-manager.yaml`, default:
