@@ -81,7 +81,7 @@ struct OpenBaoConnArgs {
 
 #[derive(Args, Debug, Clone, Default)]
 struct OpenBaoAuthArgs {
-    /// Use a token (typically for setup or bootstrap).
+    /// root/admin token for bootstrap (VAULT_TOKEN).
     #[arg(long, env = "VAULT_TOKEN")]
     token: Option<String>,
 
@@ -158,14 +158,6 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
 
 #[derive(Args, Debug)]
 struct SetupArgs {
-    /// For OpenBao: root/admin token for bootstrap (VAULT_TOKEN)
-    #[arg(long, env = "VAULT_TOKEN")]
-    root_token: Option<String>,
-
-    /// For OpenBao: AppRole auth mount to enable/use (default: approle)
-    #[arg(long, default_value = "approle")]
-    approle_mount: String,
-
     /// For OpenBao: write proxy role_id to file
     #[arg(long)]
     proxy_role_id_file: Option<PathBuf>,
@@ -406,15 +398,15 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| anyhow!("missing OpenBao address: provide --address or VAULT_ADDR"))?
                     .clone();
 
-                let root_token = args
-                    .root_token
+                let root_token = openbao
+                    .auth.token
                     .clone()
-                    .ok_or_else(|| anyhow!("setup(openbao) requires --root-token or VAULT_TOKEN"))?;
+                    .ok_or_else(|| anyhow!("setup(openbao) requires --token or VAULT_TOKEN"))?;
 
                 let res = OpenBaoAdmin::setup(
                     address,
                     root_token,
-                    args.approle_mount.clone(),
+                    openbao.auth.approle_mount.clone(),
                     openbao.kv_mount.clone(),
                     openbao.prefix.clone(),
                 )

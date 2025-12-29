@@ -286,105 +286,177 @@ The indices make `buckets_for_access_key()` efficient:
 
 ## Administration CLI (`s3pm-ctl`)
 
-This repo includes an operator CLI, **`s3pm-ctl`**, built on top of the `s3pm-admin` library.
+`s3pm-ctl` manages the Directory state (users, buckets, ACLs) for both supported backends:
+- `--backend openbao` (default): OpenBao/Vault KV v2 + indices
+- `--backend yaml`: local directory.yaml file
 
-It supports:
+All commands work with both backends. The backend is selected via `--backend`.
 
-- setting up OpenBao (KV layout + policies + AppRoles)
-- adding/removing/listing users
-- adding/removing/listing buckets
-- changing bucket ACLs
-- importing YAML â OpenBao
-- exporting OpenBao â YAML
+### Backend selection
 
-> Tip: run `s3pm-ctl --help` (and `s3pm-ctl <command> --help`) to see the exact flags supported by your current build.
-
-### OpenBao setup
-
-The setup command creates **two AppRoles**:
-
-- `s3pm-proxy`: **read-only** (used by the proxy)
-- `s3pm-admin`: **read-write** (used by operator tooling)
-
-Typical flow:
+#### YAML backend
+For YAML, you must provide the directory file path:
 
 ```bash
-# using a root token (or other high-privilege token) just for setup
-s3pm-ctl openbao setup \
-  --address http://127.0.0.1:8200 \
-  --root-token "$OPENBAO_TOKEN" \
-  --approle-mount approle \
-  --kv-mount secret \
-  --prefix s3pm
+s3pm-ctl --backend yaml --yaml-path /etc/s3pm/directory.yaml <COMMAND...>
 ```
 
-The command prints the generated **Role ID** and **Secret ID** for both roles.
-Store the proxy credentials as files referenced by `s3pm-proxy` config:
+#### OpenBao backend
+For OpenBao, provide `--address` (or `VAULT_ADDR`) plus authentication:
+- Setup typically uses a root/admin token (`--token` or `VAULT_TOKEN`)
+- Normal operations typically use AppRole (`--role-id(-file)` + `--secret-id(-file)`)
 
-- `auth.openbao.role_id_file`
-- `auth.openbao.secret_id_file`
+Common OpenBao flags:
+- `--address http://127.0.0.1:8200` (or `VAULT_ADDR`)
+- `--kv-mount secret` (default: `secret`)
+- `--prefix s3pm` (default: `s3pm`)
+- `--approle-mount approle` (default: `approle`)
+- `--token ...` (or `VAULT_TOKEN`)
+- `--role-id ...` / `--role-id-file ...`
+- `--secret-id ...` / `--secret-id-file ...`
+
+Example:
+
+```bash
+s3pm-ctl --backend openbao \
+  --address http://127.0.0.1:8200 \
+  --kv-mount secret \
+  --prefix s3pm \
+  --approle-mount approle \
+  --role-id-file /etc/s3pm/admin_role_id \
+  --secret-id-file /etc/s3pm/admin_secret_id \
+  <COMMAND...>
+```
+
+### Setup
+
+#### OpenBao setup
+Creates/updates:
+- enables AppRole auth method at `--approle-mount` (default: `approle`)
+- creates policies + roles:
+  - `s3pm-proxy` (read-only)
+  - `s3pm-admin` (read-write)
+
+You must provide a bootstrap token (`--token` or `VAULT_TOKEN`):
+
+```bash
+export VAULT_ADDR=http://127.0.0.1:8200
+export VAULT_TOKEN=... # root/admin token for setup only
+
+s3pm-ctl --backend openbao setup \
+  --proxy-role-id-file  /etc/s3pm/proxy_role_id \
+  --proxy-secret-id-file /etc/s3pm/proxy_secret_id \
+  --admin-role-id-file  /etc/s3pm/admin_role_id \
+  --admin-secret-id-file /etc/s3pm/admin_secret_id
+```
+
+The secret files are written with permissions 0600 on Unix.
+
+#### YAML setup
+Creates an empty directory file skeleton:
+
+```bash
+s3pm-ctl --backend yaml --yaml-path /etc/s3pm/directory.yaml setup
+```
 
 ### Users
 
+Commands:
+- `user add`
+- `user rm`
+- `user ls`
+
+Add a user:
+
 ```bash
-# add/update a user mapping
-s3pm-ctl user add \
+s3pm-ctl ... user add \
   --access-key AKIA_ALICE_1 \
   --secret-key alice_secret \
   --username alice \
-  --uid 1001 --gid 1001
+  --uid 1001 \
+  --gid 1001
+```
 
-# list users
-s3pm-ctl user ls
+Remove a user (optionally scrubs their `access_key` from bucket ACLs):
 
-# remove a user mapping (optionally scrub ACL references)
-s3pm-ctl user rm --access-key AKIA_ALICE_1
+```bash
+s3pm-ctl ... user rm --access-key AKIA_ALICE_1 --cleanup-acls true
+```
+
+List users:
+
+```bash
+s3pm-ctl ... user ls
 ```
 
 ### Buckets
 
+Commands:
+- `bucket add`
+- `bucket rm`
+- `bucket ls`
+- `bucket acl-set`
+
+Add a bucket:
+
 ```bash
-# add a bucket (requires id/name/path + initial ACL)
-s3pm-ctl bucket add \
-  --id bkt-alice-photos \
+s3pm-ctl ... bucket add \
   --name photos \
-  --data-path /srv/s3/alice/photos
-
-# list buckets
-s3pm-ctl bucket ls
-
-# remove a bucket by id
-s3pm-ctl bucket rm --id bkt-alice-photos
+  --data-path /srv/s3/alice/photos \
+  --grant ak:AKIA_ALICE_1:read_write
 ```
 
-### Bucket ACLs (permissions)
+`--grant` is repeatable and supports:
+- `ak:<ACCESS_KEY>:read_only|read_write`
+- `group:<GROUP_NAME>:read_only|read_write`
 
-ACL principals are:
-
-- `access_key:<AKIA...>`
-- `group_name:<posix-group>`
+Optional: provide a stable bucket id (otherwise a UUID is generated):
 
 ```bash
-# set / replace the ACL (example syntax; use --help for your exact flags)
-s3pm-ctl bucket acl set \
-  --id bkt-team \
-  --grant group_name:s3-team=read_write \
-  --grant access_key:AKIA_ALICE_1=read_only
+s3pm-ctl ... bucket add \
+  --bucket-id bkt-alice-photos \
+  --name photos \
+  --data-path /srv/s3/alice/photos \
+  --grant ak:AKIA_ALICE_1:read_write
 ```
 
-The proxy computes effective access as the maximum of all matching ACL entries.
-
-### Import / Export (YAML to/from OpenBao)
+Remove a bucket:
 
 ```bash
-# import YAML into OpenBao (optionally replace existing data)
-s3pm-ctl import-yaml --file /etc/s3pm/directory.yaml --replace
-
-# export OpenBao directory to YAML
-s3pm-ctl export-yaml --file /etc/s3pm/directory.yaml
+s3pm-ctl ... bucket rm --bucket-id bkt-alice-photos
 ```
 
----
+List buckets:
+
+```bash
+s3pm-ctl ... bucket ls
+```
+
+Replace a bucket ACL:
+
+```bash
+s3pm-ctl ... bucket acl-set \
+  --bucket-id bkt-team \
+  --grant group:s3-team:read_write \
+  --grant ak:AKIA_ALICE_1:read_only
+```
+
+### Import / Export
+
+Import a directory YAML into the selected backend:
+
+```bash
+s3pm-ctl ... import-yaml --yaml /path/to/directory.yaml --replace true
+```
+
+- openbao: `--replace` purges the directory subtrees under the configured prefix before import.
+- yaml: `--replace` overwrites the destination file; `--replace false` merges by `users.access_key` and `buckets.id`.
+
+Export backend state to a directory YAML:
+
+```bash
+s3pm-ctl ... export-yaml --yaml /path/to/directory.yaml
+```
 
 ## Building
 
