@@ -1,0 +1,31 @@
+[package]
+name = "s3pm-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+http = "1"
+httpdate = "1"
+bytes = "1"
+
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+tokio-uring = "0.5"
+tokio = { version = "1", features = ["net"] }
+
+aligned-buffer = "0.2"
+libc = "0.2"
+
+serde = { version = "1", features = ["derive"] }
+quick-xml = { version = "0.38", features = ["serialize"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+s3pm-support = { path = "../s3pm-support" }
+

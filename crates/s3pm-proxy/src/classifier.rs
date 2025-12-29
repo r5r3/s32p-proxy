@@ -20,6 +20,8 @@ pub enum S3Op {
     Multipart(MultipartOp),
     /// Versioning related operation.
     Versioning(VersioningOp),
+    /// Simple object GET (no query params).
+    GetObject,
     /// Anything else (for now).
     Other,
 }
@@ -104,6 +106,10 @@ impl QueryParams {
             .and_then(|v| v.first())
             .map(|s| s.as_str())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 /// Classify an incoming request into S3 operation buckets.
@@ -131,6 +137,16 @@ pub fn classify(req: &RequestHeader) -> S3RequestClass {
         };
     }
 
+    // GetObject: GET /{bucket}/{key} with *no* query params
+    if req.method.as_str() == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::GetObject,
+        };
+    }
+
     S3RequestClass {
         bucket,
         key,
@@ -144,6 +160,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
     match &class.op {
         S3Op::Multipart(_) => Some("multipart uploads are not implemented"),
         S3Op::Versioning(_) => Some("versioning is not implemented"),
+        S3Op::GetObject => None, // handled by routing/gateway
         S3Op::Other => None,
     }
 }

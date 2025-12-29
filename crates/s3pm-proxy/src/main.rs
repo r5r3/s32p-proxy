@@ -58,6 +58,7 @@ fn class_key(class: &classifier::S3RequestClass) -> &'static str {
     match &class.op {
         classifier::S3Op::Multipart(_) => "multipart",
         classifier::S3Op::Versioning(_) => "versioning",
+        classifier::S3Op::GetObject => "getobject",
         classifier::S3Op::Other => "other",
     }
 }

@@ -41,6 +41,19 @@ workers:
         ROOT_ACCESS_KEY: "{{access_key}}"
         ROOT_SECRET_KEY: "{{secret_key}}"
 
+    s3pm-gateway:
+      exec: "target/debug/s3pm-gateway"
+      args: []
+      env:
+        S3PM_BIND_ADDR: "{{bind_addr}}"
+        S3PM_POSIX_ROOT: "{{posix_root}}"
+        AWS_ACCESS_KEY_ID: "{{access_key}}"
+        AWS_SECRET_ACCESS_KEY: "{{secret_key}}"
+        S3PM_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
+        S3PM_CHUNK_SIZE: "1048576"
+        S3PM_INFLIGHT: "32"
+        S3PM_DIRECT_IO: "true"
+
 routing:
   class_map:
     multipart:
@@ -49,6 +62,9 @@ routing:
     versioning:
       action: "not_implemented"
       message: "versioning is not implemented"
+    getobject:
+      action: "proxy"
+      worker_profile: "s3pm-gateway"
     other:
       action: "proxy"
       worker_profile: "versitygw-default"
