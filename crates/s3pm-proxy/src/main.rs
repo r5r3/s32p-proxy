@@ -13,7 +13,6 @@ use std::time::Instant;
 use std::fs;
 
 mod responses;
-mod sigv4;
 mod worker_manager;
 mod classifier;
 mod config;
@@ -22,6 +21,8 @@ use s3pm_directory::Directory;
 use s3pm_directory::{UserDoc, BucketView};
 use s3pm_directory::yaml::YamlDirectory;
 use s3pm_directory::openbao::OpenBaoDirectory;
+
+use s3pm_support;
 
 use worker_manager::{WorkerHandle, WorkerManager};
 
@@ -113,7 +114,7 @@ impl ProxyHttp for S3ProxyApp {
         );
 
         // 1) Extract access key cheaply (no SigV4 check yet)
-        let access_key = match sigv4::extract_access_key(&req) {
+        let access_key = match s3pm_support::extract_access_key(&req.headers) {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to extract access key");
@@ -329,7 +330,7 @@ async fn validate_sigv4_header_only_or_reject(
     public_scheme: &str,
 ) -> PResult<bool> {
     // Parse full Authorization (for SignedHeaders/scope/region/service/signature)
-    let auth = match sigv4::parse_authorization(req) {
+    let auth = match s3pm_support::parse_authorization(&req.headers) {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(uid = user.uid, error = %e, "failed to parse Authorization");
@@ -347,7 +348,7 @@ async fn validate_sigv4_header_only_or_reject(
     };
 
     // Validate header-only SigV4 using client x-amz-content-sha256
-    if let Err(e) = sigv4::verify_sigv4_header_only(req, &auth, &user.secret_key, public_scheme) {
+    if let Err(e) = s3pm_support::verify_sigv4_header_only(req.method.as_str(), &req.uri, &req.headers, &auth, &user.secret_key, public_scheme) {
         tracing::warn!(
             uid = user.uid,
             username = user.username.as_str(),

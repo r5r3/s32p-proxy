@@ -4,7 +4,7 @@ use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningParams, Sign
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use constant_time_eq::constant_time_eq;
-use pingora::http::RequestHeader;
+use http::{HeaderMap, Uri};
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,9 +21,8 @@ pub struct SigV4Auth {
     pub signature: String,      // hex
 }
 
-pub fn parse_authorization(req: &RequestHeader) -> Result<SigV4Auth> {
-    let auth = req
-        .headers
+pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
+    let auth = headers
         .get("authorization")
         .ok_or_else(|| anyhow!("missing Authorization"))?
         .to_str()
@@ -85,9 +84,8 @@ pub fn parse_authorization(req: &RequestHeader) -> Result<SigV4Auth> {
 
 /// Cheap routing helper: extract only the access key from Authorization header.
 /// (No SigV4 validation, no SignedHeaders parsing.)
-pub fn extract_access_key(req: &RequestHeader) -> Result<String> {
-    let auth = req
-        .headers
+pub fn extract_access_key(headers: &HeaderMap) -> Result<String> {
+    let auth = headers
         .get("authorization")
         .ok_or_else(|| anyhow!("missing Authorization"))?
         .to_str()
@@ -121,14 +119,15 @@ pub fn extract_access_key(req: &RequestHeader) -> Result<String> {
 /// Verify SigV4 *without reading the body*, using client x-amz-content-sha256.
 /// Use this ONLY to gate worker spawn (first request).
 pub fn verify_sigv4_header_only(
-    req: &RequestHeader,
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
     auth: &SigV4Auth,
     secret_key: &str,
     public_scheme: &str, // "http" or "https"
 ) -> Result<()> {
     // 1) Parse X-Amz-Date into signing time (SystemTime) and YYYYMMDD
-    let x_amz_date = req
-        .headers
+    let x_amz_date = headers
         .get("x-amz-date")
         .ok_or_else(|| anyhow!("missing x-amz-date"))?
         .to_str()
@@ -147,8 +146,7 @@ pub fn verify_sigv4_header_only(
     }
 
     // 2) Determine payload hash mode from x-amz-content-sha256
-    let payload_hash = req
-        .headers
+    let payload_hash = headers
         .get("x-amz-content-sha256")
         .ok_or_else(|| anyhow!("missing x-amz-content-sha256"))?
         .to_str()
@@ -166,15 +164,13 @@ pub fn verify_sigv4_header_only(
     };
 
     // 3) Build URI for signing
-    let host = req
-        .headers
+    let host = headers
         .get("host")
         .ok_or_else(|| anyhow!("missing Host"))?
         .to_str()
         .map_err(|_| anyhow!("bad Host"))?;
 
-    let path_and_query = req
-        .uri
+    let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
@@ -183,7 +179,7 @@ pub fn verify_sigv4_header_only(
 
     // 4) Build header map lowercased
     let mut header_map: HashMap<String, String> = HashMap::new();
-    for (name, value) in req.headers.iter() {
+    for (name, value) in headers.iter() {
         let n = name.as_str().to_ascii_lowercase();
         if n == "authorization" {
             continue;
@@ -212,7 +208,7 @@ pub fn verify_sigv4_header_only(
     let header_iter = header_storage.iter().map(|(k, v)| (k.as_str(), v.as_str()));
 
     // 6) Build signable request
-    let signable = SignableRequest::new(req.method.as_str(), &uri, header_iter, body)
+    let signable = SignableRequest::new(method, &uri, header_iter, body)
         .map_err(|e| anyhow!("signable request error: {e}"))?;
 
     // 7) Build signing params

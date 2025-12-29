@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/s3pm-directory",
   "crates/s3pm-proxy",
+  "crates/s3pm-support",
   "crates/s3pm-admin",
   "crates/s3pm-ctl",
 ]
