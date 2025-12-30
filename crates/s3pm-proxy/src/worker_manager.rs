@@ -291,8 +291,8 @@ impl WorkerManager {
             .arg(&profile.exec)
             .args(rendered_args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
 
         for (k, v) in rendered_env {
             cmd.env(k, v);
