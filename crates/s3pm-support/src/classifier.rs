@@ -21,8 +21,8 @@ pub enum S3Op {
     Multipart(MultipartOp),
     /// Versioning related operation.
     Versioning(VersioningOp),
-    /// Simple object GET (no query params).
-    GetObject,
+    /// Basic read operations (we’ll add more here later).
+    Read(ReadOp),
     /// Anything else (for now).
     Other,
 }
@@ -68,6 +68,14 @@ pub enum VersioningOp {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOp {
+    /// GET /{bucket}/{key} (no query params)
+    GetObject,
+    /// GET /{bucket}?location or GET /{bucket}/?location
+    GetBucketLocation,
+}
+
 /// Parsed query params with lowercased keys.
 /// Values are percent-decoded (via url::form_urlencoded), which is correct for routing.
 /// Presence-only parameters are stored as empty string value (e.g. "?uploads" -> ("uploads","")).
@@ -110,6 +118,10 @@ impl QueryParams {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    pub fn is_only(&self, key: &str) -> bool {
+        self.inner.len() == 1 && self.has(key)
+    }
 }
 
 /// Convert a parsed class into a stable routing key used by config/routing.
@@ -118,7 +130,7 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
     match &class.op {
         S3Op::Multipart(_) => "multipart",
         S3Op::Versioning(_) => "versioning",
-        S3Op::GetObject => "getobject",
+        S3Op::Read(_) => "read", // grouped "basic read" ops (GetObject, GetBucketLocation, ...)
         S3Op::Other => "other",
     }
 }
@@ -149,13 +161,23 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
         };
     }
 
+    // GetBucketLocation: GET /{bucket}?location (or /{bucket}/?location), and ONLY that param
+    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only("location") {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Read(ReadOp::GetBucketLocation),
+        };
+    }
+
     // GetObject: GET /{bucket}/{key} with *no* query params
     if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
         return S3RequestClass {
             bucket,
             key,
             query,
-            op: S3Op::GetObject,
+            op: S3Op::Read(ReadOp::GetObject),
         };
     }
 
@@ -173,7 +195,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
     match &class.op {
         S3Op::Multipart(_) => Some("multipart uploads are not implemented"),
         S3Op::Versioning(_) => Some("versioning is not implemented"),
-        S3Op::GetObject => None, // GetObject is implemented by the worker/gateway.
+        S3Op::Read(_) => None, // handled by routing/gateway
         S3Op::Other => None,
     }
 }

@@ -21,7 +21,7 @@ use tokio::{
 };
 use tempfile::TempDir;
 
-use crate::config::{WorkerProfile, WorkersConfig};
+use crate::config::{WorkerProfile, WorkersConfig, ServerConfig};
 use s3pm_directory::{UserDoc, BucketView};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -41,7 +41,8 @@ impl WorkerKey {
 
 pub struct WorkerManager {
     cfg: WorkersConfig,
-    slots: DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (uid, worker_profile)
+    server_cfg: ServerConfig,
+    slots: DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
     sweeper_started: AtomicBool,
 }
 
@@ -106,9 +107,10 @@ impl WorkerHandle {
 }
 
 impl WorkerManager {
-    pub fn new(cfg: WorkersConfig) -> Arc<Self> {
+    pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig) -> Arc<Self> {
         Arc::new(Self {
             cfg,
+            server_cfg,
             slots: DashMap::new(),
             sweeper_started: AtomicBool::new(false),
         })
@@ -279,6 +281,7 @@ impl WorkerManager {
             posix_root: &staged_root_str,
             port,
             bind_addr: &bind_addr,
+            region: &self.server_cfg.region,
         };
 
         let rendered_args = render_args(&profile.args, &vars)
@@ -310,7 +313,7 @@ impl WorkerManager {
             child: Mutex::new(child),
         });
 
-        wait_until_ready(addr, Duration::from_secs(2)).await?;
+        wait_until_ready(addr, Duration::from_secs(20)).await?;
         Ok(handle)
     }
 
@@ -378,6 +381,7 @@ struct TemplateVars<'a> {
     posix_root: &'a str,
     port: u16,
     bind_addr: &'a str,
+    region: &'a str,
 }
 
 fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
@@ -420,6 +424,7 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
             "posix_root" => vars.posix_root.to_string(),
             "port" => vars.port.to_string(),
             "bind_addr" => vars.bind_addr.to_string(),
+            "region" => vars.region.to_string(),
             other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
         };
 

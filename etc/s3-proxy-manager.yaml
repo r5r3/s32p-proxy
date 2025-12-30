@@ -3,6 +3,7 @@ version: 1
 server:
   listen: "0.0.0.0:9000"
   public_scheme: "http"
+  region: "us-east-1"
   log: "info"
 
 auth:
@@ -50,8 +51,9 @@ workers:
         AWS_ACCESS_KEY_ID: "{{access_key}}"
         AWS_SECRET_ACCESS_KEY: "{{secret_key}}"
         S3PM_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
+        S3PM_REGION: "{{region}}"
         S3PM_CHUNK_SIZE: "1048576"
-        S3PM_INFLIGHT: "32"
+        S3PM_INFLIGHT: "4"
         S3PM_DIRECT_IO: "true"
 
 routing:
@@ -62,7 +64,7 @@ routing:
     versioning:
       action: "not_implemented"
       message: "versioning is not implemented"
-    getobject:
+    read:
       action: "proxy"
       worker_profile: "s3pm-gateway"
     other:

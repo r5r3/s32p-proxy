@@ -124,3 +124,24 @@ pub async fn respond_list_buckets(
     .await
 }
 
+/// Convenience: GetBucketLocation success (200).
+pub async fn respond_get_bucket_location(
+    session: &mut Session,
+    region: &str,
+    _resource: Option<&str>,
+    _request_id: Option<&str>,
+) -> pingora::Result<()> {
+    let body = s3xml::get_bucket_location_body(region)
+        .unwrap_or_else(|_| b"<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>".to_vec());
+
+    respond_bytes(
+        session,
+        StatusCode::OK,
+        "application/xml",
+        body,
+        &[],
+        /* close = */ false, // GET has no request body; safe to keepalive
+    )
+    .await
+}
+

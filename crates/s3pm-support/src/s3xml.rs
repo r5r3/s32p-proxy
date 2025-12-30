@@ -86,6 +86,17 @@ fn format_s3_time_utc_z(dt: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// Build XML body for GetBucketLocation.
+/// AWS returns an *empty* LocationConstraint for us-east-1.
+/// Many clients accept either empty text or a self-closing tag; we emit empty text via Option::None.
+pub fn get_bucket_location_body(region: &str) -> Result<Vec<u8>> {
+    let value = if region == "us-east-1" { None } else { Some(region.to_string()) };
+    let doc = LocationConstraintDoc { xmlns: S3_XMLNS, value };
+    let xml = to_xml_string(&doc)?;
+    Ok(xml.into_bytes())
+}
+
+
 /* -------------------------
  * XML DTOs
  * ------------------------- */
@@ -140,4 +151,16 @@ struct Bucket {
     #[serde(rename = "CreationDate")]
     creation_date: String,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "LocationConstraint")]
+struct LocationConstraintDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    // quick-xml/serde text node
+    #[serde(rename = "$text", skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
 

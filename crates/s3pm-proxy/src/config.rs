@@ -17,6 +17,8 @@ pub struct ServerConfig {
     pub listen: String,
     /// "http" in dev, "https" behind TLS termination
     pub public_scheme: String,
+    /// Bucket region returned by GetBucketLocation (e.g. "eu-central-1"). Use "us-east-1" for the classic default.
+    pub region: String,
     /// e.g. "info", "debug", or "s3_proxy_manager=debug"
     pub log: Option<String>,
 }
@@ -169,6 +171,10 @@ impl Config {
                     "server.public_scheme must be 'http' or 'https' (got '{other}')"
                 ))
             }
+        }
+
+        if self.server.region.trim().is_empty() {
+            return Err(anyhow!("server.region must not be empty"));
         }
 
         match self.auth.backend {

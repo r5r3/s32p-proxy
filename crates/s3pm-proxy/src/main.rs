@@ -30,6 +30,7 @@ struct S3ProxyApp {
     workers: Arc<WorkerManager>,
     public_scheme: String, // from config.server.public_scheme
     routing: config::RoutingConfig,
+    region: String, // from config.server.region (for GetBucketLocation)
 }
 
 #[derive(Clone, Default)]
@@ -76,13 +77,28 @@ impl ProxyHttp for S3ProxyApp {
         let class = s3pm_support::classifier::classify(req.method.as_str(), &req.uri);
         let key = s3pm_support::classifier::class_key(&class);
 
-        // Determine route action from config
-        let action = self.routing.class_map.get(key).ok_or_else(|| {
-            Error::explain(
-                ErrorType::InternalError,
-                format!("no routing configured for class '{key}'"),
-            )
-        })?;
+        // Determine route action from config.
+        // If routing for the specific class is not configured,
+        // fall back to the "other" route.
+        let (selected_key, action) = match self.routing.class_map.get(key) {
+            Some(a) => (key, a),
+            None => match self.routing.class_map.get("other") {
+                Some(a) => {
+                    tracing::debug!(
+                        requested_class = key,
+                        fallback_class = "other",
+                        "no routing configured for class; falling back to 'other'"
+                    );
+                    ("other", a)
+                }
+                None => {
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        format!("no routing configured for class '{key}' and no fallback 'other' route"),
+                    ));
+                }
+            },
+        };
 
         tracing::debug!(?class, class_key = key, ?action, "classified request and selected route action");
 
@@ -143,6 +159,24 @@ impl ProxyHttp for S3ProxyApp {
             }
         };
         ctx.set_user(&user);
+
+
+        // 2a) Handle GetBucketLocation locally (fast path).
+        // IMPORTANT: We still validate SigV4 first, just like NotImplemented.
+        if matches!(class.op, s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation)) {
+            if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
+                return Ok(true); // already responded with auth/signature error
+            }
+
+            responses::respond_get_bucket_location(
+                session,
+                &self.region,
+                Some(req.uri.path()),
+                None,
+            )
+            .await?;
+            return Ok(true);
+        }
 
         // 2b) If routing says NotImplemented: validate first, then reply NotImplemented.
         if let config::RouteAction::NotImplemented { message } = action {
@@ -401,13 +435,14 @@ fn main() -> Result<()> {
 
     let listen = cfg.server.listen.clone();
 
-    let workers = WorkerManager::new(cfg.workers.clone());
+    let workers = WorkerManager::new(cfg.workers.clone(), cfg.server.clone());
 
     let app = S3ProxyApp {
         directory,
         workers,
         public_scheme: cfg.server.public_scheme.clone(),
         routing: cfg.routing.clone(),
+        region: cfg.server.region.clone(),
     };
 
     let mut server = Server::new(None)?;
