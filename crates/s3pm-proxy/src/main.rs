@@ -14,7 +14,6 @@ use std::fs;
 
 mod responses;
 mod worker_manager;
-mod classifier;
 mod config;
 
 use s3pm_directory::Directory;
@@ -54,15 +53,6 @@ impl ProxyCtx {
     }
 }
 
-fn class_key(class: &classifier::S3RequestClass) -> &'static str {
-    match &class.op {
-        classifier::S3Op::Multipart(_) => "multipart",
-        classifier::S3Op::Versioning(_) => "versioning",
-        classifier::S3Op::GetObject => "getobject",
-        classifier::S3Op::Other => "other",
-    }
-}
-
 #[async_trait]
 impl ProxyHttp for S3ProxyApp {
     type CTX = ProxyCtx;
@@ -80,9 +70,11 @@ impl ProxyHttp for S3ProxyApp {
         // IMPORTANT: clone header so we don't hold an immutable borrow of `session`
         let req: RequestHeader = session.req_header().clone();
 
-        // Classify (no body required)
-        let class = classifier::classify(&req);
-        let key = class_key(&class);
+        // Classify (no body required).
+        // This logic is shared with the gateway now (in s3pm-support),
+        // so routing decisions won't drift.
+        let class = s3pm_support::classifier::classify(req.method.as_str(), &req.uri);
+        let key = s3pm_support::classifier::class_key(&class);
 
         // Determine route action from config
         let action = self.routing.class_map.get(key).ok_or_else(|| {
@@ -428,3 +420,4 @@ fn main() -> Result<()> {
     tracing::info!("s3-proxy-manager listening on {}", listen);
     server.run_forever();
 }
+

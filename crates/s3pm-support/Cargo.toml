@@ -14,3 +14,9 @@ aws-smithy-runtime-api = "1.9"
 constant_time_eq = "0.4"
 time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 
+# shared classifier parses query params
+url = "2"
+
+# shared S3 REST-XML builders
+serde = { version = "1", features = ["derive"] }
+quick-xml = { version = "0.38", features = ["serialize"] }

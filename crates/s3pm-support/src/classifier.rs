@@ -1,7 +1,8 @@
-use pingora::http::RequestHeader;
+use http::Uri;
 use std::collections::HashMap;
 
 /// High-level classification for S3 REST requests.
+/// Shared by proxy and gateway to avoid duplicated request parsing logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3RequestClass {
     /// Bucket name if present (path-style parsing for now).
@@ -68,7 +69,8 @@ pub enum VersioningOp {
 }
 
 /// Parsed query params with lowercased keys.
-/// Values are kept raw (no percent decoding), which is fine for routing/versioning/multipart keys.
+/// Values are percent-decoded (via url::form_urlencoded), which is correct for routing.
+/// Presence-only parameters are stored as empty string value (e.g. "?uploads" -> ("uploads","")).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryParams {
     // key -> list of values; presence-only parameters are stored as empty string value.
@@ -76,15 +78,13 @@ pub struct QueryParams {
 }
 
 impl QueryParams {
-    pub fn from_req(req: &RequestHeader) -> Self {
+    pub fn from_uri(uri: &Uri) -> Self {
         let mut out = QueryParams::default();
-        let q = match req.uri.query() {
+        let q = match uri.query() {
             Some(q) if !q.is_empty() => q,
             _ => return out,
         };
 
-        // Parses application/x-www-form-urlencoded style, percent-decodes.
-        // For presence-only flags like "?uploads", form_urlencoded yields ("uploads", "").
         for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
             let key = k.trim().to_ascii_lowercase();
             if key.is_empty() {
@@ -112,14 +112,26 @@ impl QueryParams {
     }
 }
 
+/// Convert a parsed class into a stable routing key used by config/routing.
+/// This keeps the routing table simple (multipart/versioning/getobject/other).
+pub fn class_key(class: &S3RequestClass) -> &'static str {
+    match &class.op {
+        S3Op::Multipart(_) => "multipart",
+        S3Op::Versioning(_) => "versioning",
+        S3Op::GetObject => "getobject",
+        S3Op::Other => "other",
+    }
+}
+
 /// Classify an incoming request into S3 operation buckets.
 /// Currently focuses on versioning + multipart uploads (to reject as NotImplemented).
-pub fn classify(req: &RequestHeader) -> S3RequestClass {
-    let (bucket, key) = parse_bucket_key_path_style(req.uri.path());
-    let query = QueryParams::from_req(req);
+pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
+    let (bucket, key) = parse_bucket_key_path_style(uri.path());
+    let query = QueryParams::from_uri(uri);
 
-    // Detect multipart first (uploadId can coexist with versionId in theory, but multipart routing is usually clearer).
-    if let Some(op) = classify_multipart(req, &bucket, &key, &query) {
+    // Detect multipart first (uploadId can coexist with versionId in theory,
+    // but multipart routing is usually clearer).
+    if let Some(op) = classify_multipart(method, &bucket, &key, &query) {
         return S3RequestClass {
             bucket,
             key,
@@ -128,7 +140,7 @@ pub fn classify(req: &RequestHeader) -> S3RequestClass {
         };
     }
 
-    if let Some(op) = classify_versioning(req, &bucket, &key, &query) {
+    if let Some(op) = classify_versioning(method, &bucket, &key, &query) {
         return S3RequestClass {
             bucket,
             key,
@@ -138,7 +150,7 @@ pub fn classify(req: &RequestHeader) -> S3RequestClass {
     }
 
     // GetObject: GET /{bucket}/{key} with *no* query params
-    if req.method.as_str() == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
+    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
         return S3RequestClass {
             bucket,
             key,
@@ -156,23 +168,22 @@ pub fn classify(req: &RequestHeader) -> S3RequestClass {
 }
 
 /// If this request should be rejected as "NotImplemented" (for now), return a message.
+/// (Both proxy and gateway can use this consistently.)
 pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
     match &class.op {
         S3Op::Multipart(_) => Some("multipart uploads are not implemented"),
         S3Op::Versioning(_) => Some("versioning is not implemented"),
-        S3Op::GetObject => None, // handled by routing/gateway
+        S3Op::GetObject => None, // GetObject is implemented by the worker/gateway.
         S3Op::Other => None,
     }
 }
 
 fn classify_multipart(
-    req: &RequestHeader,
+    method: &str,
     bucket: &Option<String>,
     key: &Option<String>,
     query: &QueryParams,
 ) -> Option<MultipartOp> {
-    let method = req.method.as_str();
-
     // ListMultipartUploads: GET /{bucket}?uploads
     if method == "GET" && bucket.is_some() && key.is_none() && query.has("uploads") {
         return Some(MultipartOp::ListMultipartUploads);
@@ -218,13 +229,11 @@ fn classify_multipart(
 }
 
 fn classify_versioning(
-    req: &RequestHeader,
+    method: &str,
     bucket: &Option<String>,
     key: &Option<String>,
     query: &QueryParams,
 ) -> Option<VersioningOp> {
-    let method = req.method.as_str();
-
     // Bucket versioning configuration: GET/PUT /{bucket}?versioning
     if bucket.is_some() && key.is_none() && query.has("versioning") {
         return match method {
@@ -280,3 +289,4 @@ fn parse_bucket_key_path_style(path: &str) -> (Option<String>, Option<String>) {
 fn parse_u32(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
 }
+

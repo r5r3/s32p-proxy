@@ -76,47 +76,42 @@ fn load_cfg() -> Result<Cfg> {
     })
 }
 
-// ---- tiny S3 XML error helper (keep minimal) ----
+// ---- S3 REST-XML error helpers (shared in s3pm-support) ----
+//
+// Historically, the gateway had its own tiny XML builder.
+// This is now centralized in s3pm-support so the proxy and gateway emit
+// consistent S3 REST-XML error responses and codes.
 
-fn s3_error(code: &str, message: &str) -> Bytes {
-    // Minimal, not perfect. You can reuse your proxy XML builder later.
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Code>{}</Code>
-  <Message>{}</Message>
-</Error>"#,
-        code, message
-    );
-    Bytes::from(body)
-}
+type Resp = Response<BoxBody<Bytes, Infallible>>;
 
-fn resp_xml(status: StatusCode, body: Bytes) -> Response<BoxBody<Bytes, Infallible>> {
-    let mut resp = Response::new(Full::new(body).boxed());
-    *resp.status_mut() = status;
-    resp.headers_mut().insert("content-type", "application/xml".parse().unwrap());
+fn into_http_resp(b: s3pm_support::s3resp::BuiltResponse) -> Resp {
+    let mut resp = Response::new(Full::new(Bytes::from(b.body)).boxed());
+    *resp.status_mut() = b.status;
+    resp.headers_mut().insert("content-type", b.content_type.parse().unwrap());
+    for (k, v) in b.headers {
+        resp.headers_mut().insert(k, v.parse().unwrap());
+    }
     resp
 }
 
-fn resp_not_implemented(msg: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    resp_xml(StatusCode::NOT_IMPLEMENTED, s3_error("NotImplemented", msg))
+fn resp_not_implemented(msg: &str) -> Resp {
+    into_http_resp(s3pm_support::s3resp::not_implemented(msg, None))
 }
 
-fn resp_access_denied(msg: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    resp_xml(StatusCode::FORBIDDEN, s3_error("AccessDenied", msg))
+fn resp_access_denied(msg: &str) -> Resp {
+    into_http_resp(s3pm_support::s3resp::access_denied(msg, None))
 }
 
-fn resp_sig_mismatch(msg: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    resp_xml(StatusCode::FORBIDDEN, s3_error("SignatureDoesNotMatch", msg))
+fn resp_sig_mismatch(msg: &str) -> Resp {
+    into_http_resp(s3pm_support::s3resp::signature_does_not_match(msg, None))
 }
 
-fn resp_no_such_key(msg: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    resp_xml(StatusCode::NOT_FOUND, s3_error("NoSuchKey", msg))
+fn resp_no_such_key(msg: &str) -> Resp {
+    into_http_resp(s3pm_support::s3resp::no_such_key(msg, None))
 }
 
-fn resp_invalid_range(msg: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    // S3 typically uses 416 for invalid ranges; body code often InvalidRange
-    resp_xml(StatusCode::RANGE_NOT_SATISFIABLE, s3_error("InvalidRange", msg))
+fn resp_invalid_range(msg: &str) -> Resp {
+    into_http_resp(s3pm_support::s3resp::invalid_range(msg, None))
 }
 
 // ---- Range parsing ----
@@ -179,16 +174,6 @@ fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
 }
 
 // ---- path mapping ----
-
-fn parse_bucket_key(path: &str) -> Option<(&str, &str)> {
-    // expects "/bucket/key..."
-    let p = path.trim_start_matches('/');
-    let (bucket, rest) = p.split_once('/')?;
-    if bucket.is_empty() || rest.is_empty() {
-        return None;
-    }
-    Some((bucket, rest))
-}
 
 fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
     // avoid ".." traversal
@@ -477,11 +462,13 @@ async fn stream_segment(
 
 // ---- request handler ----
 
-type Resp = Response<BoxBody<Bytes, Infallible>>;
-
 async fn handle(req: Request<Incoming>, cfg: Arc<Cfg>) -> Result<Resp, Infallible> {
-    // Reject query params (including presigned URLs)
-    if req.uri().query().is_some() {
+    // Classify first (no body required). This parsing logic is shared with the proxy now.
+    let class = s3pm_support::classifier::classify(req.method().as_str(), req.uri());
+
+    // Gateway policy: reject *all* query params (including presigned URLs).
+    // (Proxy may choose to route based on query params; the standalone worker/gateway stays strict.)
+    if !class.query.is_empty() {
         return Ok(resp_not_implemented("query parameters are not implemented"));
     }
 
@@ -506,14 +493,22 @@ async fn handle(req: Request<Incoming>, cfg: Arc<Cfg>) -> Result<Resp, Infallibl
         return Ok(resp_sig_mismatch(&e.to_string()));
     }
 
-    // Only GetObject for now
-    if req.method() != http::Method::GET {
-        return Ok(resp_not_implemented("only GET (GetObject) is implemented"));
+    // Only GetObject for now (and only the clean "no query params" form).
+    match &class.op {
+        s3pm_support::classifier::S3Op::GetObject => {}
+        s3pm_support::classifier::S3Op::Multipart(_) => {
+            return Ok(resp_not_implemented("multipart uploads are not implemented"));
+        }
+        s3pm_support::classifier::S3Op::Versioning(_) => {
+            return Ok(resp_not_implemented("versioning is not implemented"));
+        }
+        _ => {
+            return Ok(resp_not_implemented("only GET /{bucket}/{key} is implemented"));
+        }
     }
 
-    let Some((bucket, key)) = parse_bucket_key(req.uri().path()) else {
-        return Ok(resp_not_implemented("only GET /{bucket}/{key} is implemented"));
-    };
+    let bucket = class.bucket.as_deref().unwrap();
+    let key = class.key.as_deref().unwrap();
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
@@ -525,12 +520,40 @@ async fn handle(req: Request<Incoming>, cfg: Arc<Cfg>) -> Result<Resp, Infallibl
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(resp_no_such_key("not found")),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(resp_access_denied("permission denied")),
-        Err(e) => return Ok(resp_xml(StatusCode::INTERNAL_SERVER_ERROR, s3_error("InternalError", &e.to_string()))),
+        Err(e) => {
+            let b = s3pm_support::s3resp::s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: "application/xml",
+                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
+                headers: vec![],
+            });
+            return Ok(into_http_resp(b));
+        }
     };
 
     let meta = match std_file.metadata() {
         Ok(m) => m,
-        Err(e) => return Ok(resp_xml(StatusCode::INTERNAL_SERVER_ERROR, s3_error("InternalError", &e.to_string()))),
+        Err(e) => {
+            let b = s3pm_support::s3resp::s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: "application/xml",
+                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
+                headers: vec![],
+            });
+            return Ok(into_http_resp(b));
+        }
     };
 
     let size = meta.len();
@@ -543,6 +566,8 @@ async fn handle(req: Request<Incoming>, cfg: Arc<Cfg>) -> Result<Resp, Infallibl
         return Ok(resp);
     }
 
+    // IMPORTANT: real mtime in RFC1123 / HTTP-date format (required by many S3 clients).
+    // If metadata.modified() fails, fall back to UNIX_EPOCH (still a valid HTTP date).
     let last_modified = meta
         .modified()
         .ok()
@@ -571,7 +596,21 @@ async fn handle(req: Request<Incoming>, cfg: Arc<Cfg>) -> Result<Resp, Infallibl
     // Build streaming body
     let body = match stream_range(obj_path.clone(), size, want, cfg.clone()).await {
         Ok(b) => b.boxed(),
-        Err(e) => return Ok(resp_xml(StatusCode::INTERNAL_SERVER_ERROR, s3_error("InternalError", &e.to_string()))),
+        Err(e) => {
+            let b = s3pm_support::s3resp::s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                content_type: "application/xml",
+                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
+                headers: vec![],
+            });
+            return Ok(into_http_resp(b));
+        }
     };
 
     let mut resp = Response::new(body);

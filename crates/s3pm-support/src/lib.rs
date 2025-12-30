@@ -11,6 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use time::{macros::format_description, OffsetDateTime, PrimitiveDateTime};
 
+/// Shared S3 request classification (used by proxy and gateway).
+pub mod classifier;
+
+/// Shared S3 REST-XML body builders (pure XML, no framework specifics).
+pub mod s3xml;
+
+/// Shared “response building” layer producing status + content-type + bytes + headers.
+/// Each binary (proxy/gateway) wraps this into its own response type (Pingora vs Hyper).
+pub mod s3resp;
+
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {
     pub access_key: String,
@@ -243,7 +253,6 @@ pub fn verify_sigv4_header_only(
 
     Ok(())
 }
-
 
 fn parse_amz_date(amz_date: &str) -> Result<(OffsetDateTime, String, SystemTime)> {
     // X-Amz-Date format:  YYYYMMDDTHHMMSSZ (UTC, literal 'Z')
