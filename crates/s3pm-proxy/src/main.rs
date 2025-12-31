@@ -5,7 +5,7 @@ use pingora::http::{RequestHeader, ResponseHeader, StatusCode};
 use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::{Error, ErrorType, Result as PResult};
 use pingora::server::Server;
-use pingora::upstreams::peer::HttpPeer;
+use pingora::upstreams::peer::{HttpPeer, PeerOptions};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -264,15 +264,23 @@ impl ProxyHttp for S3ProxyApp {
         Ok(false)
     }
 
-    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> PResult<Box<HttpPeer>> {
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> PResult<Box<HttpPeer>> {
         let addr = ctx.upstream.ok_or_else(|| {
-            // Should never happen if request_filter set ctx.upstream
             Error::explain(ErrorType::InternalError, "no upstream selected")
         })?;
 
         // Plain HTTP to local worker
-        let peer = Box::new(HttpPeer::new(addr, false, "localhost".to_string()));
-        Ok(peer)
+        let mut peer = HttpPeer::new(addr, false, "localhost".to_string());
+
+        let mut opts = PeerOptions::new();
+        opts.tcp_recv_buf = Some(8 * 1024 * 1024); // 8 MiB receive buffer on the upstream socket
+        peer.options = opts;
+
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
