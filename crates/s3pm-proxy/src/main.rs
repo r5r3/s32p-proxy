@@ -23,7 +23,7 @@ use s3pm_directory::openbao::OpenBaoDirectory;
 
 use s3pm_support;
 
-use worker_manager::{WorkerHandle, WorkerManager};
+use worker_manager::{WorkerHandle, WorkerManager, WorkerEndpoint};
 
 struct S3ProxyApp {
     directory: Arc<dyn Directory>,
@@ -42,7 +42,7 @@ struct ProxyCtx {
     // Selected worker profile (used as part of worker key)
     worker_profile: Option<String>,
     // Selected upstream (per-user worker)
-    upstream: Option<SocketAddr>,
+    upstream: Option<WorkerEndpoint>,
     // Optional handle (for touch/logging)
     worker: Option<Arc<WorkerHandle>>,
 }
@@ -199,14 +199,14 @@ impl ProxyHttp for S3ProxyApp {
         // 3) If worker already running: NO proxy-side SigV4 verify (just route)
         if let Some(h) = self.workers.get_running(user.access_key.as_str(), profile).await {
             h.touch();
-            ctx.upstream = Some(h.addr);
+            ctx.upstream = Some(h.endpoint.clone());
             ctx.worker = Some(h);
 
             tracing::debug!(
                 uid = user.uid,
                 username = user.username.as_str(),
                 profile = profile,
-                addr = %ctx.upstream.unwrap(),
+                addr = %ctx.upstream.clone().unwrap(),
                 elapsed_ms = start.elapsed().as_millis(),
                 "worker already running; routing without proxy-side sigv4 verify"
             );
@@ -248,7 +248,7 @@ impl ProxyHttp for S3ProxyApp {
 
         let posix_root = h.posix_root.display().to_string();
         h.touch();
-        ctx.upstream = Some(h.addr);
+        ctx.upstream = Some(h.endpoint.clone());
         ctx.worker = Some(h);
 
         tracing::info!(
@@ -256,7 +256,7 @@ impl ProxyHttp for S3ProxyApp {
             username = user.username.as_str(),
             profile = profile,
             root = %posix_root,
-            addr = %ctx.upstream.unwrap(),
+            addr = %ctx.upstream.clone().unwrap(),
             elapsed_ms = start.elapsed().as_millis(),
             "worker started; routing request"
         );
@@ -269,16 +269,29 @@ impl ProxyHttp for S3ProxyApp {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> PResult<Box<HttpPeer>> {
-        let addr = ctx.upstream.ok_or_else(|| {
+        let ep = ctx.upstream.clone().ok_or_else(|| {
             Error::explain(ErrorType::InternalError, "no upstream selected")
         })?;
 
-        // Plain HTTP to local worker
-        let mut peer = HttpPeer::new(addr, false, "localhost".to_string());
+        let peer = match ep {
+            WorkerEndpoint::Tcp(addr) => {
+                let mut peer = HttpPeer::new(addr, false, "localhost".to_string());
 
-        let mut opts = PeerOptions::new();
-        opts.tcp_recv_buf = Some(8 * 1024 * 1024); // 8 MiB receive buffer on the upstream socket
-        peer.options = opts;
+                let mut opts = PeerOptions::new();
+                opts.tcp_recv_buf = Some(8 * 1024 * 1024); // 8 MiB receive buffer on the upstream TCP socket
+                peer.options = opts;
+
+                peer
+            }
+            WorkerEndpoint::Uds(path) => {
+                // HttpPeer::new_uds returns Result<...> so map it into Pingora's error type.
+                let mut peer = HttpPeer::new_uds(path.to_string_lossy().as_ref(), false, "localhost".to_string())
+                    .map_err(|e| Error::explain(ErrorType::InternalError, format!("new_uds failed: {e}")))?;
+
+                // TCP-only socket options don't apply to UDS; leave options default.
+                peer
+            }
+        };
 
         Ok(Box::new(peer))
     }
@@ -307,7 +320,7 @@ impl ProxyHttp for S3ProxyApp {
         tracing::debug!(
             uid = ctx.uid.unwrap_or(0),
             profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
-            upstream = %ctx.upstream.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+            upstream = %ctx.upstream.as_ref().map(|ep| ep.to_string()).unwrap_or_else(|| "<none>".to_string()),
             "sending request upstream"
         );
 

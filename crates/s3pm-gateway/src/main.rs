@@ -16,7 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
@@ -29,6 +29,7 @@ use s3pm_support;
 #[derive(Clone)]
 struct Cfg {
     bind_addr: String,
+    bind_uds: Option<PathBuf>,
     posix_root: PathBuf,
     access_key: String,
     secret_key: String,
@@ -59,6 +60,7 @@ fn env_usize(k: &str, default: usize) -> usize {
 
 fn load_cfg() -> Result<Cfg> {
     let bind_addr = std::env::var("S3PM_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_string());
+    let bind_uds = std::env::var("S3PM_BIND_UDS").ok().map(PathBuf::from);
     let posix_root = PathBuf::from(std::env::var("S3PM_POSIX_ROOT").context("S3PM_POSIX_ROOT missing")?);
 
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID missing")?;
@@ -83,6 +85,7 @@ fn load_cfg() -> Result<Cfg> {
 
     Ok(Cfg {
         bind_addr,
+        bind_uds,
         posix_root,
         access_key,
         secret_key,
@@ -854,32 +857,68 @@ fn main() -> Result<()> {
     let app = Arc::new(App { cfg: cfg.clone(), pool });
 
     tokio_uring::start(async move {
-        let listener = TcpListener::bind(&cfg.bind_addr).await
-            .with_context(|| format!("bind {}", cfg.bind_addr))?;
+        if let Some(sock_path) = cfg.bind_uds.clone() {
+            // IMPORTANT: UDS bind fails if the path already exists.
+            let _ = std::fs::remove_file(&sock_path);
 
-        tracing::info!(
-            "s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})",
-            cfg.bind_addr,
-            cfg.chunk_size,
-            cfg.inflight,
-            cfg.pool_size
-        );
+            // Optional but usually a good idea: ensure parent dir exists.
+            if let Some(parent) = sock_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create UDS dir {}", parent.display()))?;
+            }
 
-        loop {
-            let (stream, _peer) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let app2 = app.clone();
+            let listener = UnixListener::bind(&sock_path)
+                .with_context(|| format!("bind uds {}", sock_path.display()))?;
 
-            tokio_uring::spawn(async move {
-                let io = TokioIo::new(stream);
-                let svc = service_fn(move |req| handle(req, app2.clone()));
-                if let Err(e) = http1::Builder::new()
-                    .max_buf_size(8 * 1024 * 1024)
-                    .writev(true)
-                    .serve_connection(io, svc).await {
+            tracing::info!("s3pm-gateway listening on uds {} (chunk_size={} inflight={} pool_size={})", 
+                           sock_path.display(),
+                           cfg.chunk_size,
+                           cfg.inflight,
+                           cfg.pool_size);
+
+            loop {
+                let (stream, _addr) = listener.accept().await?;
+                let app2 = app.clone();
+
+                tokio_uring::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| handle(req, app2.clone()));
+                    if let Err(e) = http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                    {
                         tracing::debug!(error = %e, "connection error");
-                }
-            });
+                    }
+                });
+            }
+        } else {
+            let listener = TcpListener::bind(&cfg.bind_addr).await
+                .with_context(|| format!("bind {}", cfg.bind_addr))?;
+
+            tracing::info!("s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})", 
+                           cfg.bind_addr,
+                           cfg.chunk_size,
+                           cfg.inflight,
+                           cfg.pool_size);
+
+            loop {
+                let (stream, _peer) = listener.accept().await?;
+                stream.set_nodelay(true)?;
+                let app2 = app.clone();
+
+                tokio_uring::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| handle(req, app2.clone()));
+                    if let Err(e) = http1::Builder::new()
+                        .max_buf_size(8 * 1024 * 1024)
+                        .writev(true)
+                        .serve_connection(io, svc)
+                        .await
+                    {
+                        tracing::debug!(error = %e, "connection error");
+                    }
+                });
+            }
         }
 
         #[allow(unreachable_code)]

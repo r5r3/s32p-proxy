@@ -7,7 +7,7 @@ server:
   log: "info"
 
 auth:
-  backend: "openbao"
+  backend: "yaml"
   yaml:
     path: "etc/directory.yaml"
   openbao:
@@ -43,17 +43,20 @@ workers:
         ROOT_SECRET_KEY: "{{secret_key}}"
 
     s3pm-gateway:
+      upstream:
+        kind: "uds"
+        uds_run_dir: "/run/user/10270/s3pm"
       exec: "target/debug/s3pm-gateway"
       args: []
       env:
-        S3PM_BIND_ADDR: "{{bind_addr}}"
+        S3PM_BIND_UDS: "{{bind_uds}}"
         S3PM_POSIX_ROOT: "{{posix_root}}"
         AWS_ACCESS_KEY_ID: "{{access_key}}"
         AWS_SECRET_ACCESS_KEY: "{{secret_key}}"
         S3PM_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
         S3PM_REGION: "{{region}}"
-        S3PM_CHUNK_SIZE: "1048576"
-        S3PM_INFLIGHT: "4"
+        S3PM_CHUNK_SIZE: "4194304"
+        S3PM_INFLIGHT: "8"
         S3PM_DIRECT_IO: "true"
 
 routing:

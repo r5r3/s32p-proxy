@@ -80,6 +80,32 @@ fn default_approle_mount() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UpstreamConfig {
+    /// "tcp" or "uds"
+    pub kind: UpstreamKind,
+
+    /// Base directory for per-uid UDS run dirs. Required when kind=uds.
+    /// Sockets will be created under: <uds_run_dir>/<uid>/<profile>.sock
+    pub uds_run_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamKind {
+    Tcp,
+    Uds,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            kind: UpstreamKind::Tcp,
+            uds_run_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkersConfig {
     /// Shared POSIX root directory passed to the worker template ({{posix_root}})
     pub posix_root: String,
@@ -111,6 +137,9 @@ pub struct WorkerProfile {
     /// Args are a list (no shell). Placeholders are left as-is for your templater later.
     pub args: Vec<String>,
 
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
+    
     /// Environment variables for the worker process.
     /// Values may include placeholders like "{{access_key}}".
     #[serde(default)]
@@ -212,6 +241,18 @@ impl Config {
             return Err(anyhow!("workers.profiles must contain at least one profile"));
         }
 
+        for (name, profile) in &self.workers.profiles {
+            match profile.upstream.kind {
+                UpstreamKind::Tcp => {}
+                UpstreamKind::Uds => {
+                    let dir = profile.upstream.uds_run_dir.as_deref().unwrap_or("").trim();
+                    if dir.is_empty() {
+                        return Err(anyhow!("workers.profile.upstream.uds_run_dir must be set when kind=uds"));
+                    }
+                }
+            }
+        }
+            
         // Validate routing targets exist
         for (class, action) in &self.routing.class_map {
             match action {

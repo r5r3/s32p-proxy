@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use std::{
+    fmt,
     fs,
     net::{SocketAddr, TcpListener},
     os::unix::fs as unix_fs,
@@ -57,10 +58,25 @@ enum SlotState {
     Running(Arc<WorkerHandle>),
 }
 
+#[derive(Clone, Debug)]
+pub enum WorkerEndpoint {
+    Tcp(SocketAddr),
+    Uds(PathBuf),
+}
+
+impl fmt::Display for WorkerEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkerEndpoint::Tcp(addr) => write!(f, "{addr}"),
+            WorkerEndpoint::Uds(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
 pub struct WorkerHandle {
     pub key: WorkerKey,
     pub username: String,
-    pub addr: SocketAddr,
+    pub endpoint: WorkerEndpoint,
     pub posix_root: PathBuf,
     tempdir: Mutex<Option<TempDir>>,
     last_used_unix: AtomicU64,
@@ -233,12 +249,6 @@ impl WorkerManager {
             .get(profile_name)
             .ok_or_else(|| anyhow!("unknown worker profile '{profile_name}'"))?;
 
-        let port = pick_free_port().context("failed to pick a free local port")?;
-        let bind_addr = format!("127.0.0.1:{port}");
-        let addr: SocketAddr = bind_addr
-            .parse()
-            .map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
-
         let euid_is_root = unsafe { libc::geteuid() == 0 };
 
         // Create fresh staged root with bucket links
@@ -272,6 +282,31 @@ impl WorkerManager {
             );
         }
 
+        let endpoint = match profile.upstream.kind {
+            crate::config::UpstreamKind::Tcp => {
+                let port = pick_free_port().context("failed to pick a free local port")?;
+                let bind_addr = format!("127.0.0.1:{port}");
+                let addr: SocketAddr = bind_addr
+                    .parse()
+                    .map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
+
+                WorkerEndpoint::Tcp(addr)
+            }
+            crate::config::UpstreamKind::Uds => {
+                let base = profile.upstream.uds_run_dir.as_ref().ok_or_else(|| {
+                    anyhow!("workers.upstream.uds_run_dir missing (required for uds)")
+                })?;
+
+                let sock_path = uds_socket_path(base, user.uid, profile_name)
+                    .with_context(|| format!("failed to build uds socket path for uid={} profile={profile_name}", user.uid))?;
+
+                // Remove stale socket file from a previous crash/restart
+                let _ = std::fs::remove_file(&sock_path);
+
+                WorkerEndpoint::Uds(sock_path)
+            }
+        };
+
         let vars = TemplateVars {
             username: &user.username,
             uid: user.uid,
@@ -279,8 +314,7 @@ impl WorkerManager {
             access_key: &user.access_key,
             secret_key: &user.secret_key,
             posix_root: &staged_root_str,
-            port,
-            bind_addr: &bind_addr,
+            endpoint: &endpoint,
             region: &self.server_cfg.region,
         };
 
@@ -301,19 +335,22 @@ impl WorkerManager {
             cmd.env(k, v);
         }
 
+        // log command and env for debuuging
+        tracing::debug!(command = ?cmd, "spawning worker");
+        
         let child = cmd.spawn().context("failed to spawn launcher/worker")?;
 
         let handle = Arc::new(WorkerHandle {
             key: WorkerKey::new(user.access_key.as_str(), profile_name),
             username: user.username.clone(),
-            addr,
+            endpoint: endpoint.clone(),
             posix_root: staged_root.clone(),
             tempdir: Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
             child: Mutex::new(child),
         });
 
-        wait_until_ready(addr, Duration::from_secs(20)).await?;
+        wait_until_ready(&endpoint, Duration::from_secs(20)).await?;
         Ok(handle)
     }
 
@@ -379,8 +416,7 @@ struct TemplateVars<'a> {
     access_key: &'a str,
     secret_key: &'a str,
     posix_root: &'a str,
-    port: u16,
-    bind_addr: &'a str,
+    endpoint: &'a WorkerEndpoint,
     region: &'a str,
 }
 
@@ -398,7 +434,7 @@ fn render_env(env: &std::collections::BTreeMap<String, String>, vars: &TemplateV
 
 /// Strict, safe placeholder replacement.
 /// Supports tokens like: {{username}}, {{uid}}, {{gid}}, {{access_key}}, {{secret_key}},
-/// {{posix_root}}, {{port}}, {{bind_addr}}.
+/// {{posix_root}}, {{bind_addr}}, {{bind_uds}}, {{region}}.
 /// Unknown tokens cause an error.
 fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
     let mut out = String::with_capacity(input.len());
@@ -422,8 +458,8 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
             "access_key" => vars.access_key.to_string(),
             "secret_key" => vars.secret_key.to_string(),
             "posix_root" => vars.posix_root.to_string(),
-            "port" => vars.port.to_string(),
-            "bind_addr" => vars.bind_addr.to_string(),
+            "bind_addr" => vars.endpoint.to_string(),
+            "bind_uds" => vars.endpoint.to_string(),
             "region" => vars.region.to_string(),
             other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
         };
@@ -443,18 +479,22 @@ fn pick_free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-async fn wait_until_ready(addr: SocketAddr, timeout: Duration) -> Result<()> {
+async fn wait_until_ready(endpoint: &WorkerEndpoint, timeout: Duration) -> Result<()> {
     let start = time::Instant::now();
     loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                if start.elapsed() >= timeout {
-                    return Err(anyhow!("worker did not become ready on {addr} within {timeout:?}"));
-                }
-                time::sleep(Duration::from_millis(50)).await;
-            }
+        let ok = match endpoint {
+            WorkerEndpoint::Tcp(addr) => tokio::net::TcpStream::connect(addr).await.is_ok(),
+            WorkerEndpoint::Uds(path) => tokio::net::UnixStream::connect(path).await.is_ok(),
+        };
+
+        if ok {
+            return Ok(());
         }
+
+        if start.elapsed() >= timeout {
+            return Err(anyhow!("worker did not become ready within {timeout:?}"));
+        }
+        time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -564,5 +604,23 @@ fn create_staged_posix_root(
     }
 
     Ok((td, root))
+}
+
+fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)?;
+    let perm = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perm)?;
+    Ok(())
+}
+
+/// Create /run/s3pm/<uid>/ and return the socket path <profile>.sock.
+/// The directory must be writable by the worker user because the worker creates/binds the socket file.
+fn uds_socket_path(base: &str, uid: u32, profile: &str) -> Result<PathBuf> {
+    let dir = Path::new(base).join(uid.to_string());
+    // 0755 is the safest default if the proxy is *not* root.
+    // If your proxy runs as root and you want tighter perms, use 0700 + adjust ownership.
+    ensure_dir(&dir, 0o755)?;
+    Ok(dir.join(format!("{profile}.sock")))
 }
 
