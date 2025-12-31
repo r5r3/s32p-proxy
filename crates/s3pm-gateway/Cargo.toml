@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mimalloc = "*"
 anyhow = "1"
 http = "1"
 httpdate = "1"

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mimalloc = "*"
+
 # Local crates
 s3pm-directory = { path = "../s3pm-directory" }
 s3pm-support = { path = "../s3pm-support" }

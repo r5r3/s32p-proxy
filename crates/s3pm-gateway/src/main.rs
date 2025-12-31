@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures_util::stream::{FuturesOrdered, StreamExt};

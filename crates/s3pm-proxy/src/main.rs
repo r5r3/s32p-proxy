@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
@@ -24,6 +29,7 @@ use s3pm_directory::openbao::OpenBaoDirectory;
 use s3pm_support;
 
 use worker_manager::{WorkerHandle, WorkerManager, WorkerEndpoint};
+
 
 struct S3ProxyApp {
     directory: Arc<dyn Directory>,
