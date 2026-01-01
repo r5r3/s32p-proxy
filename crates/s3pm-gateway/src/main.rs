@@ -889,6 +889,8 @@ fn main() -> Result<()> {
                     let io = TokioIo::new(stream);
                     let svc = service_fn(move |req| handle(req, app2.clone()));
                     if let Err(e) = http1::Builder::new()
+                        .max_buf_size(8 * 1024 * 1024)
+                        .writev(true)
                         .serve_connection(io, svc)
                         .await
                     {
