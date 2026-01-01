@@ -59,7 +59,8 @@ This repository is a Rust workspace with multiple crates:
 │  • reverse proxies to per-user worker    │
 │  • optional response header rewriting    │
 └───────────────────┬──────────────────────┘
-                    │ internal HTTP (loopback)
+                    │ internal HTTP (loopback) or
+                    │ HTTP over Unix domain sockets (UDS)
                     ▼
 ┌────────────────────────────────┐
 │      Per-access-key workers    │
@@ -92,7 +93,7 @@ This repository is a Rust workspace with multiple crates:
 #### Proxy / request flow
 
 - **Pingora proxy-mode HTTP server**
-  - Reverse proxies to locally spawned workers over loopback
+  - Reverse proxies to locally spawned workers over loopback or Unix domain sockets (UDS)
   - Preserves SigV4-critical headers (notably the original `Host`)
   - Has a `response_filter` hook for response header rewriting
 
@@ -166,7 +167,9 @@ Implemented local operations:
   - allows routing different command classes to different worker profiles per access key
 - Workers are started via a configurable launcher (default: `restricted-exec`)
   - If running as root and `pass_user_flag_if_root=true`, the proxy passes `--user <username>`
-- Loopback bind: `127.0.0.1:<port>`
+- Upstream bind (per worker):
+  - TCP loopback: `127.0.0.1:<port>`
+  - Unix domain socket: `/run/s3pm/<uid>/worker.sock` (example; configurable)
 - Readiness probing: connect loop until port is reachable
 - Idle shutdown after `idle_timeout_secs`
 - Sweeper removes dead/idle workers periodically (`sweep_interval_secs`)
@@ -478,7 +481,7 @@ The proxy binds to the address configured in `etc/s3-proxy-manager.yaml`, defaul
 http://localhost:9000
 ```
 
-Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`).
+Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`) or a per-UID Unix socket.
 
 ---
 
@@ -501,7 +504,7 @@ Notes:
 - Run the proxy as **root** if you want the launcher to actually switch users (`restricted-exec --user`).
 - If the proxy is not root, workers start as the proxy’s user (development convenience).
 - Workers should never run as root in production.
-- Keep worker listeners loopback-only (or move to Unix domain sockets later).
+- Keep worker listeners loopback-only or use Unix domain sockets (recommended for local-only traffic).
 
 ACL notes:
 
@@ -515,7 +518,7 @@ ACL notes:
 - **Multipart uploads** are detected and currently return `NotImplemented`
   - Only after request validation (SigV4) to avoid turning invalid requests into “useful” responses
 - **Versioning-related** requests are detected and currently return `NotImplemented`
-- More S3 API coverage still needed (ListObjectsV2, GET/PUT object streaming, etc.)
+- More S3 API coverage still needed (ListObjectsV2, PUT object streaming, etc.)
 - More production hardening:
   - rate limiting / max concurrent starts
   - negative caching for repeated invalid requests
