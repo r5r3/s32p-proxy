@@ -3,9 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// --- new modules ---
 mod buffer;
-mod http_adapt;
 mod streaming;
 
 use anyhow::{anyhow, Context, Result};
@@ -28,10 +26,12 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio_uring::buf::BoundedBuf;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
-use crate::http_adapt::{into_hyper, Resp};
 use crate::streaming::{parse_range_header, stream_range_body, ByteRange, StreamCfg};
 
 use s3pm_support;
+
+// Hyper response type we use everywhere in this binary.
+type Resp = s3pm_support::s3resp::HttpResponse;
 
 // ---- config ----
 
@@ -107,39 +107,6 @@ fn load_cfg() -> Result<Cfg> {
     })
 }
 
-// ---- S3 REST-XML error helpers (shared in s3pm-support) ----
-
-fn resp_not_implemented(msg: &str) -> Resp {
-    into_hyper(s3pm_support::s3resp::not_implemented(msg, None))
-}
-fn resp_access_denied(msg: &str) -> Resp {
-    into_hyper(s3pm_support::s3resp::access_denied(msg, None))
-}
-fn resp_sig_mismatch(msg: &str) -> Resp {
-    into_hyper(s3pm_support::s3resp::signature_does_not_match(msg, None))
-}
-fn resp_no_such_key(msg: &str) -> Resp {
-    into_hyper(s3pm_support::s3resp::no_such_key(msg, None))
-}
-fn resp_invalid_range(msg: &str) -> Resp {
-    into_hyper(s3pm_support::s3resp::invalid_range(msg, None))
-}
-
-fn resp_bucket_location(region: &str) -> Resp {
-    match s3pm_support::s3resp::get_bucket_location(region) {
-        Ok(b) => http_adapt::into_hyper(b),
-        Err(e) => http_adapt::into_hyper(
-            s3pm_support::s3resp::s3_error(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
-                &e.to_string(),
-                None,
-                None,
-            ).unwrap()
-        ),
-    }
-}
-
 // ---- path mapping ----
 
 fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
@@ -207,17 +174,25 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         });
 
     if req.uri().query().is_some() && !is_get_bucket_location {
-        return Ok(resp_not_implemented("query parameters are not implemented"));
+        return Ok(s3pm_support::s3resp::not_implemented(
+            "query parameters are not implemented",
+            None,
+        ));
     }
 
     // SigV4: parse + verify (every request)
     let auth = match s3pm_support::parse_authorization(req.headers()) {
         Ok(a) => a,
-        Err(e) => return Ok(resp_access_denied(&format!("bad Authorization: {e}"))),
+        Err(e) => {
+            return Ok(s3pm_support::s3resp::access_denied(
+                &format!("bad Authorization: {e}"),
+                None,
+            ))
+        }
     };
 
     if auth.access_key != cfg.access_key {
-        return Ok(resp_access_denied("unknown access key"));
+        return Ok(s3pm_support::s3resp::access_denied("unknown access key", None));
     }
 
     if let Err(e) = s3pm_support::verify_sigv4_header_only(
@@ -228,22 +203,34 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         &cfg.secret_key,
         &cfg.public_scheme,
     ) {
-        return Ok(resp_sig_mismatch(&e.to_string()));
+        return Ok(s3pm_support::s3resp::signature_does_not_match(
+            &e.to_string(),
+            None,
+        ));
     }
 
     match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
-            return Ok(resp_bucket_location(&cfg.region));
+            return Ok(s3pm_support::s3resp::get_bucket_location(&cfg.region));
         }
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject) => {}
         s3pm_support::classifier::S3Op::Multipart(_) => {
-            return Ok(resp_not_implemented("multipart uploads are not implemented"));
+            return Ok(s3pm_support::s3resp::not_implemented(
+                "multipart uploads are not implemented",
+                None,
+            ));
         }
         s3pm_support::classifier::S3Op::Versioning(_) => {
-            return Ok(resp_not_implemented("versioning is not implemented"));
+            return Ok(s3pm_support::s3resp::not_implemented(
+                "versioning is not implemented",
+                None,
+            ));
         }
         _ => {
-            return Ok(resp_not_implemented("only GET /{bucket}/{key} is implemented"));
+            return Ok(s3pm_support::s3resp::not_implemented(
+                "only GET /{bucket}/{key} is implemented",
+                None,
+            ));
         }
     }
 
@@ -252,51 +239,35 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
-        Err(e) => return Ok(resp_access_denied(&e.to_string())),
+        Err(e) => return Ok(s3pm_support::s3resp::access_denied(&e.to_string(), None)),
     };
 
     // open once (buffered) to stat + inode + size
     let std_file = match OpenOptions::new().read(true).open(&obj_path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(resp_no_such_key("not found")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(s3pm_support::s3resp::no_such_key("not found", None))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(resp_access_denied("permission denied"))
+            return Ok(s3pm_support::s3resp::access_denied("permission denied", None))
         }
         Err(e) => {
-            let b = s3pm_support::s3resp::s3_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+            return Ok(s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
-            .unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                content_type: "application/xml",
-                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
-                headers: vec![],
-            });
-            return Ok(into_hyper(b));
+            ));
         }
     };
 
     let meta = match std_file.metadata() {
         Ok(m) => m,
         Err(e) => {
-            let b = s3pm_support::s3resp::s3_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+            return Ok(s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
-            .unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                content_type: "application/xml",
-                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
-                headers: vec![],
-            });
-            return Ok(into_hyper(b));
+            ));
         }
     };
 
@@ -306,7 +277,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         let mut resp = Response::new(Full::new(Bytes::new()).boxed());
         *resp.status_mut() = StatusCode::OK;
         resp.headers_mut().insert("content-length", "0".parse().unwrap());
-        resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
+        resp.headers_mut()
+            .insert("content-type", "application/octet-stream".parse().unwrap());
         return Ok(resp);
     }
 
@@ -323,9 +295,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         Some(v) => match v.to_str() {
             Ok(s) => match parse_range_header(s, size) {
                 Ok(r) => r,
-                Err(e) => return Ok(resp_invalid_range(&e.to_string())),
+                Err(e) => return Ok(s3pm_support::s3resp::invalid_range(&e.to_string(), None)),
             },
-            Err(_) => return Ok(resp_invalid_range("bad Range header")),
+            Err(_) => return Ok(s3pm_support::s3resp::invalid_range("bad Range header", None)),
         },
     };
 
@@ -342,19 +314,11 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
             Ok(b) => b,
             Err(e) => {
-                let b = s3pm_support::s3resp::s3_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+                return Ok(s3pm_support::s3resp::internal_error(
                     &e.to_string(),
                     Some(req.uri().path()),
                     None,
-                ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    content_type: "application/xml",
-                    body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
-                    headers: vec![],
-                });
-                return Ok(into_hyper(b));
+                ));
             }
         };
 
@@ -397,19 +361,11 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     {
         Ok(b) => b.boxed(),
         Err(e) => {
-            let b = s3pm_support::s3resp::s3_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+            return Ok(s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                content_type: "application/xml",
-                body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
-                headers: vec![],
-            });
-            return Ok(into_hyper(b));
+            ));
         }
     };
 
@@ -489,7 +445,8 @@ fn main() -> Result<()> {
                 });
             }
         } else {
-            let listener = TcpListener::bind(&cfg.bind_addr).await
+            let listener = TcpListener::bind(&cfg.bind_addr)
+                .await
                 .with_context(|| format!("bind {}", cfg.bind_addr))?;
 
             tracing::info!(
@@ -524,3 +481,4 @@ fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })
 }
+

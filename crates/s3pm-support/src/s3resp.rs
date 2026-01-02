@@ -1,43 +1,82 @@
-use anyhow::Result;
-use http::StatusCode;
-
 use crate::s3xml;
 
-/// A framework-agnostic response builder output.
-/// Proxy wraps it into Pingora response-writing; Gateway wraps it into Hyper responses.
-pub struct BuiltResponse {
-    pub status: StatusCode,
-    pub content_type: &'static str,
-    pub body: Vec<u8>,
-    pub headers: Vec<(&'static str, String)>,
+use bytes::Bytes;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::{Response, StatusCode};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use std::convert::Infallible;
+
+/// Body type we use for small/complete responses.
+/// Hyper can use `http::Response<impl http_body::Body>` directly, and `BoxBody` works everywhere.
+pub type RespBody = BoxBody<Bytes, Infallible>;
+
+/// Hyper-ready response type (also usable in other http-based stacks).
+pub type HttpResponse = Response<RespBody>;
+
+fn boxed_full(body: Vec<u8>) -> RespBody {
+    Full::new(Bytes::from(body)).boxed()
 }
 
-/// Build a standard S3 REST-XML error response body (and common headers).
+/// Build a complete HTTP response with a full in-memory body.
+/// Ensures `Content-Type` and `Content-Length` are set.
+pub fn response_bytes(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+    headers: impl IntoIterator<Item = (&'static str, String)>,
+) -> HttpResponse {
+    let len = body.len();
+
+    let mut resp = Response::new(boxed_full(body));
+    *resp.status_mut() = status;
+
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, content_type.parse().unwrap());
+    resp.headers_mut()
+        .insert(CONTENT_LENGTH, len.to_string().parse().unwrap());
+
+    for (k, v) in headers {
+        // All our generated header values are ASCII-ish; if parse fails, skip (best-effort).
+        if let Ok(hv) = v.parse() {
+            resp.headers_mut().insert(k, hv);
+        }
+    }
+
+    resp
+}
+
+/* -------------------------
+ * S3 REST-XML helpers
+ * ------------------------- */
+
+/// Build a standard S3 REST-XML error response (body + headers).
+///
+/// This never fails: XML build failures fall back to a minimal static body.
 pub fn s3_error(
     status: StatusCode,
     code: &str,
     message: &str,
     resource: Option<&str>,
     request_id: Option<&str>,
-) -> Result<BuiltResponse> {
-    let body = s3xml::s3_error_body(code, message, resource, request_id, None)?;
-    let mut headers = Vec::new();
+) -> HttpResponse {
+    let body = s3xml::s3_error_body(code, message, resource, request_id, None).unwrap_or_else(|_| {
+        format!(
+            "<Error><Code>{}</Code><Message>{}</Message></Error>",
+            code, message
+        )
+        .into_bytes()
+    });
 
-    // Many clients don’t require these headers, but they’re handy for debugging.
+    let mut headers = Vec::new();
     if let Some(rid) = request_id {
         headers.push(("x-amz-request-id", rid.to_string()));
     }
 
-    Ok(BuiltResponse {
-        status,
-        content_type: "application/xml",
-        body,
-        headers,
-    })
+    response_bytes(status, "application/xml", body, headers)
 }
 
 /// Convenience: NotImplemented (501).
-pub fn not_implemented(message: &str, resource: Option<&str>) -> BuiltResponse {
+pub fn not_implemented(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::NOT_IMPLEMENTED,
         s3xml::error_code::NOT_IMPLEMENTED,
@@ -45,16 +84,10 @@ pub fn not_implemented(message: &str, resource: Option<&str>) -> BuiltResponse {
         resource,
         None,
     )
-    .unwrap_or_else(|_| BuiltResponse {
-        status: StatusCode::NOT_IMPLEMENTED,
-        content_type: "application/xml",
-        body: b"<Error><Code>NotImplemented</Code><Message>xml build failed</Message></Error>".to_vec(),
-        headers: vec![],
-    })
 }
 
 /// Convenience: AccessDenied (403).
-pub fn access_denied(message: &str, resource: Option<&str>) -> BuiltResponse {
+pub fn access_denied(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::FORBIDDEN,
         s3xml::error_code::ACCESS_DENIED,
@@ -62,16 +95,10 @@ pub fn access_denied(message: &str, resource: Option<&str>) -> BuiltResponse {
         resource,
         None,
     )
-    .unwrap_or_else(|_| BuiltResponse {
-        status: StatusCode::FORBIDDEN,
-        content_type: "application/xml",
-        body: b"<Error><Code>AccessDenied</Code><Message>xml build failed</Message></Error>".to_vec(),
-        headers: vec![],
-    })
 }
 
 /// Convenience: SignatureDoesNotMatch (403).
-pub fn signature_does_not_match(message: &str, resource: Option<&str>) -> BuiltResponse {
+pub fn signature_does_not_match(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::FORBIDDEN,
         s3xml::error_code::SIGNATURE_DOES_NOT_MATCH,
@@ -79,16 +106,21 @@ pub fn signature_does_not_match(message: &str, resource: Option<&str>) -> BuiltR
         resource,
         None,
     )
-    .unwrap_or_else(|_| BuiltResponse {
-        status: StatusCode::FORBIDDEN,
-        content_type: "application/xml",
-        body: b"<Error><Code>SignatureDoesNotMatch</Code><Message>xml build failed</Message></Error>".to_vec(),
-        headers: vec![],
-    })
+}
+
+/// Convenience: InvalidAccessKeyId (403).
+pub fn invalid_access_key_id(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::FORBIDDEN,
+        s3xml::error_code::INVALID_ACCESS_KEY_ID,
+        message,
+        resource,
+        None,
+    )
 }
 
 /// Convenience: NoSuchKey (404).
-pub fn no_such_key(message: &str, resource: Option<&str>) -> BuiltResponse {
+pub fn no_such_key(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::NOT_FOUND,
         s3xml::error_code::NO_SUCH_KEY,
@@ -96,16 +128,10 @@ pub fn no_such_key(message: &str, resource: Option<&str>) -> BuiltResponse {
         resource,
         None,
     )
-    .unwrap_or_else(|_| BuiltResponse {
-        status: StatusCode::NOT_FOUND,
-        content_type: "application/xml",
-        body: b"<Error><Code>NoSuchKey</Code><Message>xml build failed</Message></Error>".to_vec(),
-        headers: vec![],
-    })
 }
 
 /// Convenience: InvalidRange (416).
-pub fn invalid_range(message: &str, resource: Option<&str>) -> BuiltResponse {
+pub fn invalid_range(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::RANGE_NOT_SATISFIABLE,
         s3xml::error_code::INVALID_RANGE,
@@ -113,25 +139,52 @@ pub fn invalid_range(message: &str, resource: Option<&str>) -> BuiltResponse {
         resource,
         None,
     )
-    .unwrap_or_else(|_| BuiltResponse {
-        status: StatusCode::RANGE_NOT_SATISFIABLE,
-        content_type: "application/xml",
-        body: b"<Error><Code>InvalidRange</Code><Message>xml build failed</Message></Error>".to_vec(),
-        headers: vec![],
-    })
+}
+
+/// Convenience: InternalError (500).
+pub fn internal_error(message: &str, resource: Option<&str>, request_id: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        s3xml::error_code::INTERNAL_ERROR,
+        message,
+        resource,
+        request_id,
+    )
+}
+
+/// Convenience: ServiceUnavailable (503).
+pub fn service_unavailable(message: &str, resource: Option<&str>, request_id: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        s3xml::error_code::SERVICE_UNAVAILABLE,
+        message,
+        resource,
+        request_id,
+    )
+}
+
+/// Convenience: ListBuckets success (200).
+pub fn list_buckets(owner_id: &str, owner_display_name: &str, buckets: &[s3xml::BucketInfo]) -> HttpResponse {
+    let body = s3xml::list_buckets_body(owner_id, owner_display_name, buckets).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
 /// Convenience: GetBucketLocation success (200).
-pub fn get_bucket_location(region: &str) -> Result<BuiltResponse> {
-    let body = crate::s3xml::get_bucket_location_body(region)?;
-    Ok(BuiltResponse {
-        status: StatusCode::OK,
-        content_type: "application/xml",
+pub fn get_bucket_location(region: &str) -> HttpResponse {
+    let body = s3xml::get_bucket_location_body(region).unwrap_or_else(|_| {
+        // Minimal fallback (still valid-ish for clients)
+        b"<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>"
+            .to_vec()
+    });
+
+    response_bytes(
+        StatusCode::OK,
+        "application/xml",
         body,
-        headers: vec![
-            // S3 clients commonly expect this header
-            ("x-amz-bucket-region", region.to_string()),
-        ],
-    })
+        [("x-amz-bucket-region", region.to_string())],
+    )
 }
 
