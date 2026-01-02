@@ -121,3 +121,17 @@ pub fn invalid_range(message: &str, resource: Option<&str>) -> BuiltResponse {
     })
 }
 
+/// Convenience: GetBucketLocation success (200).
+pub fn get_bucket_location(region: &str) -> Result<BuiltResponse> {
+    let body = crate::s3xml::get_bucket_location_body(region)?;
+    Ok(BuiltResponse {
+        status: StatusCode::OK,
+        content_type: "application/xml",
+        body,
+        headers: vec![
+            // S3 clients commonly expect this header
+            ("x-amz-bucket-region", region.to_string()),
+        ],
+    })
+}
+

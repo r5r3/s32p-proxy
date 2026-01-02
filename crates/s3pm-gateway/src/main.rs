@@ -3,29 +3,33 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// --- new modules ---
+mod buffer;
+mod http_adapt;
+mod streaming;
+
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use futures_util::stream::{FuturesOrdered, StreamExt};
 use http::{Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, Full};
 use httpdate::fmt_http_date;
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::Incoming;
 use hyper::header::LAST_MODIFIED;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{mpsc, Mutex};
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
-use aligned_buffer::UniqueAlignedBuffer;
+
+use crate::buffer::{BufPool, PooledBuf, SliceOwner};
+use crate::http_adapt::{into_hyper, Resp};
+use crate::streaming::{parse_range_header, stream_range_body, ByteRange, StreamCfg};
 
 use s3pm_support;
 
@@ -104,121 +108,36 @@ fn load_cfg() -> Result<Cfg> {
 }
 
 // ---- S3 REST-XML error helpers (shared in s3pm-support) ----
-//
-// Historically, the gateway had its own tiny XML builder.
-// This is now centralized in s3pm-support so the proxy and gateway emit
-// consistent S3 REST-XML error responses and codes.
-
-type Resp = Response<BoxBody<Bytes, Infallible>>;
-
-fn into_http_resp(b: s3pm_support::s3resp::BuiltResponse) -> Resp {
-    let mut resp = Response::new(Full::new(Bytes::from(b.body)).boxed());
-    *resp.status_mut() = b.status;
-    resp.headers_mut().insert("content-type", b.content_type.parse().unwrap());
-    for (k, v) in b.headers {
-        resp.headers_mut().insert(k, v.parse().unwrap());
-    }
-    resp
-}
 
 fn resp_not_implemented(msg: &str) -> Resp {
-    into_http_resp(s3pm_support::s3resp::not_implemented(msg, None))
+    into_hyper(s3pm_support::s3resp::not_implemented(msg, None))
 }
-
 fn resp_access_denied(msg: &str) -> Resp {
-    into_http_resp(s3pm_support::s3resp::access_denied(msg, None))
+    into_hyper(s3pm_support::s3resp::access_denied(msg, None))
 }
-
 fn resp_sig_mismatch(msg: &str) -> Resp {
-    into_http_resp(s3pm_support::s3resp::signature_does_not_match(msg, None))
+    into_hyper(s3pm_support::s3resp::signature_does_not_match(msg, None))
 }
-
 fn resp_no_such_key(msg: &str) -> Resp {
-    into_http_resp(s3pm_support::s3resp::no_such_key(msg, None))
+    into_hyper(s3pm_support::s3resp::no_such_key(msg, None))
 }
-
 fn resp_invalid_range(msg: &str) -> Resp {
-    into_http_resp(s3pm_support::s3resp::invalid_range(msg, None))
+    into_hyper(s3pm_support::s3resp::invalid_range(msg, None))
 }
 
-fn resp_bucket_location(region: &str) -> Response<BoxBody<Bytes, Infallible>> {
-    // S3 returns an empty LocationConstraint for the classic default region.
-    let body = if region == "us-east-1" || region.trim().is_empty() {
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></LocationConstraint>"#
-            .to_string()
-    } else {
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
-            region
-        )
-    };
-
-    let mut resp = Response::new(Full::new(Bytes::from(body)).boxed());
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut().insert("content-type", "application/xml".parse().unwrap());
-    resp.headers_mut().insert("x-amz-bucket-region", region.parse().unwrap());
-    resp
-}
-
-// ---- Range parsing ----
-
-#[derive(Debug, Clone, Copy)]
-struct ByteRange {
-    start: u64,
-    end_excl: u64, // [start, end_excl)
-}
-
-fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
-    let h = h.trim();
-    if h.is_empty() {
-        return Ok(None);
+fn resp_bucket_location(region: &str) -> Resp {
+    match s3pm_support::s3resp::get_bucket_location(region) {
+        Ok(b) => http_adapt::into_hyper(b),
+        Err(e) => http_adapt::into_hyper(
+            s3pm_support::s3resp::s3_error(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
+                &e.to_string(),
+                None,
+                None,
+            ).unwrap()
+        ),
     }
-    if !h.starts_with("bytes=") {
-        return Err(anyhow!("unsupported Range unit"));
-    }
-    let spec = &h["bytes=".len()..];
-
-    // Reject multi-range
-    if spec.contains(',') {
-        return Err(anyhow!("multiple ranges not supported"));
-    }
-
-    let (a, b) = spec.split_once('-').ok_or_else(|| anyhow!("bad Range syntax"))?;
-    if a.is_empty() {
-        // suffix: "-N"
-        let suffix: u64 = b.parse().map_err(|_| anyhow!("bad Range suffix"))?;
-        if suffix == 0 {
-            return Err(anyhow!("bad Range suffix"));
-        }
-        let start = size.saturating_sub(suffix);
-        return Ok(Some(ByteRange { start, end_excl: size }));
-    }
-
-    let start: u64 = a.parse().map_err(|_| anyhow!("bad Range start"))?;
-    if start >= size {
-        return Err(anyhow!("Range start beyond EOF"));
-    }
-
-    let end_incl = if b.is_empty() {
-        size - 1
-    } else {
-        let mut e: u64 = b.parse().map_err(|_| anyhow!("bad Range end"))?;
-        if e >= size {
-            e = size - 1; // clamp
-        }
-        e
-    };
-
-    if end_incl < start {
-        return Err(anyhow!("Range end < start"));
-    }
-
-    Ok(Some(ByteRange {
-        start,
-        end_excl: end_incl + 1,
-    }))
 }
 
 // ---- path mapping ----
@@ -245,335 +164,6 @@ fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-// ---- io_uring streaming ----
-
-// fixed alignment for now (good default for O_DIRECT)
-const ALIGN: usize = 4096;
-
-// pool buffer type: aligned to 4096
-type ABuf = UniqueAlignedBuffer<ALIGN>;
-
-/// A global pool of fixed-size aligned buffers.
-///
-/// Why a global pool?
-/// - Previously we created `inflight` buffers per request and zero-filled them.
-///   With chunk_size=1MiB and inflight=16, that touches ~16MiB of memory *per request*
-///   before the first body byte can be produced, which hurts TTFB (especially visible via proxy).
-/// - By warming a global pool at startup we pay the allocation + zeroing cost once.
-///   Requests then mostly just reuse buffers, improving latency and reducing allocator pressure.
-///
-/// Memory model:
-/// - Each buffer is `chunk_size` bytes long and fully initialized (zero-filled) so it is safe
-///   to expose as `&[u8]` / `Bytes` even when reads return fewer bytes.
-/// - On drop, buffers are returned to the pool via `try_send`. If the pool is full, we drop
-///   the buffer (best-effort) to avoid blocking in Drop.
-struct BufPool {
-    chunk_size: usize,
-    tx: mpsc::Sender<ABuf>,
-    rx: Mutex<mpsc::Receiver<ABuf>>,
-}
-
-impl BufPool {
-    fn new(chunk_size: usize, pool_size: usize) -> Self {
-        let (tx, rx) = mpsc::channel(pool_size);
-        Self {
-            chunk_size,
-            tx,
-            rx: Mutex::new(rx),
-        }
-    }
-
-    fn sender(&self) -> mpsc::Sender<ABuf> {
-        self.tx.clone()
-    }
-
-    /// Warm the pool with `n` buffers. This touches memory once at startup (page faults + memset).
-    fn warm(&self, n: usize) {
-        for _ in 0..n {
-            let mut b = ABuf::with_capacity(self.chunk_size);
-            // initialize once; ensures safe exposure even if read < len
-            b.resize(self.chunk_size, 0);
-            let _ = self.tx.try_send(b);
-        }
-    }
-
-    /// Get a buffer from the pool or allocate a new one if empty.
-    async fn take(&self) -> ABuf {
-        // Fast path: try without waiting
-        {
-            let mut rx = self.rx.lock().await;
-            if let Ok(b) = rx.try_recv() {
-                return b;
-            }
-        }
-
-        // Slow path: allocate on demand (still initialized, but should be rare if pool is sized well).
-        let mut b = ABuf::with_capacity(self.chunk_size);
-        b.resize(self.chunk_size, 0);
-        b
-    }
-
-    fn put_back(&self, b: ABuf) {
-        // bounded pool: return buffer; if pool is full or receiver gone, just drop
-        let _ = self.tx.try_send(b);
-    }
-}
-
-// A pooled buffer wrapper that returns the ABuf to the pool on Drop.
-struct PooledBuf {
-    pool: Arc<BufPool>,
-    buf: Option<ABuf>,
-}
-
-impl PooledBuf {
-    fn new(pool: Arc<BufPool>, buf: ABuf) -> Self {
-        Self { pool, buf: Some(buf) }
-    }
-}
-
-impl Drop for PooledBuf {
-    fn drop(&mut self) {
-        if let Some(b) = self.buf.take() {
-            self.pool.put_back(b);
-        }
-    }
-}
-
-// SAFETY: buffer memory is stable and initialized (we create with len=chunk_size filled with zeros once).
-unsafe impl tokio_uring::buf::IoBuf for PooledBuf {
-    fn stable_ptr(&self) -> *const u8 {
-        self.buf.as_ref().unwrap().as_ptr()
-    }
-    fn bytes_init(&self) -> usize {
-        self.buf.as_ref().unwrap().len()
-    }
-    fn bytes_total(&self) -> usize {
-        self.buf.as_ref().unwrap().len()
-    }
-}
-
-unsafe impl tokio_uring::buf::IoBufMut for PooledBuf {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut().unwrap().as_mut_ptr()
-    }
-    unsafe fn set_init(&mut self, _pos: usize) {
-        // no-op: we keep the entire buffer initialized always
-    }
-}
-
-// Wrap a tokio-uring Slice so we can feed it into Bytes::from_owner without copying.
-struct SliceOwner<T>(tokio_uring::buf::Slice<T>);
-
-impl<T> AsRef<[u8]> for SliceOwner<T>
-where
-    tokio_uring::buf::Slice<T>: std::ops::Deref<Target = [u8]>,
-{
-    fn as_ref(&self) -> &[u8] {
-        &*self.0
-    }
-}
-
-fn align_down(x: u64, a: u64) -> u64 { (x / a) * a }
-fn align_up(x: u64, a: u64) -> u64 { ((x + a - 1) / a) * a }
-
-async fn stream_range(
-    path: PathBuf,
-    file_size: u64,
-    want: ByteRange,
-    cfg: Arc<Cfg>,
-    pool: Arc<BufPool>,
-) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
-    // Channel from reader -> hyper body
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight * 2);
-
-    // Clone config/pool for task
-    let cfg2 = cfg.clone();
-    let pool2 = pool.clone();
-
-    tokio_uring::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg2, pool2, tx).await {
-            tracing::warn!(error = %e, "stream task failed");
-            // dropping tx ends the body; hyper will treat it as truncated if not all bytes sent
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    Ok(StreamBody::new(stream))
-}
-
-async fn stream_range_task(
-    path: PathBuf,
-    file_size: u64,
-    want: ByteRange,
-    cfg: Arc<Cfg>,
-    pool: Arc<BufPool>,
-    mut out: mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
-) -> Result<()> {
-    let chunk = cfg.chunk_size;
-    let inflight = cfg.inflight;
-
-    // Build per-request buffer pool
-    // NOTE: This used to allocate and zero `inflight` buffers *per request* which hurt TTFB.
-    // We now reuse a process-wide pool (see BufPool) to avoid per-request memory work.
-    let _pool_tx = pool.sender();
-
-    // Decide direct/buffered plan
-    let a = ALIGN as u64;
-
-    // If direct I/O is requested, enforce chunk alignment
-    let mut use_direct = cfg.direct_io;
-    if use_direct && (chunk % ALIGN != 0) {
-        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this request");
-        use_direct = false;
-    }
-
-    // We may split into:
-    //  - direct segment: aligned and not past file_size_aligned
-    //  - tail segment: buffered (handles final partial block)
-    let file_size_aligned = align_down(file_size, a);
-
-    let mut segments: Vec<(bool, u64, u64)> = Vec::new(); // (direct, seg_start, seg_end_excl)
-
-    if use_direct && want.start < file_size_aligned {
-        let seg_start = align_down(want.start, a);
-        let seg_end = std::cmp::min(align_up(want.end_excl, a), file_size_aligned);
-        if seg_end > seg_start {
-            segments.push((true, seg_start, seg_end));
-        }
-        if want.end_excl > seg_end {
-            segments.push((false, seg_end.max(want.start), want.end_excl));
-        }
-    } else {
-        segments.push((false, want.start, want.end_excl));
-    }
-
-    for (direct, seg_start, seg_end) in segments {
-        if seg_start >= seg_end {
-            continue;
-        }
-
-        let std_file = open_std_file(&path, direct)?;
-        let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
-
-        stream_segment(
-            file.clone(),
-            seg_start,
-            seg_end,
-            want.start,
-            want.end_excl,
-            chunk,
-            inflight,
-            pool.clone(),
-            &mut out,
-        )
-        .await?;
-    }
-
-    // done
-    Ok(())
-}
-
-fn open_std_file(path: &Path, direct: bool) -> Result<std::fs::File> {
-    let mut oo = OpenOptions::new();
-    oo.read(true);
-    if direct {
-        oo.custom_flags(O_DIRECT);
-    }
-    oo.open(path).map_err(|e| anyhow!("{e}"))
-}
-
-async fn read_one(
-    file: Arc<tokio_uring::fs::File>,
-    slice: tokio_uring::buf::Slice<PooledBuf>,
-    off: u64,
-    want_start: u64,
-    want_end: u64,
-) -> anyhow::Result<Option<Bytes>> {
-    let (res, slice) = file.read_at(slice, off).await;
-    let n = res.map_err(|e| anyhow::anyhow!("read_at failed at off={off}: {e}"))?;
-    if n == 0 {
-        return Ok(None);
-    }
-
-    let mut bytes = Bytes::from_owner(SliceOwner(slice));
-    bytes = bytes.slice(0..n);
-
-    let chunk_start = std::cmp::max(want_start, off);
-    let chunk_end = std::cmp::min(want_end, off + n as u64);
-
-    if chunk_start >= chunk_end {
-        return Ok(Some(Bytes::new()));
-    }
-
-    let i0 = (chunk_start - off) as usize;
-    let i1 = (chunk_end - off) as usize;
-    Ok(Some(bytes.slice(i0..i1)))
-}
-
-async fn stream_segment(
-    file: Arc<tokio_uring::fs::File>,
-    seg_start: u64,
-    seg_end: u64,
-    want_start: u64,
-    want_end: u64,
-    chunk_size: usize,
-    inflight: usize,
-    pool: Arc<BufPool>,
-    out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
-) -> anyhow::Result<()> {
-    // Bound inflight by how much we will actually read in this segment.
-    // This prevents wasting work/buffers for small objects or small ranges.
-    let chunks_total = ((seg_end - seg_start) + chunk_size as u64 - 1) / chunk_size as u64;
-    let inflight = std::cmp::min(inflight.max(1), chunks_total.max(1) as usize);
-
-    let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
-    let mut next_off = seg_start;
-
-    // initial fill
-    for _ in 0..inflight {
-        if next_off >= seg_end {
-            break;
-        }
-        let len = std::cmp::min(chunk_size as u64, seg_end - next_off) as usize;
-
-        let buf = pool.take().await;
-        let pooled = PooledBuf::new(pool.clone(), buf);
-        let slice = pooled.slice(..len);
-
-        let off = next_off;
-        futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
-        next_off += len as u64;
-    }
-
-    while let Some(res) = futs.next().await {
-        let maybe = res?;
-        let Some(bytes) = maybe else {
-            break; // EOF / truncated
-        };
-
-        if !bytes.is_empty() {
-            if out.send(Ok(Frame::data(bytes))).await.is_err() {
-                return Ok(()); // client gone
-            }
-        }
-
-        // schedule next
-        if next_off < seg_end {
-            let len = std::cmp::min(chunk_size as u64, seg_end - next_off) as usize;
-
-            let buf = pool.take().await;
-            let pooled = PooledBuf::new(pool.clone(), buf);
-            let slice = pooled.slice(..len);
-
-            let off = next_off;
-            futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
-            next_off += len as u64;
-        }
-    }
-
-    Ok(())
-}
-
 // ---- request handler ----
 
 struct App {
@@ -581,10 +171,31 @@ struct App {
     pool: Arc<BufPool>,
 }
 
+async fn read_small(
+    file: Arc<tokio_uring::fs::File>,
+    pool: Arc<BufPool>,
+    off: u64,
+    len: usize,
+) -> Result<Bytes> {
+    let buf = pool.take().await;
+    let pooled = PooledBuf::new(pool, buf);
+    let slice = pooled.slice(..len);
+
+    let (res, slice) = file.read_at(slice, off).await;
+    let n = res.map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
+    if n == 0 {
+        return Err(anyhow!("unexpected EOF"));
+    }
+
+    let mut bytes = Bytes::from_owner(SliceOwner(slice));
+    bytes = bytes.slice(0..n);
+    Ok(bytes)
+}
+
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
     let cfg = app.cfg.clone();
 
-    // Classify first (no body required). This parsing logic is shared with the proxy now.
+    // Classify first (no body required).
     let class = s3pm_support::classifier::classify(req.method().as_str(), req.uri());
 
     // Reject query params (including presigned URLs), except GetBucketLocation (?location)
@@ -620,7 +231,6 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         return Ok(resp_sig_mismatch(&e.to_string()));
     }
 
-    // Only GetObject for now (and only the clean "no query params" form).
     match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
             return Ok(resp_bucket_location(&cfg.region));
@@ -649,7 +259,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let std_file = match OpenOptions::new().read(true).open(&obj_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(resp_no_such_key("not found")),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(resp_access_denied("permission denied")),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(resp_access_denied("permission denied"))
+        }
         Err(e) => {
             let b = s3pm_support::s3resp::s3_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -657,13 +269,14 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
+            )
+            .unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 content_type: "application/xml",
                 body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
                 headers: vec![],
             });
-            return Ok(into_http_resp(b));
+            return Ok(into_hyper(b));
         }
     };
 
@@ -676,13 +289,14 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
+            )
+            .unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 content_type: "application/xml",
                 body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
                 headers: vec![],
             });
-            return Ok(into_http_resp(b));
+            return Ok(into_hyper(b));
         }
     };
 
@@ -719,26 +333,14 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let want_len = want.end_excl - want.start;
 
     // inode-based ETag
-    use std::os::unix::fs::MetadataExt;
     let ino = meta.ino();
     let etag = format!("\"{}\"", ino);
 
-    // Small body fast-path:
-    // If the response body fits in a single chunk, read it into one pooled buffer and return Full.
-    //
-    // This avoids spawning a streaming task + channels + backpressure coordination for small responses,
-    // which improves latency and reduces overhead for common small-object GETs and small Range GETs.
+    // Small body fast-path (<= one chunk): single read_at into one pooled buffer and return Full.
     if (want_len as usize) <= cfg.chunk_size {
         let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
-
-        let buf = app.pool.take().await;
-        let pooled = PooledBuf::new(app.pool.clone(), buf);
-
-        let read_len = want_len as usize;
-        let slice = pooled.slice(..read_len);
-
-        let maybe = match read_one(file, slice, want.start, want.start, want.end_excl).await {
-            Ok(m) => m,
+        let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
+            Ok(b) => b,
             Err(e) => {
                 let b = s3pm_support::s3resp::s3_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -752,25 +354,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
                     body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
                     headers: vec![],
                 });
-                return Ok(into_http_resp(b));
+                return Ok(into_hyper(b));
             }
-        };
-
-        let Some(bytes) = maybe else {
-            // EOF / truncated unexpectedly
-            let b = s3pm_support::s3resp::s3_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                s3pm_support::s3xml::error_code::INTERNAL_ERROR,
-                "unexpected EOF",
-                Some(req.uri().path()),
-                None,
-            ).unwrap_or_else(|_| s3pm_support::s3resp::BuiltResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                content_type: "application/xml",
-                body: b"<Error><Code>InternalError</Code><Message>unexpected EOF</Message></Error>".to_vec(),
-                headers: vec![],
-            });
-            return Ok(into_http_resp(b));
         };
 
         let mut resp = Response::new(Full::new(bytes.clone()).boxed());
@@ -796,8 +381,20 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         return Ok(resp);
     }
 
-    // Build streaming body
-    let body = match stream_range(obj_path.clone(), size, want, cfg.clone(), app.pool.clone()).await {
+    // Streaming body via streaming module
+    let body = match stream_range_body(
+        obj_path.clone(),
+        size,
+        want,
+        StreamCfg {
+            chunk_size: cfg.chunk_size,
+            inflight: cfg.inflight,
+            direct_io: cfg.direct_io,
+        },
+        app.pool.clone(),
+    )
+    .await
+    {
         Ok(b) => b.boxed(),
         Err(e) => {
             let b = s3pm_support::s3resp::s3_error(
@@ -812,7 +409,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
                 body: b"<Error><Code>InternalError</Code><Message>internal error</Message></Error>".to_vec(),
                 headers: vec![],
             });
-            return Ok(into_http_resp(b));
+            return Ok(into_hyper(b));
         }
     };
 
@@ -847,15 +444,7 @@ fn main() -> Result<()> {
 
     let cfg = Arc::new(load_cfg()?);
 
-    // Create and warm a global aligned buffer pool.
-    //
-    // This is the key latency fix:
-    // - We allocate + zero memory once at startup (pool_size * chunk_size).
-    // - Requests reuse buffers and avoid per-request memset/page faults before TTFB.
-    //
-    // Tuning:
-    // - `S3PM_POOL_SIZE` controls number of buffers in the pool (default 8 * inflight).
-    // - Larger pool reduces on-demand allocations under concurrency at the cost of RAM.
+    // Global aligned buffer pool (warmed at startup)
     let pool = Arc::new(BufPool::new(cfg.chunk_size, cfg.pool_size));
     pool.warm(cfg.pool_size);
 
@@ -866,7 +455,6 @@ fn main() -> Result<()> {
             // IMPORTANT: UDS bind fails if the path already exists.
             let _ = std::fs::remove_file(&sock_path);
 
-            // Optional but usually a good idea: ensure parent dir exists.
             if let Some(parent) = sock_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create UDS dir {}", parent.display()))?;
@@ -875,11 +463,13 @@ fn main() -> Result<()> {
             let listener = UnixListener::bind(&sock_path)
                 .with_context(|| format!("bind uds {}", sock_path.display()))?;
 
-            tracing::info!("s3pm-gateway listening on uds {} (chunk_size={} inflight={} pool_size={})", 
-                           sock_path.display(),
-                           cfg.chunk_size,
-                           cfg.inflight,
-                           cfg.pool_size);
+            tracing::info!(
+                "s3pm-gateway listening on uds {} (chunk_size={} inflight={} pool_size={})",
+                sock_path.display(),
+                cfg.chunk_size,
+                cfg.inflight,
+                cfg.pool_size
+            );
 
             loop {
                 let (stream, _addr) = listener.accept().await?;
@@ -902,11 +492,13 @@ fn main() -> Result<()> {
             let listener = TcpListener::bind(&cfg.bind_addr).await
                 .with_context(|| format!("bind {}", cfg.bind_addr))?;
 
-            tracing::info!("s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})", 
-                           cfg.bind_addr,
-                           cfg.chunk_size,
-                           cfg.inflight,
-                           cfg.pool_size);
+            tracing::info!(
+                "s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})",
+                cfg.bind_addr,
+                cfg.chunk_size,
+                cfg.inflight,
+                cfg.pool_size
+            );
 
             loop {
                 let (stream, _peer) = listener.accept().await?;
@@ -932,4 +524,3 @@ fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })
 }
-
