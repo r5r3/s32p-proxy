@@ -31,6 +31,8 @@ This repository is a Rust workspace with multiple crates:
 - `s3pm-directory`: shared Directory API + YAML/OpenBao backends + shared YAML file format
 - `s3pm-admin`: management library (OpenBao write access, import/export, etc.)
 - `s3pm-ctl`: CLI wrapper around `s3pm-admin` (operator tooling)
+- `s3pm-support`: shared support library (common config/types/errors/helpers used across crates)
+- `s3pm-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as the targVersityGW)
 
 ---
 
@@ -86,7 +88,7 @@ This repository is a Rust workspace with multiple crates:
 
 ---
 
-## Current Status (December 2025)
+## Current Status (January 2026)
 
 ### Implemented
 
@@ -109,6 +111,11 @@ This repository is a Rust workspace with multiple crates:
   - Each class maps to:
     - `not_implemented` (local response)
     - `proxy` (selects a worker profile)
+
+- **Gateway** (`s3pm-gateway`)
+  - experimental alternative to `versitygw`
+  - implemented commands:
+    - `GetObject`
 
 #### Directory backends (users, buckets, ACLs)
 
@@ -472,7 +479,7 @@ cargo build
 ## Running (development)
 
 ```bash
-RUST_LOG=s3_proxy_manager=debug cargo run -p s3pm-proxy
+RUST_LOG=s3_proxy_manager=debug,pingora=info,pingora_proxy=info cargo run --bin s3pm-proxy
 ```
 
 The proxy binds to the address configured in `etc/s3-proxy-manager.yaml`, default:
