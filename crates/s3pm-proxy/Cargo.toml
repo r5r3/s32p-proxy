@@ -11,7 +11,8 @@ s3pm-directory = { path = "../s3pm-directory" }
 s3pm-support = { path = "../s3pm-support" }
 
 # Pingora stack
-pingora = { version = "0.6.0", features = ["proxy"] }
+pingora = { version = "0.6.0", features = ["proxy", "rustls"] }
+rustls = "0.23"
 bytes = "1"
 
 # HTTP types

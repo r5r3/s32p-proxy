@@ -11,6 +11,8 @@ use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::{Error, ErrorType, Result as PResult};
 use pingora::server::Server;
 use pingora::upstreams::peer::{HttpPeer, PeerOptions};
+use pingora::listeners::tls::TlsSettings;
+use rustls::crypto::aws_lc_rs;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -425,6 +427,9 @@ async fn validate_sigv4_header_only_or_reject(
 }
 
 fn main() -> Result<()> {
+    // ensure, that aws-lc-rs is our crypto provider
+    aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
@@ -476,10 +481,20 @@ fn main() -> Result<()> {
     server.bootstrap();
 
     let mut proxy = http_proxy_service(&server.configuration, app);
-    proxy.add_tcp(&listen);
-    server.add_service(proxy);
 
-    tracing::info!("s3-proxy-manager listening on {}", listen);
+    if cfg.server.public_scheme == "https" {
+        let tls_settings = TlsSettings::intermediate(
+            cfg.server.tls_cert_path.as_ref().unwrap(),
+            cfg.server.tls_key_path.as_ref().unwrap(),
+        ).context("failed to load TLS settings (check certificate/key paths and format)")?;
+        proxy.add_tls_with_settings(&cfg.server.listen, None, tls_settings);
+        tracing::info!("TLS enabled, listening on {}", listen);
+    } else {
+        proxy.add_tcp(&listen);
+        tracing::info!("TLS disabled, listening on {}", listen);
+    }
+
+    server.add_service(proxy);
     server.run_forever();
 }
 

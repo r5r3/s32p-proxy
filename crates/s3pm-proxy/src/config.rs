@@ -17,6 +17,10 @@ pub struct ServerConfig {
     pub listen: String,
     /// "http" in dev, "https" behind TLS termination
     pub public_scheme: String,
+    /// Path to TLS certificate (full chain)
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key (in PEM format)
+    pub tls_key_path: Option<String>,
     /// Bucket region returned by GetBucketLocation (e.g. "eu-central-1"). Use "us-east-1" for the classic default.
     pub region: String,
     /// e.g. "info", "debug", or "s3_proxy_manager=debug"
@@ -199,6 +203,18 @@ impl Config {
                 return Err(anyhow!(
                     "server.public_scheme must be 'http' or 'https' (got '{other}')"
                 ))
+            }
+        }
+
+        if self.server.public_scheme == "https" {
+            if self.server.tls_cert_path.is_none() || self.server.tls_key_path.is_none() {
+                return Err(anyhow!("TLS certificate and key paths are required when public_scheme is 'https'"));
+            }
+            // Verify files exist and are readable
+            if let (Some(cert_path), Some(key_path)) = (&self.server.tls_cert_path, &self.server.tls_key_path) {
+                if !Path::new(cert_path).exists() || !Path::new(key_path).exists() {
+                    return Err(anyhow!("TLS certificate or key file does not exist"));
+                }
             }
         }
 
