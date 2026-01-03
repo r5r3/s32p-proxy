@@ -12,7 +12,7 @@ use pingora::{Error, ErrorType, Result as PResult};
 use pingora::server::Server;
 use pingora::upstreams::peer::{HttpPeer, PeerOptions};
 use pingora::listeners::tls::TlsSettings;
-use rustls::crypto::aws_lc_rs;
+use rustls::crypto::{aws_lc_rs, CryptoProvider};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -426,9 +426,40 @@ async fn validate_sigv4_header_only_or_reject(
     Ok(false) // valid
 }
 
+fn rustls_prefer_fast_cipher() -> Result<()> {
+    // Prefer AES-128 first, then AES-256.
+    //
+    // NOTE: rustls uses the provider’s cipher_suites order as server preference.
+    // We keep CHACHA as a fallback after AES.
+    use rustls::crypto::aws_lc_rs::cipher_suite::*;
+
+    let mut provider = aws_lc_rs::default_provider();
+    provider.cipher_suites = vec![
+        // TLS 1.3
+        TLS13_AES_128_GCM_SHA256,
+        //TLS13_AES_256_GCM_SHA384,
+        //TLS13_CHACHA20_POLY1305_SHA256,
+
+        // TLS 1.2 (ECDHE + AES-GCM), AES-128 first
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        //TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        //TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+
+        // TLS 1.2 fallback
+        //TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        //TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ];
+
+    CryptoProvider::install_default(provider).expect("Failed to install aws-lc-rs as default TLS provider");
+    Ok(())
+}
+
+
 fn main() -> Result<()> {
     // ensure, that aws-lc-rs is our crypto provider
-    aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
+    // aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
+    rustls_prefer_fast_cipher().unwrap();
 
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
@@ -483,10 +514,11 @@ fn main() -> Result<()> {
     let mut proxy = http_proxy_service(&server.configuration, app);
 
     if cfg.server.public_scheme == "https" {
-        let tls_settings = TlsSettings::intermediate(
+        let mut tls_settings = TlsSettings::intermediate(
             cfg.server.tls_cert_path.as_ref().unwrap(),
             cfg.server.tls_key_path.as_ref().unwrap(),
         ).context("failed to load TLS settings (check certificate/key paths and format)")?;
+        tls_settings.enable_h2();
         proxy.add_tls_with_settings(&cfg.server.listen, None, tls_settings);
         tracing::info!("TLS enabled, listening on {}", listen);
     } else {
@@ -497,4 +529,3 @@ fn main() -> Result<()> {
     server.add_service(proxy);
     server.run_forever();
 }
-

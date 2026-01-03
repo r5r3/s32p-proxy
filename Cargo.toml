@@ -11,6 +11,9 @@ members = [
   "crates/s3pm-gateway",
 ]
 
+[workspace.dependencies]
+rustls = { version = "0.23", features = ["aws_lc_rs", "read_buf"] }
+
 [profile.perf]
 rustflags = ["-C", "target-cpu=native"]
 inherits = "release"
