@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::Semaphore;
 use tokio_uring::buf::BoundedBuf;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
@@ -136,6 +137,10 @@ fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
 struct App {
     cfg: Arc<Cfg>,
     pool: Arc<BufPool>,
+
+    /// Global IO-permit budget (permits acquired per file/request).
+    io_sem: Arc<Semaphore>,
+    io_total: usize,
 }
 
 async fn read_small(
@@ -144,7 +149,7 @@ async fn read_small(
     off: u64,
     len: usize,
 ) -> Result<Bytes> {
-    let buf = pool.take().await;
+    let buf = pool.take();
     let pooled = PooledBuf::new(pool, buf);
     let slice = pooled.slice(..len);
 
@@ -308,8 +313,19 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let ino = meta.ino();
     let etag = format!("\"{}\"", ino);
 
-    // Small body fast-path (<= one chunk): single read_at into one pooled buffer and return Full.
+    // Small body fast-path (<= one chunk): acquire ONE permit for this file/request.
     if (want_len as usize) <= cfg.chunk_size {
+        let _permit = match app.io_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(s3pm_support::s3resp::internal_error(
+                    "io permit semaphore closed",
+                    Some(req.uri().path()),
+                    None,
+                ))
+            }
+        };
+
         let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
         let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
             Ok(b) => b,
@@ -345,7 +361,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         return Ok(resp);
     }
 
-    // Streaming body via streaming module
+    // Streaming body via streaming module (permits acquired per file inside streaming.rs)
     let body = match stream_range_body(
         obj_path.clone(),
         size,
@@ -356,6 +372,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
             direct_io: cfg.direct_io,
         },
         app.pool.clone(),
+        app.io_sem.clone(),
+        app.io_total,
     )
     .await
     {
@@ -404,7 +422,16 @@ fn main() -> Result<()> {
     let pool = Arc::new(BufPool::new(cfg.chunk_size, cfg.pool_size));
     pool.warm(cfg.pool_size);
 
-    let app = Arc::new(App { cfg: cfg.clone(), pool });
+    // Global IO permit budget: tie to pool_size by default.
+    let io_total = cfg.pool_size.max(1);
+    let io_sem = Arc::new(Semaphore::new(io_total));
+
+    let app = Arc::new(App {
+        cfg: cfg.clone(),
+        pool,
+        io_sem,
+        io_total,
+    });
 
     tokio_uring::start(async move {
         if let Some(sock_path) = cfg.bind_uds.clone() {
@@ -481,4 +508,3 @@ fn main() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })
 }
-

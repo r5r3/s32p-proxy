@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
 
@@ -28,8 +28,13 @@ pub struct StreamCfg {
     pub direct_io: bool,
 }
 
-fn align_down(x: u64, a: u64) -> u64 { (x / a) * a }
-fn align_up(x: u64, a: u64) -> u64 { ((x + a - 1) / a) * a }
+fn align_down(x: u64, a: u64) -> u64 {
+    (x / a) * a
+}
+fn align_up(x: u64, a: u64) -> u64 {
+    let y = x.saturating_add(a - 1);
+    (y / a) * a
+}
 
 pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
     let h = h.trim();
@@ -87,16 +92,81 @@ pub async fn stream_range_body(
     want: ByteRange,
     cfg: StreamCfg,
     pool: Arc<BufPool>,
+    io_sem: Arc<Semaphore>,
+    io_total: usize,
 ) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight * 2);
 
     tokio_uring::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg, pool, tx).await {
+        if let Err(e) = stream_range_task(path, file_size, want, cfg, pool, io_sem, io_total, tx).await
+        {
             tracing::warn!(error = %e, "stream task failed");
         }
     });
 
     Ok(StreamBody::new(ReceiverStream::new(rx)))
+}
+
+fn effective_end_for_scheduling(
+    file_size: u64,
+    seg_start: u64,
+    seg_end: u64,
+    chunk_size: usize,
+    direct: bool,
+) -> u64 {
+    if !direct {
+        return seg_end;
+    }
+
+    // In direct mode, seg_end may extend past EOF (aligned-up). We must not schedule reads
+    // that start at/after EOF (off >= file_size), because they'd return 0 and would stop
+    // the pipeline too early. So cap at "one block past the last valid aligned start".
+    let a = ALIGN as u64;
+    if file_size == 0 {
+        return seg_start;
+    }
+
+    // work_end is aligned and >= file_size; reads starting < work_end are safe,
+    // but we must ensure the *start offset* is < file_size.
+    let work_end = align_down(file_size.saturating_sub(1), a) + a;
+
+    // Also ensure we don't run backwards.
+    let capped = std::cmp::min(seg_end, work_end);
+    // chunk_size is assumed aligned when direct; caller enforces.
+    if capped < seg_start {
+        seg_start
+    } else {
+        capped
+    }
+}
+
+fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
+    if eff_end <= seg_start {
+        return 0;
+    }
+    let span = eff_end - seg_start;
+    ((span + chunk_size as u64 - 1) / chunk_size as u64) as usize
+}
+
+/// Decide per-file concurrency based on global permits already out.
+fn per_file_permits(base: usize, io_total: usize, io_available: usize) -> usize {
+    if base <= 1 || io_total <= 1 {
+        return base.max(1);
+    }
+
+    let io_out = io_total.saturating_sub(io_available);
+
+    // If more than half are out, scale down proportionally to remaining permits.
+    if io_out > io_total / 2 {
+        // scale factor = 2*available/total in (0,1)
+        // allowed = ceil(base * 2*available/total)
+        let avail = io_available.max(1) as u64;
+        let total = io_total as u64;
+        let scaled = ((base as u64) * (2 * avail) + (total - 1)) / total;
+        scaled as usize
+    } else {
+        base
+    }
 }
 
 async fn stream_range_task(
@@ -105,55 +175,81 @@ async fn stream_range_task(
     want: ByteRange,
     cfg: StreamCfg,
     pool: Arc<BufPool>,
+    io_sem: Arc<Semaphore>,
+    io_total: usize,
     mut out: mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
     let chunk = cfg.chunk_size;
-    let inflight = cfg.inflight.max(1);
+    let inflight_cfg = cfg.inflight.max(1);
 
     let a = ALIGN as u64;
 
-    let mut use_direct = cfg.direct_io;
-    if use_direct && (chunk % ALIGN != 0) {
-        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this request");
-        use_direct = false;
-    }
-
-    let file_size_aligned = align_down(file_size, a);
-    let mut segments: Vec<(bool, u64, u64)> = Vec::new();
-
-    if use_direct && want.start < file_size_aligned {
-        let seg_start = align_down(want.start, a);
-        let seg_end = std::cmp::min(align_up(want.end_excl, a), file_size_aligned);
-        if seg_end > seg_start {
-            segments.push((true, seg_start, seg_end));
-        }
-        if want.end_excl > seg_end {
-            segments.push((false, seg_end.max(want.start), want.end_excl));
-        }
-    } else {
-        segments.push((false, want.start, want.end_excl));
-    }
-
-    for (direct, seg_start, seg_end) in segments {
-        if seg_start >= seg_end {
-            continue;
-        }
-
-        let std_file = open_std_file(&path, direct)?;
-        let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
-
-        stream_segment(
-            file,
-            seg_start,
-            seg_end,
-            want.start,
-            want.end_excl,
+    // Use O_DIRECT for the entire request if enabled and chunk_size is aligned.
+    let mut direct = cfg.direct_io;
+    if direct && (chunk % ALIGN != 0) {
+        tracing::warn!(
             chunk,
-            inflight,
-            pool.clone(),
-            &mut out,
-        ).await?;
+            "direct_io enabled but chunk not aligned; disabling direct_io for this request"
+        );
+        direct = false;
     }
+
+    // Choose the segment to read:
+    // - direct: expand to alignment boundaries (may extend past EOF); slice later
+    // - buffered: exact request range
+    let (seg_start, seg_end) = if direct {
+        (align_down(want.start, a), align_up(want.end_excl, a))
+    } else {
+        (want.start, want.end_excl)
+    };
+
+    if seg_start >= seg_end {
+        return Ok(());
+    }
+
+    // Compute how many chunks are actually needed (taking file size into account).
+    let eff_end = effective_end_for_scheduling(file_size, seg_start, seg_end, chunk, direct);
+    let needed = chunks_needed(seg_start, eff_end, chunk);
+
+    if needed == 0 {
+        return Ok(());
+    }
+
+    // Base per-file concurrency = min(cfg.inflight, needed)
+    let base = std::cmp::min(inflight_cfg, needed);
+
+    // Dynamic per-file cap based on global usage snapshot.
+    let available = io_sem.available_permits();
+    let mut allowed = per_file_permits(base, io_total.max(1), available);
+
+    // Never exceed what we actually need.
+    allowed = allowed.clamp(1, base);
+
+    // Acquire permits ONCE per file/request and hold until streaming completes.
+    let _permits = io_sem
+        .clone()
+        .acquire_many_owned(allowed as u32)
+        .await
+        .map_err(|_| anyhow!("io permit semaphore closed"))?;
+
+    // Open exactly one fd for the whole request (direct OR buffered).
+    let std_file = open_std_file(&path, direct)?;
+    let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
+
+    stream_segment(
+        file,
+        file_size,
+        seg_start,
+        seg_end,
+        want.start,
+        want.end_excl,
+        chunk,
+        allowed, // per-file permitted inflight
+        direct,
+        pool,
+        &mut out,
+    )
+    .await?;
 
     Ok(())
 }
@@ -177,12 +273,14 @@ async fn read_one(
     let (res, slice) = file.read_at(slice, off).await;
     let n = res.map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
     if n == 0 {
+        // EOF
         return Ok(None);
     }
 
     let mut bytes = Bytes::from_owner(SliceOwner(slice));
     bytes = bytes.slice(0..n);
 
+    // Slice down to the requested [want_start, want_end) within this read window.
     let chunk_start = std::cmp::max(want_start, off);
     let chunk_end = std::cmp::min(want_end, off + n as u64);
 
@@ -197,38 +295,84 @@ async fn read_one(
 
 async fn stream_segment(
     file: Arc<tokio_uring::fs::File>,
+    file_size: u64,
     seg_start: u64,
     seg_end: u64,
     want_start: u64,
     want_end: u64,
     chunk_size: usize,
-    inflight: usize,
+    inflight: usize, // already capped by per-file permits
+    direct: bool,
     pool: Arc<BufPool>,
     out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
-    let chunks_total = ((seg_end - seg_start) + chunk_size as u64 - 1) / chunk_size as u64;
-    let inflight = std::cmp::min(inflight, chunks_total.max(1) as usize);
+    let a = ALIGN as u64;
 
-    let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
     let mut next_off = seg_start;
 
+    // For direct mode, avoid scheduling reads that start at/after EOF.
+    // We cap the scheduling window similarly to effective_end_for_scheduling().
+    let effective_end = if direct {
+        if file_size == 0 {
+            seg_start
+        } else {
+            let work_end = align_down(file_size.saturating_sub(1), a) + a;
+            std::cmp::min(seg_end, work_end)
+        }
+    } else {
+        seg_end
+    };
+
+    if next_off >= effective_end {
+        return Ok(());
+    }
+
+    // How many chunks will we actually schedule?
+    let chunks_total =
+        ((effective_end - seg_start) + chunk_size as u64 - 1) / chunk_size as u64;
+    let inflight = std::cmp::min(inflight.max(1), chunks_total.max(1) as usize);
+
+    let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
+
+    // Compute submission length at offset.
+    let mut submit_len = |off: u64| -> usize {
+        let remain = effective_end.saturating_sub(off);
+        let mut len = std::cmp::min(chunk_size as u64, remain) as usize;
+
+        if direct {
+            // Ensure ALIGN multiple for O_DIRECT submissions.
+            let rem = (len as u64) % a;
+            if rem != 0 {
+                len = (len as u64 + (a - rem)) as usize;
+            }
+            if off.saturating_add(len as u64) > effective_end {
+                len = (effective_end - off) as usize;
+            }
+        }
+
+        len.max(1)
+    };
+
+    // Prime the pipeline up to inflight.
     for _ in 0..inflight {
-        if next_off >= seg_end {
+        if next_off >= effective_end {
             break;
         }
-        let len = std::cmp::min(chunk_size as u64, seg_end - next_off) as usize;
+        let len = submit_len(next_off);
 
-        let buf = pool.take().await;
+        let buf = pool.take();
         let pooled = PooledBuf::new(pool.clone(), buf);
         let slice = pooled.slice(..len);
 
         let off = next_off;
         futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
-        next_off += len as u64;
+        next_off = next_off.saturating_add(len as u64);
     }
 
     while let Some(res) = futs.next().await {
-        let Some(bytes) = res? else { break };
+        let Some(bytes) = res? else {
+            break;
+        };
 
         if !bytes.is_empty() {
             if out.send(Ok(Frame::data(bytes))).await.is_err() {
@@ -236,16 +380,16 @@ async fn stream_segment(
             }
         }
 
-        if next_off < seg_end {
-            let len = std::cmp::min(chunk_size as u64, seg_end - next_off) as usize;
+        if next_off < effective_end {
+            let len = submit_len(next_off);
 
-            let buf = pool.take().await;
+            let buf = pool.take();
             let pooled = PooledBuf::new(pool.clone(), buf);
             let slice = pooled.slice(..len);
 
             let off = next_off;
             futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
-            next_off += len as u64;
+            next_off = next_off.saturating_add(len as u64);
         }
     }
 

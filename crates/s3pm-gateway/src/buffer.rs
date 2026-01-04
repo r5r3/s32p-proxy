@@ -1,6 +1,6 @@
 use aligned_buffer::UniqueAlignedBuffer;
+use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 
 /// Fixed alignment for now (good default for O_DIRECT)
 pub const ALIGN: usize = 4096;
@@ -8,25 +8,18 @@ pub const ALIGN: usize = 4096;
 /// Pool buffer type (aligned)
 pub type ABuf = UniqueAlignedBuffer<ALIGN>;
 
-/// A global pool of fixed-size aligned buffers.
+/// A global pool of fixed-size aligned buffers (lock-free, sync API).
 pub struct BufPool {
     chunk_size: usize,
-    tx: mpsc::Sender<ABuf>,
-    rx: Mutex<mpsc::Receiver<ABuf>>,
+    q: Arc<ArrayQueue<ABuf>>,
 }
 
 impl BufPool {
     pub fn new(chunk_size: usize, pool_size: usize) -> Self {
-        let (tx, rx) = mpsc::channel(pool_size);
         Self {
             chunk_size,
-            tx,
-            rx: Mutex::new(rx),
+            q: Arc::new(ArrayQueue::new(pool_size)),
         }
-    }
-
-    pub fn sender(&self) -> mpsc::Sender<ABuf> {
-        self.tx.clone()
     }
 
     /// Warm the pool with `n` buffers (touch memory once at startup).
@@ -34,17 +27,15 @@ impl BufPool {
         for _ in 0..n {
             let mut b = ABuf::with_capacity(self.chunk_size);
             b.resize(self.chunk_size, 0);
-            let _ = self.tx.try_send(b);
+            let _ = self.q.push(b);
         }
     }
 
     /// Get a buffer from the pool or allocate a new one if empty.
-    pub async fn take(&self) -> ABuf {
-        {
-            let mut rx = self.rx.lock().await;
-            if let Ok(b) = rx.try_recv() {
-                return b;
-            }
+    #[inline]
+    pub fn take(&self) -> ABuf {
+        if let Some(b) = self.q.pop() {
+            return b;
         }
 
         let mut b = ABuf::with_capacity(self.chunk_size);
@@ -52,8 +43,9 @@ impl BufPool {
         b
     }
 
+    #[inline]
     pub fn put_back(&self, b: ABuf) {
-        let _ = self.tx.try_send(b);
+        let _ = self.q.push(b);
     }
 }
 
@@ -65,7 +57,10 @@ pub struct PooledBuf {
 
 impl PooledBuf {
     pub fn new(pool: Arc<BufPool>, buf: ABuf) -> Self {
-        Self { pool, buf: Some(buf) }
+        Self {
+            pool,
+            buf: Some(buf),
+        }
     }
 }
 

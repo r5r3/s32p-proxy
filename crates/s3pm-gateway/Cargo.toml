@@ -9,6 +9,7 @@ anyhow = "1"
 http = "1"
 httpdate = "1"
 bytes = "1"
+crossbeam-queue = "0.3"
 
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
