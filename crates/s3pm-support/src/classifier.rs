@@ -72,6 +72,8 @@ pub enum VersioningOp {
 pub enum ReadOp {
     /// GET /{bucket}/{key} (no query params)
     GetObject,
+    /// HEAD /{bucket}/{key} (no query params)
+    HeadObject,
     /// GET /{bucket}?location or GET /{bucket}/?location
     GetBucketLocation,
 }
@@ -178,6 +180,16 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Read(ReadOp::GetObject),
+        };
+    }
+
+    // HeadObject: HEAD /{bucket}/{key} with *no* query params
+    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Read(ReadOp::HeadObject),
         };
     }
 

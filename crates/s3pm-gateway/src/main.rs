@@ -218,7 +218,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
             return Ok(s3pm_support::s3resp::get_bucket_location(&cfg.region));
         }
-        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject) => {}
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject)
+        | s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject) => {}
         s3pm_support::classifier::S3Op::Multipart(_) => {
             return Ok(s3pm_support::s3resp::not_implemented(
                 "multipart uploads are not implemented",
@@ -233,11 +234,16 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         }
         _ => {
             return Ok(s3pm_support::s3resp::not_implemented(
-                "only GET /{bucket}/{key} is implemented",
+                "only GET/HEAD /{bucket}/{key} is implemented",
                 None,
             ));
         }
     }
+
+    let is_head_object = matches!(
+        &class.op,
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject)
+    );
 
     let bucket = class.bucket.as_deref().unwrap();
     let key = class.key.as_deref().unwrap();
@@ -284,6 +290,11 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         resp.headers_mut().insert("content-length", "0".parse().unwrap());
         resp.headers_mut()
             .insert("content-type", "application/octet-stream".parse().unwrap());
+        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
+        resp.headers_mut()
+            .insert(LAST_MODIFIED, fmt_http_date(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)).parse().unwrap());
+        resp.headers_mut().insert("etag", format!("\"{}\"", meta.ino()).parse().unwrap());
+        resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
         return Ok(resp);
     }
 
@@ -312,6 +323,28 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     // inode-based ETag
     let ino = meta.ino();
     let etag = format!("\"{}\"", ino);
+
+    // HeadObject: same headers as GetObject, but no body
+    if is_head_object {
+        let mut resp = Response::new(Full::new(Bytes::new()).boxed());
+ 
+        if range.is_some() && want_len > 0 {
+            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            let content_range = format!("bytes {}-{}/{}", want.start, want.end_excl - 1, size);
+            resp.headers_mut().insert("content-range", content_range.parse().unwrap());
+            resp.headers_mut().insert("content-length", want_len.to_string().parse().unwrap());
+        } else {
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert("content-length", size.to_string().parse().unwrap());
+        }
+
+        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
+        resp.headers_mut().insert("etag", etag.parse().unwrap());
+        resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
+        resp.headers_mut().insert(LAST_MODIFIED, last_modified.parse().unwrap());
+        resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+        return Ok(resp);
+    }
 
     // Small body fast-path (<= one chunk): acquire ONE permit for this file/request.
     if (want_len as usize) <= cfg.chunk_size {
