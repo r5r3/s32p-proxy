@@ -21,6 +21,9 @@ pub mod error_code {
     // Used by gateway for object retrieval errors.
     pub const NO_SUCH_KEY: &str = "NoSuchKey";
     pub const INVALID_RANGE: &str = "InvalidRange";
+
+    // Used by gateway for bucket-level operations.
+    pub const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 }
 
 /// Minimal bucket info used by ListBuckets.

@@ -119,6 +119,17 @@ pub fn invalid_access_key_id(message: &str, resource: Option<&str>) -> HttpRespo
     )
 }
 
+/// Convenience: NoSuchBucket (404).
+pub fn no_such_bucket(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::NOT_FOUND,
+        s3xml::error_code::NO_SUCH_BUCKET,
+        message,
+        resource,
+        None,
+    )
+}
+
 /// Convenience: NoSuchKey (404).
 pub fn no_such_key(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
@@ -184,6 +195,17 @@ pub fn get_bucket_location(region: &str) -> HttpResponse {
         StatusCode::OK,
         "application/xml",
         body,
+        [("x-amz-bucket-region", region.to_string())],
+    )
+}
+
+/// Convenience: HeadBucket success (200, empty body).
+/// Many clients expect `x-amz-bucket-region` to be present.
+pub fn head_bucket_ok(region: &str) -> HttpResponse {
+    response_bytes(
+        StatusCode::OK,
+        "application/xml",
+        Vec::new(),
         [("x-amz-bucket-region", region.to_string())],
     )
 }

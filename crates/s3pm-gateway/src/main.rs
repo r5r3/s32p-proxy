@@ -24,6 +24,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -113,7 +114,7 @@ fn load_cfg() -> Result<Cfg> {
     })
 }
 
-// ---- path mapping ----
+// ---- path mapping and other helpers ----
 
 fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
     // avoid ".." traversal
@@ -135,6 +136,106 @@ fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
         out.push(part);
     }
     Ok(out)
+}
+
+fn bucket_root_path(root: &Path, bucket: &str) -> Result<PathBuf> {
+    // Reuse the same bucket validation as object path joining.
+    join_object_path(root, bucket, "")
+}
+
+fn bucket_exists_dir(root: &Path, bucket: &str) -> Result<bool> {
+    let p = bucket_root_path(root, bucket)?;
+    Ok(p.exists() && p.is_dir())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatxInfo {
+    ino: u64,
+    size: u64,
+    uid: u32,
+    mtime: SystemTime,
+}
+
+fn system_time_from_unix(sec: i64, nsec: u32) -> SystemTime {
+    use std::time::Duration;
+    if sec >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::new(sec as u64, nsec)
+    } else {
+        // sec is negative
+        let d = Duration::new((-sec) as u64, nsec);
+        SystemTime::UNIX_EPOCH - d
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn statx_info(path: &Path) -> Option<StatxInfo> {
+    // Build a C string from raw OS bytes (avoid UTF-8 assumptions).
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    let c_path = CString::new(bytes).ok()?;
+
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+
+    // Request only what we need for ListObjectsV2:
+    // - inode for ETag
+    // - size
+    // - mtime
+    // - uid for optional Owner
+    let mask: libc::c_uint =
+        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
+
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            mask,
+            &mut stx as *mut libc::statx,
+        )
+    };
+
+    if rc != 0 {
+        return None;
+    }
+
+    let mtime = system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
+
+    Some(StatxInfo {
+        ino: stx.stx_ino as u64,
+        size: stx.stx_size as u64,
+        uid: stx.stx_uid as u32,
+        mtime,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statx_info(path: &Path) -> Option<StatxInfo> {
+    // Fallback for non-Linux builds.
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(StatxInfo {
+            ino: meta.ino(),
+            size: meta.len(),
+            uid: meta.uid(),
+            mtime,
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        Some(StatxInfo {
+            ino: 0,
+            size: meta.len(),
+            uid: 0,
+            mtime,
+        })
+    }
 }
 
 // ---- request handler ----
@@ -176,6 +277,10 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let resp = match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
             handle_get_bucket_location(req, app, &class).await
+        }
+
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadBucket) => {
+            handle_head_bucket(req, app, &class).await
         }
 
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject)
@@ -234,7 +339,11 @@ fn query_is_only_location(req: &Request<Incoming>) -> bool {
         })
 }
 
-async fn handle_get_bucket_location(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+async fn handle_get_bucket_location(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
     let cfg = app.cfg.clone();
 
     // Require SigV4 even for local responses
@@ -247,7 +356,45 @@ async fn handle_get_bucket_location(req: Request<Incoming>, app: Arc<App>, _clas
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
-    s3pm_support::s3resp::get_bucket_location(&cfg.region)
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s3pm_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => s3pm_support::s3resp::get_bucket_location(&cfg.region),
+        Ok(false) => s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+}
+
+async fn handle_head_bucket(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Require SigV4 even for local responses
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    // Defensive: HeadBucket should not have query params in our implementation.
+    if req.uri().query().is_some() {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s3pm_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => s3pm_support::s3resp::head_bucket_ok(&cfg.region),
+        Ok(false) => s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
 }
 
 async fn handle_multipart(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
@@ -301,6 +448,13 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
 
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
+
+    // If the bucket is missing, S3 expects NoSuchBucket (not NoSuchKey).
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
@@ -727,16 +881,30 @@ async fn handle_list_objects_v2(
     }
 
     let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s3pm_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
+    }
 
     // list-type=2 is already checked by classifier, keep defensive.
     if class.query.first("list-type") != Some("2") {
         return s3pm_support::s3resp::not_implemented("missing list-type=2", None);
     }
 
+    // If bucket doesn't exist, return NoSuchBucket (S3 semantics).
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
     let prefix = class.query.first("prefix").unwrap_or("").to_string();
 
     // delimiter: only "/" is supported; if absent => recursive.
-    let delimiter_q = class.query.first("delimiter").and_then(|d| if d.is_empty() { None } else { Some(d) });
+    let delimiter_q = class
+        .query
+        .first("delimiter")
+        .and_then(|d| if d.is_empty() { None } else { Some(d) });
+
     let recursive = match delimiter_q {
         None => true,
         Some("/") => false,
@@ -769,7 +937,7 @@ async fn handle_list_objects_v2(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
     };
 
-    // If bucket dir doesn't exist or start dir isn't a dir => empty listing (best-effort)
+    // If the *prefix directory* doesn't exist (but bucket exists), return an empty listing.
     if !start_dir_fs.exists() || !start_dir_fs.is_dir() {
         return s3pm_support::s3resp::list_objects_v2(
             bucket,
@@ -792,28 +960,19 @@ async fn handle_list_objects_v2(
             Ok(tok) => {
                 // Validate token belongs to the same listing shape
                 if tok.bucket != bucket || tok.prefix != prefix || tok.delimiter.as_deref() != delimiter_q {
-                    let mut error_parts = Vec::new();
-
+                    let mut parts = Vec::new();
                     if tok.bucket != bucket {
-                        error_parts.push(format!("request-bucket {bucket} != token-bucket {}", tok.bucket));
-                    } else {
-                        error_parts.push(format!("request-bucket {}", bucket));
+                        parts.push(format!("request-bucket {bucket} != token-bucket {}", tok.bucket));
                     }
-
                     if tok.prefix != prefix {
-                        error_parts.push(format!("request-prefix {} != token-prefix {}", prefix, tok.prefix));
-                    } else {
-                        error_parts.push(format!("request-prefix {}", prefix));
+                        parts.push(format!("request-prefix {prefix} != token-prefix {}", tok.prefix));
                     }
-
                     if tok.delimiter.as_deref() != delimiter_q {
-                        error_parts.push(format!(
+                        parts.push(format!(
                             "request-delimiter {:?} != token-delimiter {:?}",
                             delimiter_q,
-                            tok.delimiter.as_deref().unwrap_or(&"None")
+                            tok.delimiter.as_deref()
                         ));
-                    } else {
-                        error_parts.push(format!("request-delimiter {:?}", delimiter_q));
                     }
 
                     return s3pm_support::s3resp::s3_error(
@@ -821,7 +980,7 @@ async fn handle_list_objects_v2(
                         s3pm_support::s3xml::error_code::INVALID_REQUEST,
                         &format!(
                             "continuation-token does not match request parameters: {}",
-                            error_parts.join(", ")
+                            parts.join(", ")
                         ),
                         Some(req.uri().path()),
                         None,
@@ -918,10 +1077,10 @@ async fn handle_list_objects_v2(
             continue;
         }
 
-        // file: emit Contents
-        let meta = match fs::metadata(&it.path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        // file: emit Contents using statx (AT_STATX_DONT_SYNC) for Lustre LSOM friendliness
+        let stx = match statx_info(&it.path) {
+            Some(s) => s,
+            None => continue,
         };
 
         let key = format!("{}{}", top.dir_key, it.name);
@@ -930,17 +1089,12 @@ async fn handle_list_objects_v2(
             continue;
         }
 
-        let last_modified = meta
-            .modified()
-            .ok()
-            .map(s3pm_support::s3xml::format_s3_time_system)
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-
-        let etag = format!("\"{}\"", meta.ino());
-        let size = meta.len();
+        let last_modified = s3pm_support::s3xml::format_s3_time_system(stx.mtime);
+        let etag = format!("\"{}\"", stx.ino);
+        let size = stx.size;
 
         let owner = if fetch_owner {
-            Some(owner_info(meta.uid()))
+            Some(owner_info(stx.uid))
         } else {
             None
         };
@@ -955,7 +1109,7 @@ async fn handle_list_objects_v2(
     }
 
     let key_count = (contents.len() + common_prefixes.len()) as u32;
-    let is_truncated = key_count >= max_keys && (stack.len() > 0);
+    let is_truncated = key_count >= max_keys && !stack.is_empty();
 
     let next_token = if is_truncated && key_count > 0 {
         // Build token from current runtime stack
@@ -972,10 +1126,7 @@ async fn handle_list_objects_v2(
                 })
                 .collect(),
         };
-        match encode_token(&tok) {
-            Ok(s) => Some(s),
-            Err(_) => None,
-        }
+        encode_token(&tok).ok()
     } else {
         None
     };

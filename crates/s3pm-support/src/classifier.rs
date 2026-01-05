@@ -74,6 +74,8 @@ pub enum ReadOp {
     GetObject,
     /// HEAD /{bucket}/{key} (no query params)
     HeadObject,
+    /// HEAD /{bucket} (no query params)
+    HeadBucket,
     /// GET /{bucket}?location or GET /{bucket}/?location
     GetBucketLocation,
     /// GET /{bucket}?list-type=2 (ListObjectsV2)
@@ -172,6 +174,16 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Read(ReadOp::GetBucketLocation),
+        };
+    }
+
+    // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params
+    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Read(ReadOp::HeadBucket),
         };
     }
 
