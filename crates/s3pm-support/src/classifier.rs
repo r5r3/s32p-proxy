@@ -76,6 +76,8 @@ pub enum ReadOp {
     HeadObject,
     /// GET /{bucket}?location or GET /{bucket}/?location
     GetBucketLocation,
+    /// GET /{bucket}?list-type=2 (ListObjectsV2)
+    ListObjectsV2,
 }
 
 /// Parsed query params with lowercased keys.
@@ -190,6 +192,20 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Read(ReadOp::HeadObject),
+        };
+    }
+
+    // ListObjectsV2: GET /{bucket}?list-type=2 (may have other params)
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.first("list-type") == Some("2")
+    {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Read(ReadOp::ListObjectsV2),
         };
     }
 

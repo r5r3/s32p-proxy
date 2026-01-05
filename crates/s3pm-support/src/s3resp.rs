@@ -260,3 +260,37 @@ pub fn object_response(
     resp
 }
 
+/// Convenience: ListObjectsV2 success (200).
+pub fn list_objects_v2(
+    bucket_name: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    key_count: u32,
+    max_keys: u32,
+    is_truncated: bool,
+    continuation_token: Option<&str>,
+    next_continuation_token: Option<&str>,
+    start_after: Option<&str>,
+    contents: &[s3xml::ListObjectInfo],
+    common_prefixes: &[String],
+) -> HttpResponse {
+    let body = s3xml::list_objects_v2_body(
+        bucket_name,
+        prefix,
+        delimiter,
+        key_count,
+        max_keys,
+        is_truncated,
+        continuation_token,
+        next_continuation_token,
+        start_after,
+        contents,
+        common_prefixes,
+    )
+    .unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+

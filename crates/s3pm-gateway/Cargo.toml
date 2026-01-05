@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["net"] }
 aligned-buffer = "0.2"
 libc = "0.2"
 
+base64 = "0.22"
+serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.38", features = ["serialize"] }
 

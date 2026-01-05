@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use quick_xml::se::to_string as to_xml_string;
 use serde::Serialize;
-
+use std::time::SystemTime;
 use time::{macros::format_description, OffsetDateTime, UtcOffset};
 
 /// XML namespace used by S3 REST-XML error + list bucket responses.
@@ -79,13 +79,6 @@ pub fn list_buckets_body(
     Ok(xml.into_bytes())
 }
 
-fn format_s3_time_utc_z(dt: OffsetDateTime) -> String {
-    let utc = dt.to_offset(UtcOffset::UTC);
-    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    utc.format(&fmt)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
 /// Build XML body for GetBucketLocation.
 /// AWS returns an *empty* LocationConstraint for us-east-1.
 /// Many clients accept either empty text or a self-closing tag; we emit empty text via Option::None.
@@ -96,6 +89,71 @@ pub fn get_bucket_location_body(region: &str) -> Result<Vec<u8>> {
     Ok(xml.into_bytes())
 }
 
+/// Format SystemTime into S3 list time format (UTC with trailing Z).
+pub fn format_s3_time_system(st: SystemTime) -> String {
+    let dt = match OffsetDateTime::from(st) {
+        dt => dt.to_offset(UtcOffset::UTC),
+    };
+    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    dt.format(&fmt)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn format_s3_time_utc_z(dt: OffsetDateTime) -> String {
+    let utc = dt.to_offset(UtcOffset::UTC);
+    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    utc.format(&fmt)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Build XML body for ListObjectsV2 (GET ?list-type=2).
+pub fn list_objects_v2_body(
+    bucket_name: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    key_count: u32,
+    max_keys: u32,
+    is_truncated: bool,
+    continuation_token: Option<&str>,
+    next_continuation_token: Option<&str>,
+    start_after: Option<&str>,
+    contents: &[ListObjectInfo],
+    common_prefixes: &[String],
+) -> Result<Vec<u8>> {
+    let doc = ListBucketResultV2 {
+        xmlns: S3_XMLNS,
+        name: bucket_name.to_string(),
+        prefix: prefix.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        delimiter: delimiter.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        key_count,
+        max_keys,
+        is_truncated,
+        continuation_token: continuation_token.map(|s| s.to_string()),
+        next_continuation_token: next_continuation_token.map(|s| s.to_string()),
+        start_after: start_after.map(|s| s.to_string()),
+        contents: contents
+            .iter()
+            .map(|o| ContentsV2 {
+                key: o.key.clone(),
+                last_modified: o.last_modified.clone(),
+                etag: o.etag.clone(),
+                size: o.size,
+                storage_class: "STANDARD".to_string(),
+                owner: o.owner.as_ref().map(|ow| OwnerV2 {
+                    id: ow.id.clone(),
+                    display_name: ow.display_name.clone(),
+                }),
+            })
+            .collect(),
+        common_prefixes: common_prefixes
+            .iter()
+            .map(|p| CommonPrefixesV2 { prefix: p.clone() })
+            .collect(),
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
 
 /* -------------------------
  * XML DTOs
@@ -162,5 +220,94 @@ struct LocationConstraintDoc {
     #[serde(rename = "$text", skip_serializing_if = "Option::is_none")]
     value: Option<String>,
 }
+
+// --- public DTOs for ListObjectsV2 ---
+
+#[derive(Clone, Debug)]
+pub struct ListOwnerInfo {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ListObjectInfo {
+    pub key: String,
+    pub last_modified: String, // ISO8601 UTC "YYYY-MM-DDTHH:MM:SSZ"
+    pub etag: String,          // include quotes, e.g. "\"123\""
+    pub size: u64,
+    pub owner: Option<ListOwnerInfo>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListBucketResult")]
+struct ListBucketResultV2 {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Name")]
+    name: String,
+
+    #[serde(rename = "Prefix", skip_serializing_if = "Option::is_none")]
+    prefix: Option<String>,
+
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    delimiter: Option<String>,
+
+    #[serde(rename = "KeyCount")]
+    key_count: u32,
+
+    #[serde(rename = "MaxKeys")]
+    max_keys: u32,
+
+    #[serde(rename = "IsTruncated")]
+    is_truncated: bool,
+
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<String>,
+
+    #[serde(rename = "NextContinuationToken", skip_serializing_if = "Option::is_none")]
+    next_continuation_token: Option<String>,
+
+    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
+    start_after: Option<String>,
+
+    #[serde(rename = "Contents", default, skip_serializing_if = "Vec::is_empty")]
+    contents: Vec<ContentsV2>,
+
+    #[serde(rename = "CommonPrefixes", default, skip_serializing_if = "Vec::is_empty")]
+    common_prefixes: Vec<CommonPrefixesV2>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContentsV2 {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+    #[serde(rename = "Size")]
+    size: u64,
+    #[serde(rename = "StorageClass")]
+    storage_class: String,
+
+    #[serde(rename = "Owner", skip_serializing_if = "Option::is_none")]
+    owner: Option<OwnerV2>,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerV2 {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CommonPrefixesV2 {
+    #[serde(rename = "Prefix")]
+    prefix: String,
+}
+
 
 
