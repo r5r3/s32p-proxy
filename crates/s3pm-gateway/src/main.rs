@@ -736,10 +736,9 @@ async fn handle_list_objects_v2(
     let prefix = class.query.first("prefix").unwrap_or("").to_string();
 
     // delimiter: only "/" is supported; if absent => recursive.
-    let delimiter_q = class.query.first("delimiter");
+    let delimiter_q = class.query.first("delimiter").and_then(|d| if d.is_empty() { None } else { Some(d) });
     let recursive = match delimiter_q {
         None => true,
-        Some("") => true,
         Some("/") => false,
         Some(_) => {
             return s3pm_support::s3resp::not_implemented("only delimiter=/ is supported", None);
@@ -793,10 +792,37 @@ async fn handle_list_objects_v2(
             Ok(tok) => {
                 // Validate token belongs to the same listing shape
                 if tok.bucket != bucket || tok.prefix != prefix || tok.delimiter.as_deref() != delimiter_q {
+                    let mut error_parts = Vec::new();
+
+                    if tok.bucket != bucket {
+                        error_parts.push(format!("request-bucket {bucket} != token-bucket {}", tok.bucket));
+                    } else {
+                        error_parts.push(format!("request-bucket {}", bucket));
+                    }
+
+                    if tok.prefix != prefix {
+                        error_parts.push(format!("request-prefix {} != token-prefix {}", prefix, tok.prefix));
+                    } else {
+                        error_parts.push(format!("request-prefix {}", prefix));
+                    }
+
+                    if tok.delimiter.as_deref() != delimiter_q {
+                        error_parts.push(format!(
+                            "request-delimiter {:?} != token-delimiter {:?}",
+                            delimiter_q,
+                            tok.delimiter.as_deref().unwrap_or(&"None")
+                        ));
+                    } else {
+                        error_parts.push(format!("request-delimiter {:?}", delimiter_q));
+                    }
+
                     return s3pm_support::s3resp::s3_error(
                         StatusCode::BAD_REQUEST,
                         s3pm_support::s3xml::error_code::INVALID_REQUEST,
-                        "continuation-token does not match request parameters",
+                        &format!(
+                            "continuation-token does not match request parameters: {}",
+                            error_parts.join(", ")
+                        ),
                         Some(req.uri().path()),
                         None,
                     );
