@@ -1,7 +1,7 @@
 use crate::s3xml;
 
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use http::{Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use std::convert::Infallible;
@@ -186,5 +186,77 @@ pub fn get_bucket_location(region: &str) -> HttpResponse {
         body,
         [("x-amz-bucket-region", region.to_string())],
     )
+}
+
+/* -------------------------
+ * S3 object (GetObject / HeadObject) response helpers
+ * ------------------------- */
+
+/// Box an empty body (useful for HEAD responses).
+pub fn empty_body() -> RespBody {
+    Full::new(Bytes::new()).boxed()
+}
+
+/// Box a full in-memory body from `Bytes`.
+pub fn body_bytes(bytes: Bytes) -> RespBody {
+    Full::new(bytes).boxed()
+}
+
+/// Format a Content-Range header value for a single range.
+pub fn object_content_range(start: u64, end_incl: u64, total: u64) -> String {
+    format!("bytes {}-{}/{}", start, end_incl, total)
+}
+
+fn apply_object_headers(
+    headers: &mut http::HeaderMap,
+    content_type: &'static str,
+    content_length: u64,
+    etag: &str,
+    last_modified: &str,
+    content_range: Option<&str>,
+) {
+    // Required / expected by most S3 clients
+    headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(CONTENT_LENGTH, content_length.to_string().parse().unwrap());
+    headers.insert(ACCEPT_RANGES, "bytes".parse().unwrap());
+    headers.insert(ETAG, etag.parse().unwrap());
+    headers.insert(LAST_MODIFIED, last_modified.parse().unwrap());
+
+    if let Some(cr) = content_range {
+        headers.insert(CONTENT_RANGE, cr.parse().unwrap());
+    }
+
+    // Keep consistent across all object responses from the gateway.
+    // (Header name is lowercase string to avoid relying on `http::header::SERVER` existence across versions.)
+    headers.insert("server", "s3pm-gateway".parse().unwrap());
+}
+
+/// Build a GetObject/HeadObject response with consistent headers across:
+/// - empty objects
+/// - full 200 responses
+/// - 206 single-range responses
+/// - HEAD responses (empty body but correct Content-Length / Content-Range)
+pub fn object_response(
+    status: StatusCode,
+    body: RespBody,
+    content_type: &'static str,
+    content_length: u64,
+    etag: &str,
+    last_modified: &str,
+    content_range: Option<&str>,
+) -> HttpResponse {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+
+    apply_object_headers(
+        resp.headers_mut(),
+        content_type,
+        content_length,
+        etag,
+        last_modified,
+        content_range,
+    );
+
+    resp
 }
 

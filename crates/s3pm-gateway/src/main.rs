@@ -165,31 +165,33 @@ async fn read_small(
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
-    let cfg = app.cfg.clone();
-
     // Classify first (no body required).
     let class = s3pm_support::classifier::classify(req.method().as_str(), req.uri());
 
-    // Reject query params (including presigned URLs), except GetBucketLocation (?location)
-    let is_get_bucket_location = req.method() == http::Method::GET
-        && req.uri().query().is_some_and(|q| {
-            let mut parts = q.split('&').filter(|p| !p.is_empty());
-            let first = parts.next().unwrap_or("");
-            parts.next().is_none() && (first == "location" || first.starts_with("location="))
-        });
+    let resp = match &class.op {
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
+            handle_get_bucket_location(req, app, &class).await
+        }
 
-    if req.uri().query().is_some() && !is_get_bucket_location {
-        return Ok(s3pm_support::s3resp::not_implemented(
-            "query parameters are not implemented",
-            None,
-        ));
-    }
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject)
+        | s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject) => {
+            // GetObject + HeadObject handled together
+            handle_get_object(req, app, &class).await
+        }
 
-    // SigV4: parse + verify (every request)
+        s3pm_support::classifier::S3Op::Multipart(_) => handle_multipart(req, app, &class).await,
+        s3pm_support::classifier::S3Op::Versioning(_) => handle_versioning(req, app, &class).await,
+        _ => handle_other(req, app, &class).await,
+    };
+
+    Ok(resp)
+}
+
+fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), Resp> {
     let auth = match s3pm_support::parse_authorization(req.headers()) {
         Ok(a) => a,
         Err(e) => {
-            return Ok(s3pm_support::s3resp::access_denied(
+            return Err(s3pm_support::s3resp::access_denied(
                 &format!("bad Authorization: {e}"),
                 None,
             ))
@@ -197,7 +199,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     };
 
     if auth.access_key != cfg.access_key {
-        return Ok(s3pm_support::s3resp::access_denied("unknown access key", None));
+        return Err(s3pm_support::s3resp::access_denied("unknown access key", None));
     }
 
     if let Err(e) = s3pm_support::verify_sigv4_header_only(
@@ -208,36 +210,79 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         &cfg.secret_key,
         &cfg.public_scheme,
     ) {
-        return Ok(s3pm_support::s3resp::signature_does_not_match(
-            &e.to_string(),
-            None,
-        ));
+        return Err(s3pm_support::s3resp::signature_does_not_match(&e.to_string(), None));
     }
 
-    match &class.op {
-        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
-            return Ok(s3pm_support::s3resp::get_bucket_location(&cfg.region));
-        }
-        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject)
-        | s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject) => {}
-        s3pm_support::classifier::S3Op::Multipart(_) => {
-            return Ok(s3pm_support::s3resp::not_implemented(
-                "multipart uploads are not implemented",
-                None,
-            ));
-        }
-        s3pm_support::classifier::S3Op::Versioning(_) => {
-            return Ok(s3pm_support::s3resp::not_implemented(
-                "versioning is not implemented",
-                None,
-            ));
-        }
-        _ => {
-            return Ok(s3pm_support::s3resp::not_implemented(
-                "only GET/HEAD /{bucket}/{key} is implemented",
-                None,
-            ));
-        }
+    Ok(())
+}
+
+fn query_is_only_location(req: &Request<Incoming>) -> bool {
+    req.method() == http::Method::GET
+        && req.uri().query().is_some_and(|q| {
+            let mut parts = q.split('&').filter(|p| !p.is_empty());
+            let first = parts.next().unwrap_or("");
+            parts.next().is_none() && (first == "location" || first.starts_with("location="))
+        })
+}
+
+async fn handle_get_bucket_location(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Require SigV4 even for local responses
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    // Only allow ?location (classifier should already ensure this, but keep it defensive)
+    if req.uri().query().is_some() && !query_is_only_location(&req) {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    s3pm_support::s3resp::get_bucket_location(&cfg.region)
+}
+
+async fn handle_multipart(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+    let cfg = app.cfg.clone();
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    s3pm_support::s3resp::not_implemented("multipart uploads are not implemented", None)
+}
+
+async fn handle_versioning(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+    let cfg = app.cfg.clone();
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    s3pm_support::s3resp::not_implemented("versioning is not implemented", None)
+}
+
+async fn handle_other(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+    let cfg = app.cfg.clone();
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    // Preserve the previous general message
+    s3pm_support::s3resp::not_implemented("only GET/HEAD /{bucket}/{key} is implemented", None)
+}
+
+async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Reject query params (including presigned URLs) for object reads.
+    if req.uri().query().is_some() {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    // SigV4: parse + verify (every request)
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
     }
 
     let is_head_object = matches!(
@@ -245,58 +290,44 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject)
     );
 
-    let bucket = class.bucket.as_deref().unwrap();
-    let key = class.key.as_deref().unwrap();
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
-        Err(e) => return Ok(s3pm_support::s3resp::access_denied(&e.to_string(), None)),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
     };
 
     // open once (buffered) to stat + inode + size
     let std_file = match OpenOptions::new().read(true).open(&obj_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(s3pm_support::s3resp::no_such_key("not found", None))
+            return s3pm_support::s3resp::no_such_key("not found", None)
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Ok(s3pm_support::s3resp::access_denied("permission denied", None))
+            return s3pm_support::s3resp::access_denied("permission denied", None)
         }
         Err(e) => {
-            return Ok(s3pm_support::s3resp::internal_error(
+            return s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ));
+            );
         }
     };
 
     let meta = match std_file.metadata() {
         Ok(m) => m,
         Err(e) => {
-            return Ok(s3pm_support::s3resp::internal_error(
+            return s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ));
+            );
         }
     };
 
     let size = meta.len();
-    if size == 0 {
-        // empty object OK; return 200 with Content-Length 0
-        let mut resp = Response::new(Full::new(Bytes::new()).boxed());
-        *resp.status_mut() = StatusCode::OK;
-        resp.headers_mut().insert("content-length", "0".parse().unwrap());
-        resp.headers_mut()
-            .insert("content-type", "application/octet-stream".parse().unwrap());
-        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-        resp.headers_mut()
-            .insert(LAST_MODIFIED, fmt_http_date(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)).parse().unwrap());
-        resp.headers_mut().insert("etag", format!("\"{}\"", meta.ino()).parse().unwrap());
-        resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
-        return Ok(resp);
-    }
 
     // IMPORTANT: real mtime in RFC1123 / HTTP-date format (required by many S3 clients).
     // If metadata.modified() fails, fall back to UNIX_EPOCH (still a valid HTTP date).
@@ -306,44 +337,63 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         .map(fmt_http_date)
         .unwrap_or_else(|| fmt_http_date(SystemTime::UNIX_EPOCH));
 
+    // inode-based ETag
+    let etag = format!("\"{}\"", meta.ino());
+
+    // Empty object: 200 + Content-Length: 0 (+ common headers)
+    if size == 0 {
+        return s3pm_support::s3resp::object_response(
+            StatusCode::OK,
+            s3pm_support::s3resp::empty_body(),
+            "application/octet-stream",
+            0,
+            &etag,
+            &last_modified,
+            None,
+        );
+    }
+
+    // Range parsing (single-range only)
+    let range_present = req.headers().get("range").is_some();
     let range = match req.headers().get("range") {
         None => None,
         Some(v) => match v.to_str() {
             Ok(s) => match parse_range_header(s, size) {
                 Ok(r) => r,
-                Err(e) => return Ok(s3pm_support::s3resp::invalid_range(&e.to_string(), None)),
+                Err(e) => return s3pm_support::s3resp::invalid_range(&e.to_string(), None),
             },
-            Err(_) => return Ok(s3pm_support::s3resp::invalid_range("bad Range header", None)),
+            Err(_) => return s3pm_support::s3resp::invalid_range("bad Range header", None),
         },
     };
 
     let want = range.unwrap_or(ByteRange { start: 0, end_excl: size });
     let want_len = want.end_excl - want.start;
 
-    // inode-based ETag
-    let ino = meta.ino();
-    let etag = format!("\"{}\"", ino);
-
     // HeadObject: same headers as GetObject, but no body
     if is_head_object {
-        let mut resp = Response::new(Full::new(Bytes::new()).boxed());
- 
-        if range.is_some() && want_len > 0 {
-            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-            let content_range = format!("bytes {}-{}/{}", want.start, want.end_excl - 1, size);
-            resp.headers_mut().insert("content-range", content_range.parse().unwrap());
-            resp.headers_mut().insert("content-length", want_len.to_string().parse().unwrap());
+        let (status, content_length, content_range) = if range_present {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                want_len,
+                Some(s3pm_support::s3resp::object_content_range(
+                    want.start,
+                    want.end_excl - 1,
+                    size,
+                )),
+            )
         } else {
-            *resp.status_mut() = StatusCode::OK;
-            resp.headers_mut().insert("content-length", size.to_string().parse().unwrap());
-        }
+            (StatusCode::OK, size, None)
+        };
 
-        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-        resp.headers_mut().insert("etag", etag.parse().unwrap());
-        resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
-        resp.headers_mut().insert(LAST_MODIFIED, last_modified.parse().unwrap());
-        resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
-        return Ok(resp);
+        return s3pm_support::s3resp::object_response(
+            status,
+            s3pm_support::s3resp::empty_body(),
+            "application/octet-stream",
+            content_length,
+            &etag,
+            &last_modified,
+            content_range.as_deref(),
+        );
     }
 
     // Small body fast-path (<= one chunk): acquire ONE permit for this file/request.
@@ -351,11 +401,11 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         let _permit = match app.io_sem.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => {
-                return Ok(s3pm_support::s3resp::internal_error(
+                return s3pm_support::s3resp::internal_error(
                     "io permit semaphore closed",
                     Some(req.uri().path()),
                     None,
-                ))
+                )
             }
         };
 
@@ -363,35 +413,35 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
             Ok(b) => b,
             Err(e) => {
-                return Ok(s3pm_support::s3resp::internal_error(
+                return s3pm_support::s3resp::internal_error(
                     &e.to_string(),
                     Some(req.uri().path()),
                     None,
-                ));
+                );
             }
         };
 
-        let mut resp = Response::new(Full::new(bytes.clone()).boxed());
-
-        if range.is_some() {
-            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        // For range responses, compute end from what we actually read (robust to truncation races).
+        let (status, content_length, content_range) = if range_present {
             let end_incl = want.start + (bytes.len().saturating_sub(1) as u64);
-            let content_range = format!("bytes {}-{}/{}", want.start, end_incl, size);
-            resp.headers_mut().insert("content-range", content_range.parse().unwrap());
-            resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-            resp.headers_mut().insert("content-length", bytes.len().to_string().parse().unwrap());
+            (
+                StatusCode::PARTIAL_CONTENT,
+                bytes.len() as u64,
+                Some(s3pm_support::s3resp::object_content_range(want.start, end_incl, size)),
+            )
         } else {
-            *resp.status_mut() = StatusCode::OK;
-            resp.headers_mut().insert("content-length", size.to_string().parse().unwrap());
-            resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-        }
+            (StatusCode::OK, size, None)
+        };
 
-        resp.headers_mut().insert("etag", etag.parse().unwrap());
-        resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
-        resp.headers_mut().insert(LAST_MODIFIED, last_modified.parse().unwrap());
-        resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
-
-        return Ok(resp);
+        return s3pm_support::s3resp::object_response(
+            status,
+            s3pm_support::s3resp::body_bytes(bytes),
+            "application/octet-stream",
+            content_length,
+            &etag,
+            &last_modified,
+            content_range.as_deref(),
+        );
     }
 
     // Streaming body via streaming module (permits acquired per file inside streaming.rs)
@@ -412,34 +462,37 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     {
         Ok(b) => b.boxed(),
         Err(e) => {
-            return Ok(s3pm_support::s3resp::internal_error(
+            return s3pm_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            ));
+            );
         }
     };
 
-    let mut resp = Response::new(body);
-
-    if range.is_some() {
-        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-        let content_range = format!("bytes {}-{}/{}", want.start, want.end_excl - 1, size);
-        resp.headers_mut().insert("content-range", content_range.parse().unwrap());
-        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-        resp.headers_mut().insert("content-length", want_len.to_string().parse().unwrap());
+    let (status, content_length, content_range) = if range_present {
+        (
+            StatusCode::PARTIAL_CONTENT,
+            want_len,
+            Some(s3pm_support::s3resp::object_content_range(
+                want.start,
+                want.end_excl - 1,
+                size,
+            )),
+        )
     } else {
-        *resp.status_mut() = StatusCode::OK;
-        resp.headers_mut().insert("content-length", size.to_string().parse().unwrap());
-        resp.headers_mut().insert("accept-ranges", "bytes".parse().unwrap());
-    }
+        (StatusCode::OK, size, None)
+    };
 
-    resp.headers_mut().insert("etag", etag.parse().unwrap());
-    resp.headers_mut().insert("content-type", "application/octet-stream".parse().unwrap());
-    resp.headers_mut().insert(LAST_MODIFIED, last_modified.parse().unwrap());
-    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
-
-    Ok(resp)
+    s3pm_support::s3resp::object_response(
+        status,
+        body,
+        "application/octet-stream",
+        content_length,
+        &etag,
+        &last_modified,
+        content_range.as_deref(),
+    )
 }
 
 // ---- main ----
