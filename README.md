@@ -32,7 +32,7 @@ This repository is a Rust workspace with multiple crates:
 - `s3pm-admin`: management library (OpenBao write access, import/export, etc.)
 - `s3pm-ctl`: CLI wrapper around `s3pm-admin` (operator tooling)
 - `s3pm-support`: shared support library (common config/types/errors/helpers used across crates)
-- `s3pm-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as the targVersityGW)
+- `s3pm-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as alternative to VersityGW)
 
 ---
 
@@ -112,10 +112,17 @@ This repository is a Rust workspace with multiple crates:
     - `not_implemented` (local response)
     - `proxy` (selects a worker profile)
 
-- **Gateway** (`s3pm-gateway`)
-  - experimental alternative to `versitygw`
-  - implemented commands:
-    - `GetObject`
+#### Gateway (`s3pm-gateway`)
+
+- experimental alternative to `versitygw`
+- implemented commands:
+  - `GetObject`
+  - `HeadObject`
+  - `GetBucketLocation`
+- notes:
+  - supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`)
+  - rejects query parameters for now (including presigned URLs), except `?location`
+  - `ETag` generated from inode number.
 
 #### Directory backends (users, buckets, ACLs)
 
@@ -554,4 +561,4 @@ TBD
 `s3-proxy-manager` is the **control plane**:
 authentication/routing/worker lifecycle for per-access-key S3 access to a shared filesystem.
 
-VersityGW remains the storage-facing component and performs the authoritative SigV4 validation.
+VersityGW or `s3pm-gateway` are the storage-facing components and performs the authoritative SigV4 validation.
