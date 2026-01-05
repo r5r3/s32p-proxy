@@ -118,10 +118,13 @@ This repository is a Rust workspace with multiple crates:
 - implemented commands:
   - `GetObject`
   - `HeadObject`
+  - `HeadBucket`
   - `GetBucketLocation`
+  - `ListObjectsV2`
 - notes:
-  - supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`)
-  - rejects query parameters for now (including presigned URLs), except `?location`
+  - supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
+  - rejects query parameters for now (including presigned URLs), except `?location` and `?list-type=2`.
+  - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM).
   - `ETag` generated from inode number.
 
 #### Directory backends (users, buckets, ACLs)
