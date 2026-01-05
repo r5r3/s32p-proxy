@@ -168,24 +168,6 @@ impl ProxyHttp for S3ProxyApp {
         };
         ctx.set_user(&user);
 
-
-        // 2a) Handle GetBucketLocation locally (fast path).
-        // IMPORTANT: We still validate SigV4 first, just like NotImplemented.
-        if matches!(class.op, s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation)) {
-            if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
-                return Ok(true); // already responded with auth/signature error
-            }
-
-            responses::respond_get_bucket_location(
-                session,
-                &self.region,
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-            return Ok(true);
-        }
-
         // 2b) If routing says NotImplemented: validate first, then reply NotImplemented.
         if let config::RouteAction::NotImplemented { message } = action {
             // Only send NotImplemented for VALID requests.
