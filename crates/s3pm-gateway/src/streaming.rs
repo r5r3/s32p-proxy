@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, Buf};
+use futures_util::Stream;
 use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
 use http_body_util::{StreamBody, BodyExt};
 use hyper::body::{Body, Incoming, Frame};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
-use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
+use crate::buffer::{BufPool, PooledBuf, SliceOwner, BytesBuf, ALIGN};
 use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
 
@@ -398,167 +399,361 @@ async fn stream_segment(
     Ok(())
 }
 
-pub struct AwsChunkedReader<R> {
-    inner: BufReader<R>,
-    remaining_in_chunk: usize,
-    finished: bool,
+struct PlainFrameReader<S> {
+    stream: S,
+    buf: Bytes,
+    done: bool,
 }
 
-impl<R: AsyncRead + Unpin> AwsChunkedReader<R> {
-    pub fn new(r: R) -> Self {
+impl<S> PlainFrameReader<S>
+where
+    S: Stream<Item = io::Result<Bytes>> + Unpin,
+{
+    fn new(stream: S) -> Self {
         Self {
-            inner: BufReader::new(r),
-            remaining_in_chunk: 0,
-            finished: false,
+            stream,
+            buf: Bytes::new(),
+            done: false,
         }
     }
 
-    async fn read_chunk_len_line(&mut self) -> io::Result<usize> {
-        // AWS format: "<hex>;chunk-signature=<hex>\r\n"
-        let mut line = String::new();
-        let n = self.inner.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unexpected EOF while reading aws-chunked header line",
-            ));
-        }
-
-        // read_line keeps '\n'; handle either "\n" or "\r\n"
-        let line = line.trim_end_matches('\n').trim_end_matches('\r');
-        let hex = line.split(';').next().unwrap_or("");
-        usize::from_str_radix(hex, 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid aws-chunked size line: {line}"),
-            )
-        })
-    }
-
-    async fn read_and_check_crlf(&mut self) -> io::Result<()> {
-        let mut crlf = [0u8; 2];
-        self.inner.read_exact(&mut crlf).await?;
-        if &crlf != b"\r\n" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "aws-chunked: missing CRLF after chunk data",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn read_trailers_until_blank_line(&mut self) -> io::Result<()> {
-        // After the 0-sized chunk, AWS ends with an empty line.
-        loop {
-            let mut line = String::new();
-            let n = self.inner.read_line(&mut line).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading aws-chunked trailers",
-                ));
-            }
-            if line == "\n" || line == "\r\n" {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Read exactly dst.len() decoded payload bytes into dst.
-    pub async fn read_exact_payload(&mut self, mut dst: &mut [u8]) -> io::Result<()> {
-        while !dst.is_empty() {
-            if self.finished {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "aws-chunked: payload shorter than expected",
-                ));
-            }
-
-            if self.remaining_in_chunk == 0 {
-                let n = self.read_chunk_len_line().await?;
-                if n == 0 {
-                    // Terminal chunk (0). It is followed by trailers ending in a blank line.
-                    self.read_trailers_until_blank_line().await?;
-                    self.finished = true;
-                    continue;
-                }
-                self.remaining_in_chunk = n;
-            }
-
-            let take = dst.len().min(self.remaining_in_chunk);
-            self.inner.read_exact(&mut dst[..take]).await?;
-            self.remaining_in_chunk -= take;
-            dst = &mut dst[take..];
-
-            if self.remaining_in_chunk == 0 {
-                self.read_and_check_crlf().await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Consume the aws-chunked terminator/trailers if they weren't fully consumed yet.
-    pub async fn finish(mut self) -> io::Result<()> {
-        if self.finished {
+    async fn refill(&mut self) -> io::Result<()> {
+        if self.done {
             return Ok(());
         }
-
-        // Discard any partial chunk data remaining, then CRLF.
-        if self.remaining_in_chunk > 0 {
-            let mut limited = (&mut self.inner).take(self.remaining_in_chunk as u64);
-            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
-            self.remaining_in_chunk = 0;
-            self.read_and_check_crlf().await?;
+        while self.buf.is_empty() && !self.done {
+            match self.stream.next().await {
+                None => self.done = true,
+                Some(Ok(b)) => self.buf = b,
+                Some(Err(e)) => return Err(e),
+            }
         }
+        Ok(())
+    }
 
-        // Read headers until we see the 0 chunk + blank line.
-        loop {
-            let n = self.read_chunk_len_line().await?;
-            if n == 0 {
-                self.read_trailers_until_blank_line().await?;
-                return Ok(());
+    async fn read_exact_payload(&mut self, mut dst: &mut [u8]) -> io::Result<()> {
+        while !dst.is_empty() {
+            self.refill().await?;
+            if self.done && self.buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "body shorter than expected",
+                ));
             }
 
-            let mut limited = (&mut self.inner).take(n as u64);
-            tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+            let n = dst.len().min(self.buf.len());
+            dst[..n].copy_from_slice(&self.buf[..n]);
+            dst = &mut dst[n..];
+            self.buf.advance(n);
+        }
+        Ok(())
+    }
 
-            self.read_and_check_crlf().await?;
+    async fn next_bytes(&mut self) -> io::Result<Option<Bytes>> {
+        self.refill().await?;
+        if self.done && self.buf.is_empty() {
+            return Ok(None);
+        }
+        if self.buf.is_empty() {
+            return Ok(Some(Bytes::new()));
+        }
+        Ok(Some(std::mem::take(&mut self.buf)))
+    }
+
+    async fn ensure_eof(mut self) -> io::Result<()> {
+        while let Some(item) = self.stream.next().await {
+            let b = item?;
+            if !b.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "body longer than expected",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn try_preallocate(file: &tokio_uring::fs::File, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    match file.fallocate(0, len, 0).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Some FS / setups return "operation not supported" etc. Don’t fail the upload.
+            let raw = e.raw_os_error().unwrap_or(0);
+            if raw == libc::EOPNOTSUPP
+                || raw == libc::ENOSYS
+                || raw == libc::EINVAL
+                || raw == libc::ENOTSUP
+            {
+                tracing::debug!(error = %e, "fallocate not supported; continuing without preallocation");
+                Ok(())
+            } else {
+                Err(anyhow!("fallocate({len}) failed: {e}"))
+            }
         }
     }
 }
 
-// Wrap in aws-chunked decoder if needed
-// reader yields *encoded* bytes; AwsChunkedReader strips aws framing.
-enum InReader<R> {
-    Plain(R),
-    Aws(AwsChunkedReader<R>),
+fn ftruncate_fd(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
+    let rc = unsafe { libc::ftruncate(fd, len as libc::off_t) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "ftruncate({}) failed: {}",
+            len,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
-impl<R: AsyncRead + Unpin> InReader<R> {
-    async fn read_exact_payload(&mut self, dst: &mut [u8]) -> Result<()> {
-        match self {
-            InReader::Plain(r) => {
-                r.read_exact(dst).await.map_err(|e| anyhow!("read_exact: {e}"))?;
-                Ok(())
-            }
-            InReader::Aws(aws) => {
-                aws.read_exact_payload(dst)
-                    .await
-                    .map_err(|e| anyhow!("aws-chunked read error: {e}"))?;
-                Ok(())
-            }
-        }
+pub mod aws_chunked {
+    use super::*;
+    use futures_util::Stream;
+
+    #[derive(Debug, Clone, Copy)]
+    enum State {
+        NeedHeader,
+        NeedData,
+        NeedCrlf,
+        NeedTrailers,
+        Done,
     }
 
-    async fn finish(self) -> Result<()> {
-        match self {
-            InReader::Plain(_) => Ok(()),
-            InReader::Aws(aws) => {
-                aws.finish()
-                    .await
-                    .map_err(|e| anyhow!("aws-chunked finish error: {e}"))?;
-                Ok(())
+    /// Decoder for `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`.
+    ///
+    /// - Consumes the *encoded* HTTP body as `Bytes` frames (no AsyncRead wrapper).
+    /// - Produces *decoded payload bytes*.
+    /// - Ignores `chunk-signature=...` (parses and discards extensions).
+    pub struct Decoder<S> {
+        stream: S,
+        buf: Bytes,
+        scratch: Vec<u8>, // for header/trailer lines crossing frame boundaries
+        state: State,
+        remaining_in_chunk: usize,
+        eof: bool,
+    }
+
+    impl<S> Decoder<S>
+    where
+        S: Stream<Item = io::Result<Bytes>> + Unpin,
+    {
+        pub fn new(stream: S) -> Self {
+            Self {
+                stream,
+                buf: Bytes::new(),
+                scratch: Vec::with_capacity(256),
+                state: State::NeedHeader,
+                remaining_in_chunk: 0,
+                eof: false,
             }
+        }
+
+        async fn refill(&mut self) -> io::Result<()> {
+            while self.buf.is_empty() && !self.eof {
+                match self.stream.next().await {
+                    None => self.eof = true,
+                    Some(Ok(b)) => self.buf = b,
+                    Some(Err(e)) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+
+        async fn read_line(&mut self) -> io::Result<Bytes> {
+            self.scratch.clear();
+
+            loop {
+                // Search in current buffer for '\n'
+                if let Some(pos) = self.buf.iter().position(|&c| c == b'\n') {
+                    let mut line = self.buf.split_to(pos + 1);
+
+                    // If scratch is empty, return line directly.
+                    if self.scratch.is_empty() {
+                        return Ok(line);
+                    }
+
+                    // Otherwise append line to scratch and return combined as Bytes.
+                    self.scratch.extend_from_slice(&line);
+                    return Ok(Bytes::copy_from_slice(&self.scratch));
+                }
+
+                // No newline: move entire buf into scratch, then refill.
+                if !self.buf.is_empty() {
+                    self.scratch.extend_from_slice(&self.buf);
+                    self.buf = Bytes::new();
+                }
+
+                self.refill().await?;
+                if self.eof && self.buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "aws-chunked: unexpected EOF while reading line",
+                    ));
+                }
+            }
+        }
+
+        fn parse_chunk_len_line(line: &[u8]) -> io::Result<usize> {
+            // Expected: "<hex>;chunk-signature=<hex>\r\n" (extensions ignored)
+            // Be tolerant: allow "<hex>\r\n".
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+            let hex_part = line.split(|&c| c == b';').next().unwrap_or(&[]);
+            if hex_part.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "aws-chunked: empty chunk size",
+                ));
+            }
+
+            let s = std::str::from_utf8(hex_part).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: non-utf8 size")
+            })?;
+
+            usize::from_str_radix(s, 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("aws-chunked: invalid hex chunk size: {s}"),
+                )
+            })
+        }
+
+        async fn consume_exact(&mut self, mut need: &[u8]) -> io::Result<()> {
+            while !need.is_empty() {
+                self.refill().await?;
+                if self.eof && self.buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "aws-chunked: unexpected EOF while consuming CRLF",
+                    ));
+                }
+
+                let take = need.len().min(self.buf.len());
+                if &self.buf[..take] != &need[..take] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aws-chunked: missing/invalid CRLF",
+                    ));
+                }
+
+                self.buf.advance(take);
+                need = &need[take..];
+            }
+            Ok(())
+        }
+
+        async fn read_trailers_until_blank(&mut self) -> io::Result<()> {
+            loop {
+                let line = self.read_line().await?;
+                if line == b"\n"[..] || line == b"\r\n"[..] {
+                    return Ok(());
+                }
+                // ignore trailer headers
+            }
+        }
+
+        /// Returns the next decoded payload chunk (may be a slice of an input frame).
+        /// Returns `Ok(None)` when the aws-chunked stream terminator/trailers are fully consumed.
+        pub async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
+            loop {
+                match self.state {
+                    State::Done => return Ok(None),
+
+                    State::NeedHeader => {
+                        let line = self.read_line().await?;
+                        let n = Self::parse_chunk_len_line(&line)?;
+                        if n == 0 {
+                            self.state = State::NeedTrailers;
+                        } else {
+                            self.remaining_in_chunk = n;
+                            self.state = State::NeedData;
+                        }
+                    }
+
+                    State::NeedData => {
+                        if self.remaining_in_chunk == 0 {
+                            self.state = State::NeedCrlf;
+                            continue;
+                        }
+
+                        self.refill().await?;
+                        if self.eof && self.buf.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "aws-chunked: unexpected EOF in chunk data",
+                            ));
+                        }
+
+                        let take = self.remaining_in_chunk.min(self.buf.len());
+                        let out = self.buf.split_to(take);
+                        self.remaining_in_chunk -= take;
+
+                        if !out.is_empty() {
+                            return Ok(Some(out));
+                        }
+                    }
+
+                    State::NeedCrlf => {
+                        self.consume_exact(b"\r\n").await?;
+                        self.state = State::NeedHeader;
+                    }
+
+                    State::NeedTrailers => {
+                        self.read_trailers_until_blank().await?;
+                        self.state = State::Done;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        /// Read exactly `dst.len()` decoded payload bytes into `dst`.
+        pub async fn read_exact_payload(&mut self, mut dst: &mut [u8]) -> io::Result<()> {
+            while !dst.is_empty() {
+                match self.next_payload().await? {
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "aws-chunked: decoded payload shorter than expected",
+                        ))
+                    }
+                    Some(mut b) => {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        let n = dst.len().min(b.len());
+                        dst[..n].copy_from_slice(&b[..n]);
+                        dst = &mut dst[n..];
+                        b.advance(n);
+
+                        // If we didn't consume the whole `b`, put the remainder back into `self.buf`
+                        // by prefixing it (rare; only if dst is smaller than produced slice).
+                        if !b.is_empty() {
+                            // Put remainder in front of existing buf with a tiny copy.
+                            // This is fine because it only happens when dst is smaller than
+                            // the chunk slice (i.e. direct-io chunk boundary).
+                            let mut v = Vec::with_capacity(b.len() + self.buf.len());
+                            v.extend_from_slice(&b);
+                            v.extend_from_slice(&self.buf);
+                            self.buf = Bytes::from(v);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Ensure the underlying stream is fully consumed (for HTTP/1.1 keep-alive correctness).
+        pub async fn drain_to_eof(mut self) -> io::Result<()> {
+            while let Some(item) = self.stream.next().await {
+                let _ = item?;
+            }
+            Ok(())
         }
     }
 }
@@ -576,31 +771,31 @@ pub async fn write_object_body_to_file(
     body: Incoming,
     path: PathBuf,
     logical_len: u64,          // decoded length if streaming, otherwise Content-Length
-    is_streaming_sigv4: bool,  // true if STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+    is_streaming_sigv4: bool,  // STREAMING-AWS4-HMAC-SHA256-PAYLOAD
     cfg: StreamCfg,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
 ) -> Result<()> {
-    // Convert hyper Incoming -> AsyncRead of Bytes (encoded body bytes)
-    let data_stream = body.into_data_stream().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("body read error: {e}"))
-    });
-    let reader = StreamReader::new(data_stream);
     let chunk = cfg.chunk_size;
     let inflight_cfg = cfg.inflight.max(1);
-    let direct = cfg.direct_io && logical_len > chunk as u64;
+    let a = ALIGN as u64;
+
+    // Decide direct I/O (must be aligned).
+    let mut direct = cfg.direct_io && logical_len > chunk as u64;
+    if direct && (chunk % ALIGN != 0) {
+        tracing::warn!(
+            chunk,
+            "direct_io enabled but chunk not aligned; disabling direct_io for this upload"
+        );
+        direct = false;
+    }
 
     // Ensure parent directories exist (S3 "folders" are implicit)
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
     }
-    let mut r = if is_streaming_sigv4 {
-        InReader::Aws(AwsChunkedReader::new(reader))
-    } else {
-        InReader::Plain(reader)
-    };
 
     // Open file (single fd for whole upload)
     let std_file = {
@@ -614,20 +809,24 @@ pub async fn write_object_body_to_file(
 
     let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
 
-    // Empty object: just ensure it exists/truncated (done by open), and (if direct) truncate explicitly.
+    // Preallocate (best-effort). For direct, allocate the aligned-on-disk size.
+    let prealloc_len = if direct {
+        align_up(logical_len, a)
+    } else {
+        logical_len
+    };
+    try_preallocate(&file, prealloc_len).await?;
+
+    // Empty object: done.
     if logical_len == 0 {
-        if direct {
-            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), 0) };
-            if rc != 0 {
-                return Err(anyhow!("ftruncate(0) failed: {}", std::io::Error::last_os_error()));
-            }
-        }
+        // Ensure size is exactly 0 even if fallocate extended it.
+        ftruncate_fd(file.as_raw_fd(), 0)?;
         return Ok(());
     }
 
-    // get required number of permits
-    let needed = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
-    let base = std::cmp::min(inflight_cfg, needed);
+    // Permits: base on logical chunks.
+    let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
+    let base = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let available = io_sem.available_permits();
     let mut allowed = per_file_permits(base, io_total.max(1), available);
     allowed = allowed.clamp(1, base);
@@ -639,9 +838,135 @@ pub async fn write_object_body_to_file(
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
 
-    let a = ALIGN as u64;
-    let mut off: u64 = 0;
+    // Hyper -> stream of Bytes frames (encoded body bytes).
+    let data_stream = body.into_data_stream().map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
+    });
 
+    // -------------------------
+    // Buffered (non-direct) path: write Bytes frames without copying using BytesBuf
+    // -------------------------
+    if !direct {
+        enum Src<S> {
+            Plain(PlainFrameReader<S>),
+            Aws(aws_chunked::Decoder<S>),
+        }
+
+        impl<S> Src<S>
+        where
+            S: Stream<Item = io::Result<Bytes>> + Unpin,
+        {
+            async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
+                match self {
+                    Src::Plain(p) => p.next_bytes().await,
+                    Src::Aws(d) => d.next_payload().await,
+                }
+            }
+
+            async fn ensure_done(self) -> io::Result<()> {
+                match self {
+                    Src::Plain(p) => p.ensure_eof().await,
+                    Src::Aws(d) => d.drain_to_eof().await,
+                }
+            }
+        }
+
+        let mut src = if is_streaming_sigv4 {
+            Src::Aws(aws_chunked::Decoder::new(data_stream))
+        } else {
+            Src::Plain(PlainFrameReader::new(data_stream))
+        };
+
+        let mut written: u64 = 0;
+        let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+
+        while written < logical_len {
+            while futs.len() >= allowed {
+                let Some(done) = futs.next().await else { break };
+                done?;
+            }
+
+            let Some(mut b) = src.next_payload().await? else {
+                return Err(anyhow!(
+                    "upload body ended early: got {} bytes, expected {}",
+                    written,
+                    logical_len
+                ));
+            };
+
+            if b.is_empty() {
+                continue;
+            }
+
+            let remaining = (logical_len - written) as usize;
+            if b.len() > remaining {
+                return Err(anyhow!(
+                    "upload body longer than expected: next chunk={}, remaining={}",
+                    b.len(),
+                    remaining
+                ));
+            }
+
+            let off = written;
+            written += b.len() as u64;
+
+            let file2 = file.clone();
+            futs.push(async move {
+                // Ensure full write.
+                let (res, _buf) = file2.write_all_at(BytesBuf(b), off).await;
+                res.map_err(|e| anyhow!("write_all_at failed at off={off}: {e}"))?;
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+
+        while let Some(done) = futs.next().await {
+            done?;
+        }
+
+        // Make sure there is no extra payload (and drain framing / EOF).
+        // - Plain: enforce EOF (no extra bytes beyond Content-Length).
+        // - Aws: drain the remainder of the encoded stream (safe keep-alive).
+        src.ensure_done().await.map_err(|e| anyhow!("{e}"))?;
+
+        // Ensure final file size is exactly logical_len (fallocate may have extended it).
+        ftruncate_fd(file.as_raw_fd(), logical_len)?;
+        return Ok(());
+    }
+
+    // -------------------------
+    // Direct I/O path: read into aligned pooled buffers and pad last write.
+    // -------------------------
+    enum DirectSrc<S> {
+        Plain(PlainFrameReader<S>),
+        Aws(aws_chunked::Decoder<S>),
+    }
+
+    impl<S> DirectSrc<S>
+    where
+        S: Stream<Item = io::Result<Bytes>> + Unpin,
+    {
+        async fn read_exact_payload(&mut self, dst: &mut [u8]) -> io::Result<()> {
+            match self {
+                DirectSrc::Plain(p) => p.read_exact_payload(dst).await,
+                DirectSrc::Aws(d) => d.read_exact_payload(dst).await,
+            }
+        }
+
+        async fn drain(self) -> io::Result<()> {
+            match self {
+                DirectSrc::Plain(p) => p.ensure_eof().await,
+                DirectSrc::Aws(d) => d.drain_to_eof().await,
+            }
+        }
+    }
+
+    let mut src = if is_streaming_sigv4 {
+        DirectSrc::Aws(aws_chunked::Decoder::new(data_stream))
+    } else {
+        DirectSrc::Plain(PlainFrameReader::new(data_stream))
+    };
+
+    let mut off: u64 = 0;
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
 
     while off < logical_len {
@@ -654,21 +979,18 @@ pub async fn write_object_body_to_file(
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        let write_len = if direct {
-            // last chunk may be smaller; we still must write an aligned length
-            align_up(real_len as u64, a) as usize
-        } else {
-            real_len
-        };
+        let write_len = align_up(real_len as u64, a) as usize;
 
         let buf = pool.take();
         let mut pooled = PooledBuf::new(pool.clone(), buf);
 
-        // Read *payload* bytes (decoded if streaming)
-        r.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len]).await?;
+        // Read decoded payload bytes.
+        src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
+            .await
+            .map_err(|e| anyhow!("read payload failed: {e}"))?;
 
-        // pad tail for direct alignment
-        if direct && write_len > real_len {
+        // Pad tail to aligned write size.
+        if write_len > real_len {
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
@@ -677,8 +999,8 @@ pub async fn write_object_body_to_file(
         let off2 = off;
 
         futs.push(async move {
-            let (res, _slice) = file2.write_at(slice, off2).submit().await;
-            res.map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
+            let (res, _slice) = file2.write_all_at(slice, off2).await;
+            res.map_err(|e| anyhow!("write_all_at failed at off={off2}: {e}"))?;
             Ok::<(), anyhow::Error>(())
         });
 
@@ -689,20 +1011,10 @@ pub async fn write_object_body_to_file(
         done?;
     }
 
-    // Consume aws-chunked terminator/trailers so the connection state is clean
-    r.finish().await?;
+    // Drain any remaining encoded bytes (e.g. aws-chunked terminator/trailers).
+    src.drain().await.map_err(|e| anyhow!("{e}"))?;
 
-    // If direct I/O forced padding, truncate to logical length (decoded length for streaming)
-    if direct {
-        let rc = unsafe { libc::ftruncate(file.as_raw_fd(), logical_len as i64) };
-        if rc != 0 {
-            return Err(anyhow!(
-                "ftruncate({}) failed: {}",
-                logical_len,
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-
+    // Truncate away the padded tail.
+    ftruncate_fd(file.as_raw_fd(), logical_len)?;
     Ok(())
 }

@@ -1,6 +1,7 @@
 use aligned_buffer::UniqueAlignedBuffer;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
+use bytes::Bytes;
 
 /// Fixed alignment for now (good default for O_DIRECT)
 pub const ALIGN: usize = 4096;
@@ -117,4 +118,26 @@ where
         &*self.0
     }
 }
+
+
+#[derive(Clone, Debug)]
+pub struct BytesBuf(pub Bytes);
+
+// We implement IoBuf ourselves so we do NOT rely on tokio-uring's optional `bytes` feature,
+// which causes naming clashes with the slice function.
+unsafe impl tokio_uring::buf::IoBuf for BytesBuf {
+    #[inline]
+    fn stable_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+    #[inline]
+    fn bytes_init(&self) -> usize {
+        self.0.len()
+    }
+    #[inline]
+    fn bytes_total(&self) -> usize {
+        self.0.len()
+    }
+}
+
 
