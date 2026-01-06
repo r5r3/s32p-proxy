@@ -14,7 +14,6 @@ use pingora::upstreams::peer::{HttpPeer, PeerOptions};
 use pingora::listeners::tls::TlsSettings;
 use rustls::crypto::{aws_lc_rs, CryptoProvider};
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use std::fs;
@@ -24,7 +23,7 @@ mod worker_manager;
 mod config;
 
 use s3pm_directory::Directory;
-use s3pm_directory::{UserDoc, BucketView};
+use s3pm_directory::UserDoc;
 use s3pm_directory::yaml::YamlDirectory;
 use s3pm_directory::openbao::OpenBaoDirectory;
 
@@ -88,7 +87,7 @@ impl ProxyHttp for S3ProxyApp {
         // Determine route action from config.
         // If routing for the specific class is not configured,
         // fall back to the "other" route.
-        let (selected_key, action) = match self.routing.class_map.get(key) {
+        let (_selected_key, action) = match self.routing.class_map.get(key) {
             Some(a) => (key, a),
             None => match self.routing.class_map.get("other") {
                 Some(a) => {
@@ -275,7 +274,7 @@ impl ProxyHttp for S3ProxyApp {
             }
             WorkerEndpoint::Uds(path) => {
                 // HttpPeer::new_uds returns Result<...> so map it into Pingora's error type.
-                let mut peer = HttpPeer::new_uds(path.to_string_lossy().as_ref(), false, "localhost".to_string())
+                let peer = HttpPeer::new_uds(path.to_string_lossy().as_ref(), false, "localhost".to_string())
                     .map_err(|e| Error::explain(ErrorType::InternalError, format!("new_uds failed: {e}")))?;
 
                 // TCP-only socket options don't apply to UDS; leave options default.

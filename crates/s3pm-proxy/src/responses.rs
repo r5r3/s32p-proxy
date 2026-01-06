@@ -1,10 +1,6 @@
-use bytes::Bytes;
-use http::header::CONTENT_LENGTH;
-use http::Response as HttpResponse;
 use http_body_util::BodyExt;
 use pingora::http::{ResponseHeader, StatusCode};
 use pingora::proxy::Session;
-use std::convert::Infallible;
 
 use s3pm_support::s3resp;
 
@@ -92,17 +88,3 @@ pub async fn respond_list_buckets(
     // GET / has no request body; safe to keepalive
     respond_hyper(session, resp, /* close = */ false).await
 }
-
-/// Convenience: GetBucketLocation success (200).
-pub async fn respond_get_bucket_location(
-    session: &mut Session,
-    region: &str,
-    _resource: Option<&str>,
-    _request_id: Option<&str>,
-) -> pingora::Result<()> {
-    let resp = s3resp::get_bucket_location(region);
-
-    // GET has no request body; safe to keepalive
-    respond_hyper(session, resp, /* close = */ false).await
-}
-

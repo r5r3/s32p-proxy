@@ -15,14 +15,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    net::TcpStream,
     process::{Child, Command},
     sync::{Mutex, Notify},
     time,
 };
 use tempfile::TempDir;
 
-use crate::config::{WorkerProfile, WorkersConfig, ServerConfig};
+use crate::config::{WorkersConfig, ServerConfig};
 use s3pm_directory::{UserDoc, BucketView};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]

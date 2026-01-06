@@ -257,7 +257,7 @@ impl Config {
             return Err(anyhow!("workers.profiles must contain at least one profile"));
         }
 
-        for (name, profile) in &self.workers.profiles {
+        for (_name, profile) in &self.workers.profiles {
             match profile.upstream.kind {
                 UpstreamKind::Tcp => {}
                 UpstreamKind::Uds => {

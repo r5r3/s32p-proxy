@@ -11,12 +11,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, BytesBuf, ALIGN};
-use tokio::io::{self, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
-use tokio_util::io::StreamReader;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -338,7 +337,7 @@ async fn stream_segment(
     let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
 
     // Compute submission length at offset.
-    let mut submit_len = |off: u64| -> usize {
+    let submit_len = |off: u64| -> usize {
         let remain = effective_end.saturating_sub(off);
         let mut len = std::cmp::min(chunk_size as u64, remain) as usize;
 
@@ -569,7 +568,7 @@ pub mod aws_chunked {
             loop {
                 // Search in current buffer for '\n'
                 if let Some(pos) = self.buf.iter().position(|&c| c == b'\n') {
-                    let mut line = self.buf.split_to(pos + 1);
+                    let line = self.buf.split_to(pos + 1);
 
                     // If scratch is empty, return line directly.
                     if self.scratch.is_empty() {
@@ -886,7 +885,7 @@ pub async fn write_object_body_to_file(
                 done?;
             }
 
-            let Some(mut b) = src.next_payload().await? else {
+            let Some(b) = src.next_payload().await? else {
                 return Err(anyhow!(
                     "upload body ended early: got {} bytes, expected {}",
                     written,
