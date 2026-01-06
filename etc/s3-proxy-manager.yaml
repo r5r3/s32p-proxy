@@ -3,6 +3,8 @@ version: 1
 server:
   listen: "0.0.0.0:9000"
   public_scheme: "http"
+  tls_cert_path: "etc/fullchain.pem"
+  tls_key_path: "etc/privkey.pem"
   region: "us-east-1"
   log: "info"
 
@@ -37,6 +39,7 @@ workers:
         - "{{bind_addr}}"
         - "posix"
         - "--bucketlinks"
+        - "--nometa"
         - "{{posix_root}}"
       env:
         ROOT_ACCESS_KEY: "{{access_key}}"
@@ -68,6 +71,9 @@ routing:
       action: "not_implemented"
       message: "versioning is not implemented"
     read:
+      action: "proxy"
+      worker_profile: "s3pm-gateway"
+    write:
       action: "proxy"
       worker_profile: "s3pm-gateway"
     other:

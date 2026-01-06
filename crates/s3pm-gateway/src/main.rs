@@ -15,6 +15,7 @@ use http_body_util::{BodyExt, Full};
 use httpdate::fmt_http_date;
 use hyper::body::Incoming;
 use hyper::header::LAST_MODIFIED;
+use hyper::HeaderMap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -35,7 +36,7 @@ use tokio_uring::buf::BoundedBuf;
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::streaming::{
     parse_range_header, stream_range_body, write_object_body_to_file,
-    ByteRange, StreamCfg, WriteCfg,
+    ByteRange, StreamCfg,
 };
 use s3pm_support;
 
@@ -1156,6 +1157,41 @@ async fn handle_list_objects_v2(
 // PutObject and other write operations
 // -------------------------
 
+fn header_eq(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == expected)
+        .unwrap_or(false)
+}
+
+fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
+    let v = headers
+        .get(name)
+        .ok_or_else(|| anyhow!("missing header {name}"))?
+        .to_str()
+        .map_err(|_| anyhow!("invalid utf8 in header {name}"))?;
+    v.parse::<u64>()
+        .map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
+}
+
+/// Returns (is_streaming_sigv4, logical_len)
+fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64)> {
+    let is_streaming = header_eq(
+        headers,
+        "x-amz-content-sha256",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    );
+
+    let logical_len = if is_streaming {
+        parse_u64_header(headers, "x-amz-decoded-content-length")?
+    } else {
+        parse_u64_header(headers, "content-length")?
+    };
+
+    Ok((is_streaming, logical_len))
+}
+
 async fn handle_put_object(
     req: Request<Incoming>,
     app: Arc<App>,
@@ -1198,40 +1234,40 @@ async fn handle_put_object(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
     };
 
-    // Require Content-Length so we can schedule parallel chunk writes with offsets.
-    let content_len = match req.headers().get(http::header::CONTENT_LENGTH) {
-        Some(v) => match v.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
-            Some(n) => n,
-            None => {
-                return s3pm_support::s3resp::s3_error(
-                    StatusCode::BAD_REQUEST,
-                    s3pm_support::s3xml::error_code::INVALID_REQUEST,
-                    "invalid Content-Length",
-                    Some(req.uri().path()),
-                    None,
-                );
-            }
-        },
-        None => {
+    // pick decoded length for streaming payloads
+    let (is_streaming_sigv4, logical_len) = match compute_logical_len(req.headers()) {
+        Ok(v) => v,
+        Err(e) => {
             return s3pm_support::s3resp::s3_error(
                 StatusCode::BAD_REQUEST,
                 s3pm_support::s3xml::error_code::INVALID_REQUEST,
-                "missing Content-Length (chunked uploads not implemented)",
+                &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            );
+            )
         }
     };
 
-    // Move body out
+    // Still require Content-Length at HTTP layer
+    if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing Content-Length",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
     let (parts, body) = req.into_parts();
 
     // Stream-write
     if let Err(e) = write_object_body_to_file(
         body,
         obj_path.clone(),
-        content_len,
-        WriteCfg {
+        logical_len,
+        is_streaming_sigv4,
+        StreamCfg {
             chunk_size: cfg.chunk_size,
             inflight: cfg.inflight,
             direct_io: cfg.direct_io,
@@ -1245,14 +1281,13 @@ async fn handle_put_object(
         return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
     }
 
-    // Build ETag (consistent with your reads: inode-based ETag)
+    // Build ETag (consistent with reads: inode-based ETag)
     let meta = match std::fs::metadata(&obj_path) {
         Ok(m) => m,
         Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
     };
 
     let etag = format!("\"{}\"", meta.ino());
-
     s3pm_support::s3resp::put_object_ok(&etag)
 }
 
