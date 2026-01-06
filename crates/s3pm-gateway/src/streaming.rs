@@ -1,18 +1,18 @@
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
-use futures_util::stream::{FuturesOrdered, StreamExt};
-use http_body_util::StreamBody;
-use hyper::body::{Body, Frame};
+use bytes::{Bytes, Buf};
+use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
+use http_body_util::{StreamBody, BodyExt};
+use hyper::body::{Body, Incoming, Frame};
 use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
-
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
 
 #[derive(Debug, Clone, Copy)]
@@ -390,6 +390,297 @@ async fn stream_segment(
             let off = next_off;
             futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
             next_off = next_off.saturating_add(len as u64);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct WriteCfg {
+    pub chunk_size: usize,
+    pub inflight: usize,
+    pub direct_io: bool,
+}
+
+struct IncomingReader {
+    body: Incoming,
+    cur: Bytes,
+    seen: u64,
+}
+
+impl IncomingReader {
+    fn new(body: Incoming) -> Self {
+        Self {
+            body,
+            cur: Bytes::new(),
+            seen: 0,
+        }
+    }
+
+    async fn next_data(&mut self) -> Result<Option<Bytes>> {
+        loop {
+            let frame = match self.body.frame().await {
+                Some(Ok(frame)) => frame,
+                Some(Err(e)) => return Err(anyhow!("body read error: {e}")),
+                None => return Ok(None), // end of stream
+            };
+
+            match frame.into_data() {
+                Ok(b) => {
+                    if !b.is_empty() {
+                        return Ok(Some(b));
+                    }
+                    continue;
+                }
+                Err(_non_data) => {
+                    // trailers etc - ignore
+                    continue;
+                }
+            }
+        }
+    }
+
+    async fn read_exact_into(&mut self, dst: &mut [u8]) -> Result<()> {
+        let mut off = 0usize;
+
+        while off < dst.len() {
+            if self.cur.is_empty() {
+                let Some(next) = self.next_data().await? else {
+                    return Err(anyhow!(
+                        "unexpected EOF in request body (needed {}, got {})",
+                        dst.len(),
+                        off
+                    ));
+                };
+                self.cur = next;
+            }
+
+            let take = std::cmp::min(dst.len() - off, self.cur.len());
+            dst[off..off + take].copy_from_slice(&self.cur[..take]);
+            self.cur.advance(take);
+            off += take;
+            self.seen += take as u64;
+        }
+
+        Ok(())
+    }
+}
+
+// local helpers (same semantics as the read-side)
+fn per_file_permits_write(base: usize, io_total: usize, io_available: usize) -> usize {
+    if base <= 1 || io_total <= 1 {
+        return base.max(1);
+    }
+
+    let io_out = io_total.saturating_sub(io_available);
+
+    if io_out > io_total / 2 {
+        let avail = io_available.max(1) as u64;
+        let total = io_total as u64;
+        let scaled = ((base as u64) * (2 * avail) + (total - 1)) / total;
+        scaled as usize
+    } else {
+        base
+    }
+}
+
+/// Stream-write an object body to `path`.
+///
+/// Requirements / behavior:
+/// - Supports parallel in-flight chunk writes (same file) up to `cfg.inflight` (scaled by global permits).
+/// - If `content_len <= chunk_size`, writes in one step.
+/// - If direct_io is enabled:
+///   - requires `chunk_size % ALIGN == 0`
+///   - pads the last chunk with zeros to an aligned write size
+///   - truncates to the real size at the end
+pub async fn write_object_body_to_file(
+    body: Incoming,
+    path: PathBuf,
+    content_len: u64,
+    cfg: WriteCfg,
+    pool: Arc<BufPool>,
+    io_sem: Arc<Semaphore>,
+    io_total: usize,
+) -> Result<()> {
+    let chunk = cfg.chunk_size.max(1);
+    let inflight_cfg = cfg.inflight.max(1);
+
+    // direct-io eligibility
+    let mut direct = cfg.direct_io;
+    if direct && (chunk % ALIGN != 0) {
+        tracing::warn!(
+            chunk,
+            "direct_io enabled but chunk not aligned; disabling direct_io for this request"
+        );
+        direct = false;
+    }
+
+    // Ensure parent directories exist (S3 "folders" are implicit)
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
+    }
+
+    // Open file (single fd for whole upload)
+    let std_file = {
+        let mut oo = OpenOptions::new();
+        oo.write(true).create(true).truncate(true);
+        if direct {
+            oo.custom_flags(O_DIRECT);
+        }
+        oo.open(&path).map_err(|e| anyhow!("open {}: {e}", path.display()))?
+    };
+
+    let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
+
+    // Empty object: just ensure it exists/truncated (done by open), and (if direct) truncate explicitly.
+    if content_len == 0 {
+        if direct {
+            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), 0) };
+            if rc != 0 {
+                return Err(anyhow!("ftruncate(0) failed: {}", std::io::Error::last_os_error()));
+            }
+        }
+        return Ok(());
+    }
+
+    // Small fast-path: <= one chunk => fill one buffer, one write, optional pad+truncate.
+    if (content_len as usize) <= chunk {
+        let mut r = IncomingReader::new(body);
+
+        let buf = pool.take();
+        let mut pooled = PooledBuf::new(pool.clone(), buf);
+
+        let real_len = content_len as usize;
+        r.read_exact_into(&mut pooled.as_mut_bytes()[..real_len]).await?;
+
+        // If body had extra bytes (shouldn't), treat as error (helps catch mismatched Content-Length).
+        // We'll attempt to read one more non-empty data frame.
+        if let Ok(Some(extra)) = r.next_data().await {
+            if !extra.is_empty() {
+                return Err(anyhow!("request body larger than Content-Length"));
+            }
+        }
+
+        let a = ALIGN as u64;
+        let write_len = if direct {
+            align_up(real_len as u64, a) as usize
+        } else {
+            real_len
+        };
+
+        // pad zeros for direct alignment
+        if direct && write_len > real_len {
+            pooled.as_mut_bytes()[real_len..write_len].fill(0);
+        }
+
+        // Acquire 1 permit for this request
+        let _permit = io_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("io permit semaphore closed"))?;
+
+        let slice = pooled.slice(..write_len);
+        let (res, _slice) = file.write_at(slice, 0).submit().await;
+        res.map_err(|e| anyhow!("write_at failed: {e}"))?;
+
+        if direct {
+            let rc = unsafe { libc::ftruncate(file.as_raw_fd(), content_len as i64) };
+            if rc != 0 {
+                return Err(anyhow!(
+                    "ftruncate({}) failed: {}",
+                    content_len,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Multi-chunk path: schedule writes at fixed offsets with N inflight operations.
+    let needed = ((content_len + chunk as u64 - 1) / chunk as u64) as usize;
+    let base = std::cmp::min(inflight_cfg, needed);
+
+    let available = io_sem.available_permits();
+    let mut allowed = per_file_permits_write(base, io_total.max(1), available);
+    allowed = allowed.clamp(1, base);
+
+    // Hold permits for the whole upload (matches read-side idea)
+    let _permits = io_sem
+        .clone()
+        .acquire_many_owned(allowed as u32)
+        .await
+        .map_err(|_| anyhow!("io permit semaphore closed"))?;
+
+    let mut r = IncomingReader::new(body);
+    let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+
+    let a = ALIGN as u64;
+
+    let mut off: u64 = 0;
+    while off < content_len {
+        // throttle to `allowed`
+        while futs.len() >= allowed {
+            let Some(done) = futs.next().await else { break };
+            done?;
+        }
+
+        let remaining = (content_len - off) as usize;
+        let real_len = std::cmp::min(chunk, remaining);
+
+        let write_len = if direct {
+            // last chunk may be smaller; we still must write an aligned length
+            align_up(real_len as u64, a) as usize
+        } else {
+            real_len
+        };
+
+        let buf = pool.take();
+        let mut pooled = PooledBuf::new(pool.clone(), buf);
+
+        // fill payload bytes
+        r.read_exact_into(&mut pooled.as_mut_bytes()[..real_len]).await?;
+
+        // pad tail for direct alignment
+        if direct && write_len > real_len {
+            pooled.as_mut_bytes()[real_len..write_len].fill(0);
+        }
+
+        let slice = pooled.slice(..write_len);
+        let file2 = file.clone();
+        let off2 = off;
+
+        futs.push(async move {
+            let (res, _slice) = file2.write_at(slice, off2).submit().await;
+            res.map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        off += real_len as u64;
+    }
+
+    // Ensure no trailing data beyond Content-Length
+    if let Ok(Some(extra)) = r.next_data().await {
+        if !extra.is_empty() {
+            return Err(anyhow!("request body larger than Content-Length"));
+        }
+    }
+
+    while let Some(done) = futs.next().await {
+        done?;
+    }
+
+    if direct {
+        let rc = unsafe { libc::ftruncate(file.as_raw_fd(), content_len as i64) };
+        if rc != 0 {
+            return Err(anyhow!(
+                "ftruncate({}) failed: {}",
+                content_len,
+                std::io::Error::last_os_error()
+            ));
         }
     }
 

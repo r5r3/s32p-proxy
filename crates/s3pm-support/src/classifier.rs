@@ -23,6 +23,8 @@ pub enum S3Op {
     Versioning(VersioningOp),
     /// Basic read operations (we’ll add more here later).
     Read(ReadOp),
+    /// Basic write operations.
+    Write(WriteOp),
     /// Anything else (for now).
     Other,
 }
@@ -82,6 +84,12 @@ pub enum ReadOp {
     ListObjectsV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// PUT /{bucket}/{key} (no query params)
+    PutObject,
+}
+
 /// Parsed query params with lowercased keys.
 /// Values are percent-decoded (via url::form_urlencoded), which is correct for routing.
 /// Presence-only parameters are stored as empty string value (e.g. "?uploads" -> ("uploads","")).
@@ -137,6 +145,7 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
         S3Op::Multipart(_) => "multipart",
         S3Op::Versioning(_) => "versioning",
         S3Op::Read(_) => "read", // grouped "basic read" ops (GetObject, GetBucketLocation, ...)
+        S3Op::Write(_) => "write",
         S3Op::Other => "other",
     }
 }
@@ -221,6 +230,16 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
         };
     }
 
+    // PutObject: PUT /{bucket}/{key} with *no* query params
+    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Write(WriteOp::PutObject),
+        };
+    }
+
     S3RequestClass {
         bucket,
         key,
@@ -236,6 +255,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
         S3Op::Multipart(_) => Some("multipart uploads are not implemented"),
         S3Op::Versioning(_) => Some("versioning is not implemented"),
         S3Op::Read(_) => None, // handled by routing/gateway
+        S3Op::Write(_) => None,
         S3Op::Other => None,
     }
 }

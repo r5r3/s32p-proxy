@@ -33,8 +33,10 @@ use tokio::sync::Semaphore;
 use tokio_uring::buf::BoundedBuf;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
-use crate::streaming::{parse_range_header, stream_range_body, ByteRange, StreamCfg};
-
+use crate::streaming::{
+    parse_range_header, stream_range_body, write_object_body_to_file,
+    ByteRange, StreamCfg, WriteCfg,
+};
 use s3pm_support;
 
 // Hyper response type we use everywhere in this binary.
@@ -291,6 +293,10 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::ListObjectsV2) => {
             handle_list_objects_v2(req, app, &class).await
+        }
+
+        s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::PutObject) => {
+            handle_put_object(req, app, &class).await
         }
 
         s3pm_support::classifier::S3Op::Multipart(_) => handle_multipart(req, app, &class).await,
@@ -1144,6 +1150,110 @@ async fn handle_list_objects_v2(
         &contents,
         &common_prefixes,
     )
+}
+
+// -------------------------
+// PutObject and other write operations
+// -------------------------
+
+async fn handle_put_object(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Reject query params for PutObject for now (presigned etc.)
+    if req.uri().query().is_some() {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    // SigV4: parse + verify (every request)
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+
+    if bucket.is_empty() || key.is_empty() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // S3 semantics: if bucket doesn't exist => NoSuchBucket
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    // Require Content-Length so we can schedule parallel chunk writes with offsets.
+    let content_len = match req.headers().get(http::header::CONTENT_LENGTH) {
+        Some(v) => match v.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => n,
+            None => {
+                return s3pm_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                    "invalid Content-Length",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+        None => {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                "missing Content-Length (chunked uploads not implemented)",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    // Move body out
+    let (parts, body) = req.into_parts();
+
+    // Stream-write
+    if let Err(e) = write_object_body_to_file(
+        body,
+        obj_path.clone(),
+        content_len,
+        WriteCfg {
+            chunk_size: cfg.chunk_size,
+            inflight: cfg.inflight,
+            direct_io: cfg.direct_io,
+        },
+        app.pool.clone(),
+        app.io_sem.clone(),
+        app.io_total,
+    )
+    .await
+    {
+        return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+    }
+
+    // Build ETag (consistent with your reads: inode-based ETag)
+    let meta = match std::fs::metadata(&obj_path) {
+        Ok(m) => m,
+        Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+    };
+
+    let etag = format!("\"{}\"", meta.ino());
+
+    s3pm_support::s3resp::put_object_ok(&etag)
 }
 
 // ---- main ----

@@ -316,3 +316,15 @@ pub fn list_objects_v2(
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
+/// Convenience: PutObject success (200, empty body).
+/// We return an ETag and keep the "server" header consistent with gateway responses.
+pub fn put_object_ok(etag: &str) -> HttpResponse {
+    // Empty body, but still include Content-Length and Content-Type (many clients are picky).
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", Vec::new(), [
+        ("etag", etag.to_string()),
+    ]);
+
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+

@@ -62,6 +62,18 @@ impl PooledBuf {
             buf: Some(buf),
         }
     }
+
+    /// Mutable access to the underlying initialized bytes (always len == chunk_size).
+    #[inline]
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        self.buf.as_mut().unwrap().as_mut()
+    }
+
+    /// Read-only access (sometimes useful for debugging).
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buf.as_ref().unwrap().as_ref()
+    }
 }
 
 impl Drop for PooledBuf {
