@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use base64::write;
 use bytes::{Bytes, Buf};
 use futures_util::Stream;
 use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
@@ -8,7 +7,7 @@ use hyper::body::{Body, Incoming, Frame};
 use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, FileExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,8 +15,8 @@ use tokio::io;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_uring::buf::BoundedBuf;
-use crate::buffer::{BufPool, PooledBuf, SliceOwner, BytesBuf, ALIGN};
+
+use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -32,9 +31,7 @@ pub struct StreamCfg {
     pub direct_io: bool,
 }
 
-fn align_down(x: u64, a: u64) -> u64 {
-    (x / a) * a
-}
+fn align_down(x: u64, a: u64) -> u64 { (x / a) * a }
 fn align_up(x: u64, a: u64) -> u64 {
     let y = x.saturating_add(a - 1);
     (y / a) * a
@@ -83,13 +80,10 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
         return Err(anyhow!("Range end < start"));
     }
 
-    Ok(Some(ByteRange {
-        start,
-        end_excl: end_incl + 1,
-    }))
+    Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
 }
 
-/// Stream a range from file as a Hyper body (using tokio-uring reader task).
+/// Stream a range from file as a Hyper body (Tokio runtime + spawn_blocking pread).
 pub async fn stream_range_body(
     path: PathBuf,
     file_size: u64,
@@ -99,11 +93,10 @@ pub async fn stream_range_body(
     io_sem: Arc<Semaphore>,
     io_total: usize,
 ) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight * 2);
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight.max(1) * 2);
 
-    tokio_uring::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg, pool, io_sem, io_total, tx).await
-        {
+    tokio::spawn(async move {
+        if let Err(e) = stream_range_task(path, file_size, want, cfg, pool, io_sem, io_total, tx).await {
             tracing::warn!(error = %e, "stream task failed");
         }
     });
@@ -115,33 +108,21 @@ fn effective_end_for_scheduling(
     file_size: u64,
     seg_start: u64,
     seg_end: u64,
-    chunk_size: usize,
+    _chunk_size: usize,
     direct: bool,
 ) -> u64 {
     if !direct {
         return seg_end;
     }
 
-    // In direct mode, seg_end may extend past EOF (aligned-up). We must not schedule reads
-    // that start at/after EOF (off >= file_size), because they'd return 0 and would stop
-    // the pipeline too early. So cap at "one block past the last valid aligned start".
     let a = ALIGN as u64;
     if file_size == 0 {
         return seg_start;
     }
 
-    // work_end is aligned and >= file_size; reads starting < work_end are safe,
-    // but we must ensure the *start offset* is < file_size.
     let work_end = align_down(file_size.saturating_sub(1), a) + a;
-
-    // Also ensure we don't run backwards.
     let capped = std::cmp::min(seg_end, work_end);
-    // chunk_size is assumed aligned when direct; caller enforces.
-    if capped < seg_start {
-        seg_start
-    } else {
-        capped
-    }
+    if capped < seg_start { seg_start } else { capped }
 }
 
 fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
@@ -160,10 +141,7 @@ fn per_file_permits(base: usize, io_total: usize, io_available: usize) -> usize 
 
     let io_out = io_total.saturating_sub(io_available);
 
-    // If more than half are out, scale down proportionally to remaining permits.
     if io_out > io_total / 2 {
-        // scale factor = 2*available/total in (0,1)
-        // allowed = ceil(base * 2*available/total)
         let avail = io_available.max(1) as u64;
         let total = io_total as u64;
         let scaled = ((base as u64) * (2 * avail) + (total - 1)) / total;
@@ -188,19 +166,12 @@ async fn stream_range_task(
 
     let a = ALIGN as u64;
 
-    // Use O_DIRECT for the entire request if enabled and chunk_size is aligned.
     let mut direct = cfg.direct_io;
     if direct && (chunk % ALIGN != 0) {
-        tracing::warn!(
-            chunk,
-            "direct_io enabled but chunk not aligned; disabling direct_io for this request"
-        );
+        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this request");
         direct = false;
     }
 
-    // Choose the segment to read:
-    // - direct: expand to alignment boundaries (may extend past EOF); slice later
-    // - buffered: exact request range
     let (seg_start, seg_end) = if direct {
         (align_down(want.start, a), align_up(want.end_excl, a))
     } else {
@@ -211,34 +182,25 @@ async fn stream_range_task(
         return Ok(());
     }
 
-    // Compute how many chunks are actually needed (taking file size into account).
     let eff_end = effective_end_for_scheduling(file_size, seg_start, seg_end, chunk, direct);
     let needed = chunks_needed(seg_start, eff_end, chunk);
-
     if needed == 0 {
         return Ok(());
     }
 
-    // Base per-file concurrency = min(cfg.inflight, needed)
     let base = std::cmp::min(inflight_cfg, needed);
-
-    // Dynamic per-file cap based on global usage snapshot.
     let available = io_sem.available_permits();
     let mut allowed = per_file_permits(base, io_total.max(1), available);
-
-    // Never exceed what we actually need.
     allowed = allowed.clamp(1, base);
 
-    // Acquire permits ONCE per file/request and hold until streaming completes.
     let _permits = io_sem
         .clone()
         .acquire_many_owned(allowed as u32)
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
 
-    // Open exactly one fd for the whole request (direct OR buffered).
     let std_file = open_std_file(&path, direct)?;
-    let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
+    let file = Arc::new(std_file);
 
     stream_segment(
         file,
@@ -248,7 +210,7 @@ async fn stream_range_task(
         want.start,
         want.end_excl,
         chunk,
-        allowed, // per-file permitted inflight
+        allowed,
         direct,
         pool,
         &mut out,
@@ -268,23 +230,30 @@ fn open_std_file(path: &Path, direct: bool) -> Result<std::fs::File> {
 }
 
 async fn read_one(
-    file: Arc<tokio_uring::fs::File>,
-    slice: tokio_uring::buf::Slice<PooledBuf>,
+    file: Arc<std::fs::File>,
+    pooled: PooledBuf,
     off: u64,
+    len: usize,
     want_start: u64,
     want_end: u64,
 ) -> Result<Option<Bytes>> {
-    let (res, slice) = file.read_at(slice, off).await;
-    let n = res.map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
+    let (n, pooled) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, PooledBuf)> {
+        let mut pooled = pooled;
+        let dst = &mut pooled.as_mut_bytes()[..len];
+        let n = file
+            .read_at(dst, off)
+            .map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
+        Ok((n, pooled))
+    })
+    .await
+    .map_err(|e| anyhow!("read task join error: {e}"))??;
+
     if n == 0 {
-        // EOF
         return Ok(None);
     }
 
-    let mut bytes = Bytes::from_owner(SliceOwner(slice));
-    bytes = bytes.slice(0..n);
+    let mut bytes = Bytes::from_owner(SliceOwner::new(pooled, 0, n));
 
-    // Slice down to the requested [want_start, want_end) within this read window.
     let chunk_start = std::cmp::max(want_start, off);
     let chunk_end = std::cmp::min(want_end, off + n as u64);
 
@@ -294,28 +263,26 @@ async fn read_one(
 
     let i0 = (chunk_start - off) as usize;
     let i1 = (chunk_end - off) as usize;
-    Ok(Some(bytes.slice(i0..i1)))
+    bytes = bytes.slice(i0..i1);
+    Ok(Some(bytes))
 }
 
 async fn stream_segment(
-    file: Arc<tokio_uring::fs::File>,
+    file: Arc<std::fs::File>,
     file_size: u64,
     seg_start: u64,
     seg_end: u64,
     want_start: u64,
     want_end: u64,
     chunk_size: usize,
-    inflight: usize, // already capped by per-file permits
+    inflight: usize,
     direct: bool,
     pool: Arc<BufPool>,
     out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
     let a = ALIGN as u64;
-
     let mut next_off = seg_start;
 
-    // For direct mode, avoid scheduling reads that start at/after EOF.
-    // We cap the scheduling window similarly to effective_end_for_scheduling().
     let effective_end = if direct {
         if file_size == 0 {
             seg_start
@@ -331,20 +298,16 @@ async fn stream_segment(
         return Ok(());
     }
 
-    // How many chunks will we actually schedule?
-    let chunks_total =
-        ((effective_end - seg_start) + chunk_size as u64 - 1) / chunk_size as u64;
+    let chunks_total = ((effective_end - seg_start) + chunk_size as u64 - 1) / chunk_size as u64;
     let inflight = std::cmp::min(inflight.max(1), chunks_total.max(1) as usize);
 
     let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
 
-    // Compute submission length at offset.
     let submit_len = |off: u64| -> usize {
         let remain = effective_end.saturating_sub(off);
         let mut len = std::cmp::min(chunk_size as u64, remain) as usize;
 
         if direct {
-            // Ensure ALIGN multiple for O_DIRECT submissions.
             let rem = (len as u64) % a;
             if rem != 0 {
                 len = (len as u64 + (a - rem)) as usize;
@@ -357,7 +320,6 @@ async fn stream_segment(
         len.max(1)
     };
 
-    // Prime the pipeline up to inflight.
     for _ in 0..inflight {
         if next_off >= effective_end {
             break;
@@ -366,10 +328,9 @@ async fn stream_segment(
 
         let buf = pool.take();
         let pooled = PooledBuf::new(pool.clone(), buf);
-        let slice = pooled.slice(..len);
 
         let off = next_off;
-        futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
+        futs.push_back(read_one(file.clone(), pooled, off, len, want_start, want_end));
         next_off = next_off.saturating_add(len as u64);
     }
 
@@ -389,10 +350,9 @@ async fn stream_segment(
 
             let buf = pool.take();
             let pooled = PooledBuf::new(pool.clone(), buf);
-            let slice = pooled.slice(..len);
 
             let off = next_off;
-            futs.push_back(read_one(file.clone(), slice, off, want_start, want_end));
+            futs.push_back(read_one(file.clone(), pooled, off, len, want_start, want_end));
             next_off = next_off.saturating_add(len as u64);
         }
     }
@@ -411,11 +371,7 @@ where
     S: Stream<Item = io::Result<Bytes>> + Unpin,
 {
     fn new(stream: S) -> Self {
-        Self {
-            stream,
-            buf: Bytes::new(),
-            done: false,
-        }
+        Self { stream, buf: Bytes::new(), done: false }
     }
 
     async fn refill(&mut self) -> io::Result<()> {
@@ -436,10 +392,7 @@ where
         while !dst.is_empty() {
             self.refill().await?;
             if self.done && self.buf.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "body shorter than expected",
-                ));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body shorter than expected"));
             }
 
             let n = dst.len().min(self.buf.len());
@@ -450,53 +403,43 @@ where
         Ok(())
     }
 
-    async fn next_bytes(&mut self) -> io::Result<Option<Bytes>> {
-        self.refill().await?;
-        if self.done && self.buf.is_empty() {
-            return Ok(None);
-        }
-        if self.buf.is_empty() {
-            return Ok(Some(Bytes::new()));
-        }
-        Ok(Some(std::mem::take(&mut self.buf)))
-    }
-
     async fn ensure_eof(mut self) -> io::Result<()> {
         while let Some(item) = self.stream.next().await {
             let b = item?;
             if !b.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "body longer than expected",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "body longer than expected"));
             }
         }
         Ok(())
     }
 }
 
-async fn try_preallocate(file: &tokio_uring::fs::File, len: u64) -> Result<()> {
+async fn try_preallocate(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
 
-    match file.fallocate(0, len, 0).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Some FS / setups return "operation not supported" etc. Don’t fail the upload.
-            let raw = e.raw_os_error().unwrap_or(0);
-            if raw == libc::EOPNOTSUPP
-                || raw == libc::ENOSYS
-                || raw == libc::EINVAL
-                || raw == libc::ENOTSUP
-            {
-                tracing::debug!(error = %e, "fallocate not supported; continuing without preallocation");
-                Ok(())
-            } else {
-                Err(anyhow!("fallocate({len}) failed: {e}"))
-            }
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        // Prefer posix_fallocate for portability; treat unsupported as non-fatal.
+        let rc = unsafe { libc::posix_fallocate(fd, 0, len as libc::off_t) };
+        if rc == 0 {
+            return Ok(());
         }
-    }
+
+        if rc == libc::EOPNOTSUPP
+            || rc == libc::ENOSYS
+            || rc == libc::EINVAL
+            || rc == libc::ENOTSUP
+            || rc == libc::EBADF
+        {
+            tracing::debug!(rc, "posix_fallocate not supported; continuing without preallocation");
+            Ok(())
+        } else {
+            Err(anyhow!("posix_fallocate({len}) failed: {}", io::Error::from_raw_os_error(rc)))
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("prealloc task join error: {e}"))?
 }
 
 fn ftruncate_fd(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
@@ -516,24 +459,13 @@ pub mod aws_chunked {
     use futures_util::Stream;
 
     #[derive(Debug, Clone, Copy)]
-    enum State {
-        NeedHeader,
-        NeedData,
-        NeedCrlf,
-        NeedTrailers,
-        Done,
-    }
+    enum State { NeedHeader, NeedData, NeedCrlf, NeedTrailers, Done }
 
-    /// Decoder for `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`.
-    ///
-    /// - Consumes the *encoded* HTTP body as `Bytes` frames (no AsyncRead wrapper).
-    /// - Produces *decoded payload bytes*.
-    /// - Ignores `chunk-signature=...` (parses and discards extensions).
     pub struct Decoder<S> {
         stream: S,
         buf: Bytes,
-        pending: Bytes,   // leftover decoded payload to serve first
-        scratch: Vec<u8>, // for header/trailer lines crossing frame boundaries
+        pending: Bytes,
+        scratch: Vec<u8>,
         state: State,
         remaining_in_chunk: usize,
         eof: bool,
@@ -570,21 +502,15 @@ pub mod aws_chunked {
             self.scratch.clear();
 
             loop {
-                // Search in current buffer for '\n'
                 if let Some(pos) = self.buf.iter().position(|&c| c == b'\n') {
                     let line = self.buf.split_to(pos + 1);
-
-                    // If scratch is empty, return line directly.
                     if self.scratch.is_empty() {
                         return Ok(line);
                     }
-
-                    // Otherwise append line to scratch and return combined as Bytes.
                     self.scratch.extend_from_slice(&line);
                     return Ok(Bytes::copy_from_slice(&self.scratch));
                 }
 
-                // No newline: move entire buf into scratch, then refill.
                 if !self.buf.is_empty() {
                     self.scratch.extend_from_slice(&self.buf);
                     self.buf = Bytes::new();
@@ -601,28 +527,19 @@ pub mod aws_chunked {
         }
 
         fn parse_chunk_len_line(line: &[u8]) -> io::Result<usize> {
-            // Expected: "<hex>;chunk-signature=<hex>\r\n" (extensions ignored)
-            // Be tolerant: allow "<hex>\r\n".
             let line = line.strip_suffix(b"\n").unwrap_or(line);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
 
             let hex_part = line.split(|&c| c == b';').next().unwrap_or(&[]);
             if hex_part.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "aws-chunked: empty chunk size",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: empty chunk size"));
             }
 
-            let s = std::str::from_utf8(hex_part).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: non-utf8 size")
-            })?;
+            let s = std::str::from_utf8(hex_part)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: non-utf8 size"))?;
 
             usize::from_str_radix(s, 16).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("aws-chunked: invalid hex chunk size: {s}"),
-                )
+                io::Error::new(io::ErrorKind::InvalidData, format!("aws-chunked: invalid hex chunk size: {s}"))
             })
         }
 
@@ -638,10 +555,7 @@ pub mod aws_chunked {
 
                 let take = need.len().min(self.buf.len());
                 if &self.buf[..take] != &need[..take] {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "aws-chunked: missing/invalid CRLF",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: missing/invalid CRLF"));
                 }
 
                 self.buf.advance(take);
@@ -656,7 +570,6 @@ pub mod aws_chunked {
                 if line == b"\n"[..] || line == b"\r\n"[..] {
                     return Ok(());
                 }
-                // ignore trailer headers
             }
         }
 
@@ -684,10 +597,7 @@ pub mod aws_chunked {
 
                         self.refill().await?;
                         if self.eof && self.buf.is_empty() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "aws-chunked: unexpected EOF in chunk data",
-                            ));
+                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "aws-chunked: unexpected EOF in chunk data"));
                         }
 
                         let take = self.remaining_in_chunk.min(self.buf.len());
@@ -713,19 +623,8 @@ pub mod aws_chunked {
             }
         }
 
-        /// Returns the next decoded payload chunk (may be a slice of an input frame).
-        /// Returns `Ok(None)` when the aws-chunked stream terminator/trailers are fully consumed.
-        pub async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
-            if !self.pending.is_empty() {
-                return Ok(Some(std::mem::take(&mut self.pending)));
-            }
-            self.next_payload_raw().await
-        }
-
-        /// Read exactly `dst.len()` decoded payload bytes into `dst`.
         pub async fn read_exact_payload(&mut self, mut dst: &mut [u8]) -> io::Result<()> {
             while !dst.is_empty() {
-                // First consume any pending remainder (zero-copy).
                 if !self.pending.is_empty() {
                     let n = dst.len().min(self.pending.len());
                     dst[..n].copy_from_slice(&self.pending[..n]);
@@ -735,21 +634,12 @@ pub mod aws_chunked {
                 }
 
                 match self.next_payload_raw().await? {
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "aws-chunked: decoded payload shorter than expected",
-                        ))
-                    }
+                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "aws-chunked: decoded payload shorter than expected")),
                     Some(b) => {
-                        if b.is_empty() {
-                            continue;
-                        }
+                        if b.is_empty() { continue; }
                         let n = dst.len().min(b.len());
                         dst[..n].copy_from_slice(&b[..n]);
                         dst = &mut dst[n..];
-
-                        // If there's leftover, stash it as pending (zero-copy slice).
                         if n < b.len() {
                             self.pending = b.slice(n..);
                         }
@@ -759,7 +649,6 @@ pub mod aws_chunked {
             Ok(())
         }
 
-        /// Ensure the underlying stream is fully consumed (for HTTP/1.1 keep-alive correctness).
         pub async fn drain_to_eof(mut self) -> io::Result<()> {
             while let Some(item) = self.stream.next().await {
                 let _ = item?;
@@ -769,20 +658,12 @@ pub mod aws_chunked {
     }
 }
 
-/// Stream-write an object body to `path`.
-///
-/// Requirements / behavior:
-/// - Supports parallel in-flight chunk writes (same file) up to `cfg.inflight` (scaled by global permits).
-/// - Files smaller than chunk_size are written without direct_io.
-/// - If direct_io is enabled:
-///   - requires `chunk_size % ALIGN == 0`
-///   - pads the last chunk with zeros to an aligned write size
-///   - truncates to the real size at the end
+/// Stream-write an object body to `path` (Tokio runtime + spawn_blocking pwrite).
 pub async fn write_object_body_to_file(
     body: Incoming,
     path: PathBuf,
-    logical_len: u64,          // decoded length if streaming, otherwise Content-Length
-    is_streaming_sigv4: bool,  // STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+    logical_len: u64,
+    is_streaming_sigv4: bool,
     cfg: StreamCfg,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
@@ -792,24 +673,18 @@ pub async fn write_object_body_to_file(
     let inflight_cfg = cfg.inflight.max(1);
     let a = ALIGN as u64;
 
-    // Decide direct I/O (must be aligned). Keep your heuristic (avoid direct on tiny uploads).
     let mut direct = cfg.direct_io && logical_len > chunk as u64;
     if direct && (chunk % ALIGN != 0) {
-        tracing::warn!(
-            chunk,
-            "direct_io enabled but chunk not aligned; disabling direct_io for this upload"
-        );
+        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this upload");
         direct = false;
     }
 
-    // Ensure parent directories exist (S3 "folders" are implicit)
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
     }
 
-    // Open file (single fd for whole upload)
-    let std_file = {
+    let file = {
         let mut oo = OpenOptions::new();
         oo.write(true).create(true).truncate(true);
         if direct {
@@ -817,38 +692,31 @@ pub async fn write_object_body_to_file(
         }
         oo.open(&path).map_err(|e| anyhow!("open {}: {e}", path.display()))?
     };
-    let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
 
-    // Preallocate (best-effort). Lustre may not support fallocate -> treated as non-fatal by try_preallocate.
     let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
-    try_preallocate(&file, prealloc_len).await?;
+    try_preallocate(file.as_raw_fd(), prealloc_len).await?;
 
-    // Empty object: done.
     if logical_len == 0 {
         ftruncate_fd(file.as_raw_fd(), 0)?;
         return Ok(());
     }
 
-    // Permits: base on logical chunks.
     let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
     let base = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let available = io_sem.available_permits();
     let mut allowed = per_file_permits(base, io_total.max(1), available);
     allowed = allowed.clamp(1, base);
 
-    // Hold permits for the whole upload
     let _permits = io_sem
         .clone()
         .acquire_many_owned(allowed as u32)
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
 
-    // Hyper -> stream of Bytes frames (encoded body bytes).
     let data_stream = body.into_data_stream().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
     });
 
-    // Unified decoded payload source (plain or aws-chunked).
     enum Src<S> {
         Plain(PlainFrameReader<S>),
         Aws(aws_chunked::Decoder<S>),
@@ -867,9 +735,7 @@ pub async fn write_object_body_to_file(
 
         async fn finish(self) -> io::Result<()> {
             match self {
-                // Plain: enforce EOF (no bytes beyond Content-Length).
                 Src::Plain(p) => p.ensure_eof().await,
-                // Aws: drain encoded remainder (terminator + trailers) for keep-alive correctness.
                 Src::Aws(d) => d.drain_to_eof().await,
             }
         }
@@ -881,52 +747,42 @@ pub async fn write_object_body_to_file(
         Src::Plain(PlainFrameReader::new(data_stream))
     };
 
-    // Inflight writes are *spawned* so they begin immediately; FuturesUnordered polls joinhandles.
     let mut inflight: FuturesUnordered<JoinHandle<std::result::Result<(), anyhow::Error>>> = FuturesUnordered::new();
-
     let mut off: u64 = 0;
 
     while off < logical_len {
-        // throttle
+        tracing::debug!("off: {off}, len: {logical_len}, inflight: {}", inflight.len());
         while inflight.len() >= allowed {
-            let Some(done) = inflight.next().await else {
-                break;
-            };
-            // tokio JoinHandle yields Result<T, JoinError>; our T is anyhow::Result<()>
+            let Some(done) = inflight.next().await else { break; };
             done.map_err(|e| anyhow!("write task join error: {e}"))??;
         }
 
-        // Read next logical chunk from payload.
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        // Always submit full chunk writes; pad last chunk and truncate at end.
         let write_len = chunk;
 
         let buf = pool.take();
         let mut pooled = PooledBuf::new(pool.clone(), buf);
 
-        // Fill [0..real_len] from decoded payload
         src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
             .await
             .map_err(|e| anyhow!("read payload failed at off={off}: {e}"))?;
 
-        // Pad [real_len..chunk] with zeros (only really matters on last chunk)
         if write_len > real_len {
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
-        let slice = pooled.slice(..write_len);
-        let file2 = file.clone();
+        let file2 = file.try_clone()?;
         let off2 = off;
 
-        inflight.push(tokio_uring::spawn(async move {
-            let (res, _slice) = file2.write_at(slice, off2).submit().await;
-            let n = res.map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
+        inflight.push(tokio::task::spawn_blocking(move || {
+            let src = &pooled.as_bytes()[..write_len];
+            let n = file2
+                .write_at(src, off2)
+                .map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
             if n != write_len {
-                return Err(anyhow!(
-                    "short write_at at off={off2}: wrote {n}, expected {write_len}"
-                ));
+                return Err(anyhow!("short write_at at off={off2}: wrote {n}, expected {write_len}"));
             }
             Ok::<(), anyhow::Error>(())
         }));
@@ -934,15 +790,11 @@ pub async fn write_object_body_to_file(
         off += real_len as u64;
     }
 
-    // Drain remaining writes
     while let Some(done) = inflight.next().await {
         done.map_err(|e| anyhow!("write task join error: {e}"))??;
     }
 
-    // Drain/validate remaining HTTP framing (keep-alive correctness).
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
-
-    // Truncate away the padded tail.
     ftruncate_fd(file.as_raw_fd(), logical_len)?;
     Ok(())
 }

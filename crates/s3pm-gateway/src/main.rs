@@ -25,12 +25,12 @@ use std::fs::OpenOptions;
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Semaphore;
-use tokio_uring::buf::BoundedBuf;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::streaming::{
@@ -39,7 +39,6 @@ use crate::streaming::{
 };
 use s3pm_support;
 
-// Hyper response type we use everywhere in this binary.
 type Resp = s3pm_support::s3resp::HttpResponse;
 
 // ---- config ----
@@ -55,10 +54,6 @@ struct Cfg {
     region: String,
     chunk_size: usize,
     inflight: usize,
-    /// Size of the *process-wide* aligned buffer pool, in number of buffers.
-    ///
-    /// Memory impact is approximately: `pool_size * chunk_size` bytes (plus allocator overhead).
-    /// Example: pool_size=128, chunk_size=1MiB => ~128MiB resident when warmed.
     pool_size: usize,
     direct_io: bool,
 }
@@ -90,12 +85,6 @@ fn load_cfg() -> Result<Cfg> {
     let chunk_size = env_usize("S3PM_CHUNK_SIZE", 1024 * 1024);
     let inflight = env_usize("S3PM_INFLIGHT", 16).max(1);
 
-    // Global buffer pool size (number of buffers).
-    // Default: 8 * inflight (enough slack to absorb concurrent requests without reallocating).
-    //
-    // IMPORTANT: This pool is warmed at startup (buffers are allocated and zero-initialized once),
-    // which improves latency by avoiding per-request buffer allocation / page-fault / memset work.
-    // Pool buffers are returned on Drop (best-effort) and reused across requests.
     let pool_size_default = inflight.saturating_mul(8).max(1);
     let pool_size = env_usize("S3PM_POOL_SIZE", pool_size_default).max(1);
 
@@ -119,7 +108,6 @@ fn load_cfg() -> Result<Cfg> {
 // ---- path mapping and other helpers ----
 
 fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
-    // avoid ".." traversal
     if bucket.is_empty() || bucket.contains('/') || bucket == "." || bucket == ".." {
         return Err(anyhow!("invalid bucket"));
     }
@@ -141,7 +129,6 @@ fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
 }
 
 fn bucket_root_path(root: &Path, bucket: &str) -> Result<PathBuf> {
-    // Reuse the same bucket validation as object path joining.
     join_object_path(root, bucket, "")
 }
 
@@ -163,7 +150,6 @@ fn system_time_from_unix(sec: i64, nsec: u32) -> SystemTime {
     if sec >= 0 {
         SystemTime::UNIX_EPOCH + Duration::new(sec as u64, nsec)
     } else {
-        // sec is negative
         let d = Duration::new((-sec) as u64, nsec);
         SystemTime::UNIX_EPOCH - d
     }
@@ -171,7 +157,6 @@ fn system_time_from_unix(sec: i64, nsec: u32) -> SystemTime {
 
 #[cfg(target_os = "linux")]
 fn statx_info(path: &Path) -> Option<StatxInfo> {
-    // Build a C string from raw OS bytes (avoid UTF-8 assumptions).
     let bytes = path.as_os_str().as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
         return None;
@@ -179,12 +164,6 @@ fn statx_info(path: &Path) -> Option<StatxInfo> {
     let c_path = CString::new(bytes).ok()?;
 
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-
-    // Request only what we need for ListObjectsV2:
-    // - inode for ETag
-    // - size
-    // - mtime
-    // - uid for optional Owner
     let mask: libc::c_uint =
         (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
 
@@ -214,13 +193,11 @@ fn statx_info(path: &Path) -> Option<StatxInfo> {
 
 #[cfg(not(target_os = "linux"))]
 fn statx_info(path: &Path) -> Option<StatxInfo> {
-    // Fallback for non-Linux builds.
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         Some(StatxInfo {
             ino: meta.ino(),
             size: meta.len(),
@@ -231,12 +208,7 @@ fn statx_info(path: &Path) -> Option<StatxInfo> {
 
     #[cfg(not(unix))]
     {
-        Some(StatxInfo {
-            ino: 0,
-            size: meta.len(),
-            uid: 0,
-            mtime,
-        })
+        Some(StatxInfo { ino: 0, size: meta.len(), uid: 0, mtime })
     }
 }
 
@@ -245,60 +217,57 @@ fn statx_info(path: &Path) -> Option<StatxInfo> {
 struct App {
     cfg: Arc<Cfg>,
     pool: Arc<BufPool>,
-
-    /// Global IO-permit budget (permits acquired per file/request).
     io_sem: Arc<Semaphore>,
     io_total: usize,
 }
 
 async fn read_small(
-    file: Arc<tokio_uring::fs::File>,
+    file: Arc<std::fs::File>,
     pool: Arc<BufPool>,
     off: u64,
     len: usize,
 ) -> Result<Bytes> {
     let buf = pool.take();
     let pooled = PooledBuf::new(pool, buf);
-    let slice = pooled.slice(..len);
 
-    let (res, slice) = file.read_at(slice, off).await;
-    let n = res.map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
+    let (n, pooled) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, PooledBuf)> {
+        let mut pooled = pooled;
+        let dst = &mut pooled.as_mut_bytes()[..len];
+        let n = file
+            .read_at(dst, off)
+            .map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
+        Ok((n, pooled))
+    })
+    .await
+    .map_err(|e| anyhow!("read task join error: {e}"))??;
+
     if n == 0 {
         return Err(anyhow!("unexpected EOF"));
     }
 
-    let mut bytes = Bytes::from_owner(SliceOwner(slice));
-    bytes = bytes.slice(0..n);
-    Ok(bytes)
+    Ok(Bytes::from_owner(SliceOwner::new(pooled, 0, n)))
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
-    // Classify first (no body required).
     let class = s3pm_support::classifier::classify(req.method().as_str(), req.uri());
 
     let resp = match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
             handle_get_bucket_location(req, app, &class).await
         }
-
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadBucket) => {
             handle_head_bucket(req, app, &class).await
         }
-
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetObject)
         | s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::HeadObject) => {
-            // GetObject + HeadObject handled together
             handle_get_object(req, app, &class).await
         }
-
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::ListObjectsV2) => {
             handle_list_objects_v2(req, app, &class).await
         }
-
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
         }
-
         s3pm_support::classifier::S3Op::Multipart(_) => handle_multipart(req, app, &class).await,
         s3pm_support::classifier::S3Op::Versioning(_) => handle_versioning(req, app, &class).await,
         _ => handle_other(req, app, &class).await,
@@ -578,7 +547,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
             }
         };
 
-        let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
+        let file = Arc::new(std_file);
         let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
             Ok(b) => b,
             Err(e) => {
@@ -1292,18 +1261,17 @@ async fn handle_put_object(
 
 // ---- main ----
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     let cfg = Arc::new(load_cfg()?);
 
-    // Global aligned buffer pool (warmed at startup)
     let pool = Arc::new(BufPool::new(cfg.chunk_size, cfg.pool_size));
     pool.warm(cfg.pool_size);
 
-    // Global IO permit budget: tie to pool_size by default.
     let io_total = cfg.pool_size.max(1);
     let io_sem = Arc::new(Semaphore::new(io_total));
 
@@ -1314,78 +1282,72 @@ fn main() -> Result<()> {
         io_total,
     });
 
-    tokio_uring::start(async move {
-        if let Some(sock_path) = cfg.bind_uds.clone() {
-            // IMPORTANT: UDS bind fails if the path already exists.
-            let _ = std::fs::remove_file(&sock_path);
+    if let Some(sock_path) = cfg.bind_uds.clone() {
+        let _ = std::fs::remove_file(&sock_path);
 
-            if let Some(parent) = sock_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("create UDS dir {}", parent.display()))?;
-            }
-
-            let listener = UnixListener::bind(&sock_path)
-                .with_context(|| format!("bind uds {}", sock_path.display()))?;
-
-            tracing::info!(
-                "s3pm-gateway listening on uds {} (chunk_size={} inflight={} pool_size={})",
-                sock_path.display(),
-                cfg.chunk_size,
-                cfg.inflight,
-                cfg.pool_size
-            );
-
-            loop {
-                let (stream, _addr) = listener.accept().await?;
-                let app2 = app.clone();
-
-                tokio_uring::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req| handle(req, app2.clone()));
-                    if let Err(e) = http1::Builder::new()
-                        .max_buf_size(8 * 1024 * 1024)
-                        .writev(true)
-                        .serve_connection(io, svc)
-                        .await
-                    {
-                        tracing::debug!(error = %e, "connection error");
-                    }
-                });
-            }
-        } else {
-            let listener = TcpListener::bind(&cfg.bind_addr)
-                .await
-                .with_context(|| format!("bind {}", cfg.bind_addr))?;
-
-            tracing::info!(
-                "s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})",
-                cfg.bind_addr,
-                cfg.chunk_size,
-                cfg.inflight,
-                cfg.pool_size
-            );
-
-            loop {
-                let (stream, _peer) = listener.accept().await?;
-                stream.set_nodelay(true)?;
-                let app2 = app.clone();
-
-                tokio_uring::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req| handle(req, app2.clone()));
-                    if let Err(e) = http1::Builder::new()
-                        .max_buf_size(8 * 1024 * 1024)
-                        .writev(true)
-                        .serve_connection(io, svc)
-                        .await
-                    {
-                        tracing::debug!(error = %e, "connection error");
-                    }
-                });
-            }
+        if let Some(parent) = sock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create UDS dir {}", parent.display()))?;
         }
 
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    })
+        let listener = UnixListener::bind(&sock_path)
+            .with_context(|| format!("bind uds {}", sock_path.display()))?;
+
+        tracing::info!(
+            "s3pm-gateway listening on uds {} (chunk_size={} inflight={} pool_size={})",
+            sock_path.display(),
+            cfg.chunk_size,
+            cfg.inflight,
+            cfg.pool_size
+        );
+
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let app2 = app.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req| handle(req, app2.clone()));
+                if let Err(e) = http1::Builder::new()
+                    .max_buf_size(8 * 1024 * 1024)
+                    .writev(true)
+                    .serve_connection(io, svc)
+                    .await
+                {
+                    tracing::debug!(error = %e, "connection error");
+                }
+            });
+        }
+    } else {
+        let listener = TcpListener::bind(&cfg.bind_addr)
+            .await
+            .with_context(|| format!("bind {}", cfg.bind_addr))?;
+
+        tracing::info!(
+            "s3pm-gateway listening on {} (chunk_size={} inflight={} pool_size={})",
+            cfg.bind_addr,
+            cfg.chunk_size,
+            cfg.inflight,
+            cfg.pool_size
+        );
+
+        loop {
+            let (stream, _peer) = listener.accept().await?;
+            stream.set_nodelay(true)?;
+            let app2 = app.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req| handle(req, app2.clone()));
+                if let Err(e) = http1::Builder::new()
+                    .max_buf_size(8 * 1024 * 1024)
+                    .writev(true)
+                    .serve_connection(io, svc)
+                    .await
+                {
+                    tracing::debug!(error = %e, "connection error");
+                }
+            });
+        }
+    }
 }

@@ -1,7 +1,6 @@
 use aligned_buffer::UniqueAlignedBuffer;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use bytes::Bytes;
 
 /// Fixed alignment for now (good default for O_DIRECT)
 pub const ALIGN: usize = 4096;
@@ -69,6 +68,12 @@ impl PooledBuf {
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
         self.buf.as_mut().unwrap().as_mut()
     }
+
+    /// Immutable access to the full buffer (len == chunk_size).
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buf.as_ref().unwrap().as_ref()
+    }
 }
 
 impl Drop for PooledBuf {
@@ -79,59 +84,23 @@ impl Drop for PooledBuf {
     }
 }
 
-// SAFETY: memory is stable and initialized (we always keep len == init bytes).
-unsafe impl tokio_uring::buf::IoBuf for PooledBuf {
-    fn stable_ptr(&self) -> *const u8 {
-        self.buf.as_ref().unwrap().as_ptr()
-    }
-    fn bytes_init(&self) -> usize {
-        self.buf.as_ref().unwrap().len()
-    }
-    fn bytes_total(&self) -> usize {
-        self.buf.as_ref().unwrap().len()
+/// Owner type used for zero-copy `Bytes::from_owner(...)`.
+/// When the Bytes is dropped, the underlying `PooledBuf` is dropped and returned to the pool.
+pub struct SliceOwner {
+    pooled: PooledBuf,
+    start: usize,
+    end: usize,
+}
+
+impl SliceOwner {
+    pub fn new(pooled: PooledBuf, start: usize, end: usize) -> Self {
+        Self { pooled, start, end }
     }
 }
 
-unsafe impl tokio_uring::buf::IoBufMut for PooledBuf {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.buf.as_mut().unwrap().as_mut_ptr()
-    }
-    unsafe fn set_init(&mut self, _pos: usize) {
-        // no-op: we keep the entire buffer initialized always
-    }
-}
-
-/// Wrap a tokio-uring Slice so we can feed it into Bytes::from_owner without copying.
-pub struct SliceOwner<T>(pub tokio_uring::buf::Slice<T>);
-
-impl<T> AsRef<[u8]> for SliceOwner<T>
-where
-    tokio_uring::buf::Slice<T>: std::ops::Deref<Target = [u8]>,
-{
+impl AsRef<[u8]> for SliceOwner {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
-        &*self.0
+        &self.pooled.as_bytes()[self.start..self.end]
     }
 }
-
-
-#[derive(Clone, Debug)]
-pub struct BytesBuf(pub Bytes);
-
-// We implement IoBuf ourselves so we do NOT rely on tokio-uring's optional `bytes` feature,
-// which causes naming clashes with the slice function.
-unsafe impl tokio_uring::buf::IoBuf for BytesBuf {
-    #[inline]
-    fn stable_ptr(&self) -> *const u8 {
-        self.0.as_ptr()
-    }
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        self.0.len()
-    }
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.0.len()
-    }
-}
-
-
