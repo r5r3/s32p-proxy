@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use base64::write;
 use bytes::{Bytes, Buf};
 use futures_util::Stream;
 use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_uring::buf::BoundedBuf;
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, BytesBuf, ALIGN};
@@ -530,6 +532,7 @@ pub mod aws_chunked {
     pub struct Decoder<S> {
         stream: S,
         buf: Bytes,
+        pending: Bytes,   // leftover decoded payload to serve first
         scratch: Vec<u8>, // for header/trailer lines crossing frame boundaries
         state: State,
         remaining_in_chunk: usize,
@@ -544,6 +547,7 @@ pub mod aws_chunked {
             Self {
                 stream,
                 buf: Bytes::new(),
+                pending: Bytes::new(),
                 scratch: Vec::with_capacity(256),
                 state: State::NeedHeader,
                 remaining_in_chunk: 0,
@@ -656,9 +660,7 @@ pub mod aws_chunked {
             }
         }
 
-        /// Returns the next decoded payload chunk (may be a slice of an input frame).
-        /// Returns `Ok(None)` when the aws-chunked stream terminator/trailers are fully consumed.
-        pub async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
+        async fn next_payload_raw(&mut self) -> io::Result<Option<Bytes>> {
             loop {
                 match self.state {
                     State::Done => return Ok(None),
@@ -711,35 +713,45 @@ pub mod aws_chunked {
             }
         }
 
+        /// Returns the next decoded payload chunk (may be a slice of an input frame).
+        /// Returns `Ok(None)` when the aws-chunked stream terminator/trailers are fully consumed.
+        pub async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
+            if !self.pending.is_empty() {
+                return Ok(Some(std::mem::take(&mut self.pending)));
+            }
+            self.next_payload_raw().await
+        }
+
         /// Read exactly `dst.len()` decoded payload bytes into `dst`.
         pub async fn read_exact_payload(&mut self, mut dst: &mut [u8]) -> io::Result<()> {
             while !dst.is_empty() {
-                match self.next_payload().await? {
+                // First consume any pending remainder (zero-copy).
+                if !self.pending.is_empty() {
+                    let n = dst.len().min(self.pending.len());
+                    dst[..n].copy_from_slice(&self.pending[..n]);
+                    dst = &mut dst[n..];
+                    self.pending.advance(n);
+                    continue;
+                }
+
+                match self.next_payload_raw().await? {
                     None => {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "aws-chunked: decoded payload shorter than expected",
                         ))
                     }
-                    Some(mut b) => {
+                    Some(b) => {
                         if b.is_empty() {
                             continue;
                         }
                         let n = dst.len().min(b.len());
                         dst[..n].copy_from_slice(&b[..n]);
                         dst = &mut dst[n..];
-                        b.advance(n);
 
-                        // If we didn't consume the whole `b`, put the remainder back into `self.buf`
-                        // by prefixing it (rare; only if dst is smaller than produced slice).
-                        if !b.is_empty() {
-                            // Put remainder in front of existing buf with a tiny copy.
-                            // This is fine because it only happens when dst is smaller than
-                            // the chunk slice (i.e. direct-io chunk boundary).
-                            let mut v = Vec::with_capacity(b.len() + self.buf.len());
-                            v.extend_from_slice(&b);
-                            v.extend_from_slice(&self.buf);
-                            self.buf = Bytes::from(v);
+                        // If there's leftover, stash it as pending (zero-copy slice).
+                        if n < b.len() {
+                            self.pending = b.slice(n..);
                         }
                     }
                 }
@@ -780,7 +792,7 @@ pub async fn write_object_body_to_file(
     let inflight_cfg = cfg.inflight.max(1);
     let a = ALIGN as u64;
 
-    // Decide direct I/O (must be aligned).
+    // Decide direct I/O (must be aligned). Keep your heuristic (avoid direct on tiny uploads).
     let mut direct = cfg.direct_io && logical_len > chunk as u64;
     if direct && (chunk % ALIGN != 0) {
         tracing::warn!(
@@ -805,20 +817,14 @@ pub async fn write_object_body_to_file(
         }
         oo.open(&path).map_err(|e| anyhow!("open {}: {e}", path.display()))?
     };
-
     let file = Arc::new(tokio_uring::fs::File::from_std(std_file));
 
-    // Preallocate (best-effort). For direct, allocate the aligned-on-disk size.
-    let prealloc_len = if direct {
-        align_up(logical_len, a)
-    } else {
-        logical_len
-    };
+    // Preallocate (best-effort). Lustre may not support fallocate -> treated as non-fatal by try_preallocate.
+    let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
     try_preallocate(&file, prealloc_len).await?;
 
     // Empty object: done.
     if logical_len == 0 {
-        // Ensure size is exactly 0 even if fallocate extended it.
         ftruncate_fd(file.as_raw_fd(), 0)?;
         return Ok(());
     }
@@ -830,7 +836,7 @@ pub async fn write_object_body_to_file(
     let mut allowed = per_file_permits(base, io_total.max(1), available);
     allowed = allowed.clamp(1, base);
 
-    // Hold permits for the whole upload (matches read-side idea)
+    // Hold permits for the whole upload
     let _permits = io_sem
         .clone()
         .acquire_many_owned(allowed as u32)
@@ -842,153 +848,70 @@ pub async fn write_object_body_to_file(
         io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
     });
 
-    // -------------------------
-    // Buffered (non-direct) path: write Bytes frames without copying using BytesBuf
-    // -------------------------
-    if !direct {
-        enum Src<S> {
-            Plain(PlainFrameReader<S>),
-            Aws(aws_chunked::Decoder<S>),
-        }
-
-        impl<S> Src<S>
-        where
-            S: Stream<Item = io::Result<Bytes>> + Unpin,
-        {
-            async fn next_payload(&mut self) -> io::Result<Option<Bytes>> {
-                match self {
-                    Src::Plain(p) => p.next_bytes().await,
-                    Src::Aws(d) => d.next_payload().await,
-                }
-            }
-
-            async fn ensure_done(self) -> io::Result<()> {
-                match self {
-                    Src::Plain(p) => p.ensure_eof().await,
-                    Src::Aws(d) => d.drain_to_eof().await,
-                }
-            }
-        }
-
-        let mut src = if is_streaming_sigv4 {
-            Src::Aws(aws_chunked::Decoder::new(data_stream))
-        } else {
-            Src::Plain(PlainFrameReader::new(data_stream))
-        };
-
-        let mut written: u64 = 0;
-        let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
-
-        while written < logical_len {
-            while futs.len() >= allowed {
-                let Some(done) = futs.next().await else { break };
-                done?;
-            }
-
-            let Some(b) = src.next_payload().await? else {
-                return Err(anyhow!(
-                    "upload body ended early: got {} bytes, expected {}",
-                    written,
-                    logical_len
-                ));
-            };
-
-            if b.is_empty() {
-                continue;
-            }
-
-            let remaining = (logical_len - written) as usize;
-            if b.len() > remaining {
-                return Err(anyhow!(
-                    "upload body longer than expected: next chunk={}, remaining={}",
-                    b.len(),
-                    remaining
-                ));
-            }
-
-            let off = written;
-            written += b.len() as u64;
-
-            let file2 = file.clone();
-            futs.push(async move {
-                // Ensure full write.
-                let (res, _buf) = file2.write_all_at(BytesBuf(b), off).await;
-                res.map_err(|e| anyhow!("write_all_at failed at off={off}: {e}"))?;
-                Ok::<(), anyhow::Error>(())
-            });
-        }
-
-        while let Some(done) = futs.next().await {
-            done?;
-        }
-
-        // Make sure there is no extra payload (and drain framing / EOF).
-        // - Plain: enforce EOF (no extra bytes beyond Content-Length).
-        // - Aws: drain the remainder of the encoded stream (safe keep-alive).
-        src.ensure_done().await.map_err(|e| anyhow!("{e}"))?;
-
-        // Ensure final file size is exactly logical_len (fallocate may have extended it).
-        ftruncate_fd(file.as_raw_fd(), logical_len)?;
-        return Ok(());
-    }
-
-    // -------------------------
-    // Direct I/O path: read into aligned pooled buffers and pad last write.
-    // -------------------------
-    enum DirectSrc<S> {
+    // Unified decoded payload source (plain or aws-chunked).
+    enum Src<S> {
         Plain(PlainFrameReader<S>),
         Aws(aws_chunked::Decoder<S>),
     }
 
-    impl<S> DirectSrc<S>
+    impl<S> Src<S>
     where
         S: Stream<Item = io::Result<Bytes>> + Unpin,
     {
         async fn read_exact_payload(&mut self, dst: &mut [u8]) -> io::Result<()> {
             match self {
-                DirectSrc::Plain(p) => p.read_exact_payload(dst).await,
-                DirectSrc::Aws(d) => d.read_exact_payload(dst).await,
+                Src::Plain(p) => p.read_exact_payload(dst).await,
+                Src::Aws(d) => d.read_exact_payload(dst).await,
             }
         }
 
-        async fn drain(self) -> io::Result<()> {
+        async fn finish(self) -> io::Result<()> {
             match self {
-                DirectSrc::Plain(p) => p.ensure_eof().await,
-                DirectSrc::Aws(d) => d.drain_to_eof().await,
+                // Plain: enforce EOF (no bytes beyond Content-Length).
+                Src::Plain(p) => p.ensure_eof().await,
+                // Aws: drain encoded remainder (terminator + trailers) for keep-alive correctness.
+                Src::Aws(d) => d.drain_to_eof().await,
             }
         }
     }
 
     let mut src = if is_streaming_sigv4 {
-        DirectSrc::Aws(aws_chunked::Decoder::new(data_stream))
+        Src::Aws(aws_chunked::Decoder::new(data_stream))
     } else {
-        DirectSrc::Plain(PlainFrameReader::new(data_stream))
+        Src::Plain(PlainFrameReader::new(data_stream))
     };
 
+    // Inflight writes are *spawned* so they begin immediately; FuturesUnordered polls joinhandles.
+    let mut inflight: FuturesUnordered<JoinHandle<std::result::Result<(), anyhow::Error>>> = FuturesUnordered::new();
+
     let mut off: u64 = 0;
-    let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
 
     while off < logical_len {
         // throttle
-        while futs.len() >= allowed {
-            let Some(done) = futs.next().await else { break };
-            done?;
+        while inflight.len() >= allowed {
+            let Some(done) = inflight.next().await else {
+                break;
+            };
+            // tokio JoinHandle yields Result<T, JoinError>; our T is anyhow::Result<()>
+            done.map_err(|e| anyhow!("write task join error: {e}"))??;
         }
 
+        // Read next logical chunk from payload.
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        let write_len = align_up(real_len as u64, a) as usize;
+        // Always submit full chunk writes; pad last chunk and truncate at end.
+        let write_len = chunk;
 
         let buf = pool.take();
         let mut pooled = PooledBuf::new(pool.clone(), buf);
 
-        // Read decoded payload bytes.
+        // Fill [0..real_len] from decoded payload
         src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
             .await
-            .map_err(|e| anyhow!("read payload failed: {e}"))?;
+            .map_err(|e| anyhow!("read payload failed at off={off}: {e}"))?;
 
-        // Pad tail to aligned write size.
+        // Pad [real_len..chunk] with zeros (only really matters on last chunk)
         if write_len > real_len {
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
@@ -997,21 +920,27 @@ pub async fn write_object_body_to_file(
         let file2 = file.clone();
         let off2 = off;
 
-        futs.push(async move {
-            let (res, _slice) = file2.write_all_at(slice, off2).await;
-            res.map_err(|e| anyhow!("write_all_at failed at off={off2}: {e}"))?;
+        inflight.push(tokio_uring::spawn(async move {
+            let (res, _slice) = file2.write_at(slice, off2).submit().await;
+            let n = res.map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
+            if n != write_len {
+                return Err(anyhow!(
+                    "short write_at at off={off2}: wrote {n}, expected {write_len}"
+                ));
+            }
             Ok::<(), anyhow::Error>(())
-        });
+        }));
 
         off += real_len as u64;
     }
 
-    while let Some(done) = futs.next().await {
-        done?;
+    // Drain remaining writes
+    while let Some(done) = inflight.next().await {
+        done.map_err(|e| anyhow!("write task join error: {e}"))??;
     }
 
-    // Drain any remaining encoded bytes (e.g. aws-chunked terminator/trailers).
-    src.drain().await.map_err(|e| anyhow!("{e}"))?;
+    // Drain/validate remaining HTTP framing (keep-alive correctness).
+    src.finish().await.map_err(|e| anyhow!("{e}"))?;
 
     // Truncate away the padded tail.
     ftruncate_fd(file.as_raw_fd(), logical_len)?;
