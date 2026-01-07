@@ -15,6 +15,13 @@ buckets:
       - principal: { type: "access_key", access_key: "TESTACCESSKEY123" }
         access: "read_write"
 
+  - id: "bkt-scratch"
+    name: "scratch"
+    data_path: "/scratch/r/Robert.Redl/infd/runtime/vllm"
+    acl:
+      - principal: { type: "access_key", access_key: "TESTACCESSKEY123" }
+        access: "read_write"
+
   - id: "bkt-team"
     name: "team"
     data_path: "/tmp/s3/team"
