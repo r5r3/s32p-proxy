@@ -7,7 +7,7 @@ use hyper::body::{Body, Incoming, Frame};
 use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
-use std::os::unix::fs::{OpenOptionsExt, FileExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use tokio::io;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
-use crate::uring_writer::UringWriter;
+use crate::uring_io::{UringIO, UringFileSender};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -83,12 +83,13 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
     Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
 }
 
-/// Stream a range from file as a Hyper body (Tokio runtime + spawn_blocking pread).
+/// Stream a range from file as a Hyper body using the shared UringIO.
 pub async fn stream_range_body(
     path: PathBuf,
     file_size: u64,
     want: ByteRange,
     cfg: StreamCfg,
+    uring: Arc<UringIO>,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
@@ -96,7 +97,7 @@ pub async fn stream_range_body(
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight.max(1) * 2);
 
     tokio::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg, pool, io_sem, io_total, tx).await {
+        if let Err(e) = stream_range_task(path, file_size, want, cfg, uring, pool, io_sem, io_total, tx).await {
             tracing::warn!(error = %e, "stream task failed");
         }
     });
@@ -156,6 +157,7 @@ async fn stream_range_task(
     file_size: u64,
     want: ByteRange,
     cfg: StreamCfg,
+    uring: Arc<UringIO>,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
@@ -202,8 +204,10 @@ async fn stream_range_task(
     let std_file = open_std_file(&path, direct)?;
     let file = Arc::new(std_file);
 
+    let sender = uring.sender(file.clone(), allowed.max(1));
+
     stream_segment(
-        file,
+        &sender,
         file_size,
         seg_start,
         seg_end,
@@ -230,23 +234,14 @@ fn open_std_file(path: &Path, direct: bool) -> Result<std::fs::File> {
 }
 
 async fn read_one(
-    file: Arc<std::fs::File>,
+    sender: &UringFileSender,
     pooled: PooledBuf,
     off: u64,
     len: usize,
     want_start: u64,
     want_end: u64,
 ) -> Result<Option<Bytes>> {
-    let (n, pooled) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, PooledBuf)> {
-        let mut pooled = pooled;
-        let dst = &mut pooled.as_mut_bytes()[..len];
-        let n = file
-            .read_at(dst, off)
-            .map_err(|e| anyhow!("read_at failed at off={off}: {e}"))?;
-        Ok((n, pooled))
-    })
-    .await
-    .map_err(|e| anyhow!("read task join error: {e}"))??;
+    let (n, pooled) = sender.read(off, len, pooled).await?;
 
     if n == 0 {
         return Ok(None);
@@ -268,7 +263,7 @@ async fn read_one(
 }
 
 async fn stream_segment(
-    file: Arc<std::fs::File>,
+    sender: &UringFileSender,
     file_size: u64,
     seg_start: u64,
     seg_end: u64,
@@ -330,14 +325,12 @@ async fn stream_segment(
         let pooled = PooledBuf::new(pool.clone(), buf);
 
         let off = next_off;
-        futs.push_back(read_one(file.clone(), pooled, off, len, want_start, want_end));
+        futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
         next_off = next_off.saturating_add(len as u64);
     }
 
     while let Some(res) = futs.next().await {
-        let Some(bytes) = res? else {
-            break;
-        };
+        let Some(bytes) = res? else { break; };
 
         if !bytes.is_empty() {
             if out.send(Ok(Frame::data(bytes))).await.is_err() {
@@ -352,13 +345,17 @@ async fn stream_segment(
             let pooled = PooledBuf::new(pool.clone(), buf);
 
             let off = next_off;
-            futs.push_back(read_one(file.clone(), pooled, off, len, want_start, want_end));
+            futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
             next_off = next_off.saturating_add(len as u64);
         }
     }
 
     Ok(())
 }
+
+// -------------------------
+// Upload path (unchanged except UringIO type)
+// -------------------------
 
 struct PlainFrameReader<S> {
     stream: S,
@@ -414,7 +411,7 @@ where
     }
 }
 
-async fn try_preallocate(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
+async fn try_preallocate(fd: RawFd, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
@@ -442,7 +439,7 @@ async fn try_preallocate(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
     .map_err(|e| anyhow!("prealloc task join error: {e}"))?
 }
 
-fn ftruncate_fd(fd: std::os::unix::io::RawFd, len: u64) -> Result<()> {
+fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
     let rc = unsafe { libc::ftruncate(fd, len as libc::off_t) };
     if rc != 0 {
         return Err(anyhow!(
@@ -664,7 +661,7 @@ pub async fn write_object_body_to_file(
     logical_len: u64,
     is_streaming_sigv4: bool,
     cfg: StreamCfg,
-    uring: Arc<UringWriter>,
+    uring: Arc<UringIO>,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
@@ -803,7 +800,7 @@ pub async fn write_object_body_to_file(
         } else {
             // bounded async backpressure; also abort on cancellation
             tokio::select! {
-                r = sender.send(off, write_len, pooled) => {
+                r = sender.write(off, write_len, pooled) => {
                     if r.is_err() { tx_dead = true; }
                 }
                 _ = cancel.cancelled() => {

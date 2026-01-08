@@ -5,7 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod buffer;
 mod streaming;
-mod uring_writer;
+mod uring_io;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -34,7 +34,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Semaphore;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
-use crate::uring_writer::UringWriter;
+use crate::uring_io::UringIO;
 use crate::streaming::{
     parse_range_header, stream_range_body, write_object_body_to_file,
     ByteRange, StreamCfg,
@@ -221,7 +221,7 @@ struct App {
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
-    uring: Arc<UringWriter>,
+    uring: Arc<UringIO>,
 }
 
 async fn read_small(
@@ -585,7 +585,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
         );
     }
 
-    // Streaming body via streaming module (permits acquired per file inside streaming.rs)
+    // Unified read path: always stream via UringIO (no small-file special case).
     let body = match stream_range_body(
         obj_path.clone(),
         size,
@@ -595,6 +595,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
             inflight: cfg.inflight,
             direct_io: cfg.direct_io,
         },
+        app.uring.clone(),
         app.pool.clone(),
         app.io_sem.clone(),
         app.io_total,
@@ -610,6 +611,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
             );
         }
     };
+
 
     let (status, content_length, content_range) = if range_present {
         (
@@ -1280,7 +1282,7 @@ async fn main() -> Result<()> {
     let io_sem = Arc::new(Semaphore::new(io_total));
 
     // Single global io_uring writer sized to the whole buffer pool.
-    let uring = Arc::new(UringWriter::spawn(io_total)?);
+    let uring = Arc::new(UringIO::spawn(io_total)?);
 
     let app = Arc::new(App {
         cfg: cfg.clone(),
