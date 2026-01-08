@@ -5,6 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod buffer;
 mod streaming;
+mod uring_writer;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;

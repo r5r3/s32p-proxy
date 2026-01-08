@@ -4,22 +4,19 @@ use futures_util::Stream;
 use futures_util::stream::{FuturesOrdered, StreamExt, TryStreamExt};
 use http_body_util::{StreamBody, BodyExt};
 use hyper::body::{Body, Incoming, Frame};
-use io_uring::{opcode, types, IoUring};
 use libc::O_DIRECT;
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, FileExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
 use tokio::io;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
+use crate::uring_writer::{self, WriteItem};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -722,243 +719,14 @@ pub async fn write_object_body_to_file(
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
 
-    struct WorkItem {
-        off: u64,
-        write_len: usize,
-        pooled: PooledBuf, // returned to pool on Drop
-    }
-
     // io_uring depth (per-file parallelism)
     // and Queue capacity between producer and writer
+    // io_uring depth (per-file parallelism)
     let depth: usize = allowed.max(1);
 
-    // Bounded async channel: producer send().await provides backpressure
-    let (tx, mut rx) = mpsc::channel::<WorkItem>(depth);
-
-    let cancel = CancellationToken::new();
-    let cancel_w = cancel.clone();
-
-    let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+    // Spawn io_uring writer thread (bounded queue + cancellation + completion)
     let fd: RawFd = file.as_raw_fd();
-
-    // -------------------------
-    // Writer thread (io_uring)
-    // -------------------------
-    thread::spawn(move || {
-        fn submit_item(
-            ring: &mut IoUring,
-            slots: &mut [Option<WorkItem>],
-            inflight: &mut usize,
-            fd: RawFd,
-            id: usize,
-            item: WorkItem,
-        ) -> Result<()> {
-            let WorkItem { off, write_len, pooled } = item;
-
-            let ptr = pooled.as_bytes().as_ptr();
-            let len = write_len as u32;
-
-            // keep buffer alive until CQE
-            slots[id] = Some(WorkItem { off, write_len, pooled });
-
-            let op = opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(off)
-                .build()
-                .user_data(id as u64);
-
-            unsafe {
-                ring.submission()
-                    .push(&op)
-                    .map_err(|_| anyhow!("io_uring SQ full"))?;
-            }
-
-            *inflight += 1;
-            tracing::debug!("submitting {} bytes at offset {}; inflight: {}", len, off, *inflight);
-            Ok(())
-        }
-
-        fn reap_all(
-            ring: &mut IoUring,
-            slots: &mut [Option<WorkItem>],
-            free: &mut VecDeque<usize>,
-            inflight: &mut usize,
-            first_err: &mut Option<anyhow::Error>,
-            cancel: &CancellationToken,
-        ) {
-            let mut cq = ring.completion();
-            while let Some(cqe) = cq.next() {
-                let id = cqe.user_data() as usize;
-                let res = cqe.result();
-
-                let item = slots.get_mut(id).and_then(|s| s.take());
-                free.push_back(id);
-                *inflight = inflight.saturating_sub(1);
-
-                if first_err.is_some() {
-                    drop(item);
-                    continue;
-                }
-
-                let Some(item) = item else {
-                    *first_err = Some(anyhow!("io_uring completion for unknown id={id}"));
-                    cancel.cancel();
-                    continue;
-                };
-
-                if res < 0 {
-                    let errno = -res;
-                    *first_err = Some(anyhow!(
-                        "io_uring write failed at off={}: errno={errno}",
-                        item.off
-                    ));
-                    cancel.cancel();
-                    continue;
-                }
-
-                let n = res as usize;
-                if n != item.write_len {
-                    *first_err = Some(anyhow!(
-                        "short io_uring write at off={}: wrote {n}, expected {}",
-                        item.off,
-                        item.write_len
-                    ));
-                    cancel.cancel();
-                    continue;
-                }
-
-                drop(item);
-            }
-        }
-
-        let mut ring = match IoUring::new(depth as u32) {
-            Ok(r) => r,
-            Err(e) => {
-                cancel_w.cancel();
-                let _ = done_tx.send(Err(anyhow!("IoUring::new({depth}) failed: {e}")));
-                return;
-            }
-        };
-
-        let mut slots: Vec<Option<WorkItem>> = Vec::with_capacity(depth);
-        slots.resize_with(depth, || None);
-
-        let mut free: VecDeque<usize> = (0..depth).collect();
-        let mut inflight: usize = 0;
-        let mut rx_closed = false;
-        let mut first_err: Option<anyhow::Error> = None;
-
-        loop {
-            // 1) reap
-            reap_all(
-                &mut ring,
-                &mut slots,
-                &mut free,
-                &mut inflight,
-                &mut first_err,
-                &cancel_w,
-            );
-
-            // On error: cancel and drain inflight completions
-            if first_err.is_some() {
-                cancel_w.cancel();
-                if inflight > 0 {
-                    let _ = ring.submit_and_wait(inflight);
-                    continue;
-                }
-                break;
-            }
-
-            // 2) fill SQ up to depth using non-blocking try_recv
-            let mut pushed = 0usize;
-            while inflight < depth {
-                let Some(id) = free.pop_front() else { break; };
-
-                let work = match rx.try_recv() {
-                    Ok(w) => w,
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        free.push_front(id);
-                        break;
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        rx_closed = true;
-                        free.push_front(id);
-                        break;
-                    }
-                };
-
-                if let Err(_) = submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
-                    free.push_front(id);
-                    break;
-                }
-                pushed += 1;
-            }
-
-            // 3) submit once per batch
-            if pushed > 0 {
-                if let Err(e) = ring.submit() {
-                    first_err = Some(anyhow!("io_uring submit failed: {e}"));
-                    continue;
-                }
-            }
-
-            // 4) reap again
-            reap_all(
-                &mut ring,
-                &mut slots,
-                &mut free,
-                &mut inflight,
-                &mut first_err,
-                &cancel_w,
-            );
-            if first_err.is_some() {
-                continue;
-            }
-
-            if rx_closed && inflight == 0 {
-                break;
-            }
-
-            // 5) only wait when saturated or draining
-            if inflight == depth || (rx_closed && inflight > 0) {
-                if let Err(e) = ring.submit_and_wait(1) {
-                    first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
-                    cancel_w.cancel();
-                }
-                continue;
-            }
-
-            // 6) otherwise block for one item to avoid spin
-            if !rx_closed {
-                match rx.blocking_recv() {
-                    Some(work) => {
-                        if let Some(id) = free.pop_front() {
-                            if let Err(e) =
-                                submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work)
-                            {
-                                first_err = Some(e);
-                                continue;
-                            }
-                            if let Err(e) = ring.submit() {
-                                first_err = Some(anyhow!("io_uring submit failed: {e}"));
-                                continue;
-                            }
-                        } else {
-                            drop(work);
-                        }
-                    }
-                    None => {
-                        rx_closed = true;
-                    }
-                }
-            }
-        }
-
-        let res = match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        };
-        let _ = done_tx.send(res);
-    });
+    let (tx, cancel, done_rx) = uring_writer::spawn_uring_writer(depth, fd);
 
     // -------------------------
     // Producer (async): decode + enqueue
@@ -1034,13 +802,13 @@ pub async fn write_object_body_to_file(
         } else {
             // bounded async backpressure; also abort on cancellation
             tokio::select! {
-                r = tx.send(WorkItem { off, write_len, pooled }) => {
+                r = tx.send(WriteItem { off, write_len, pooled }) => {
                     if r.is_err() {
                         tx_dead = true;
                     }
                 }
                 _ = cancel.cancelled() => {
-                    // send future is dropped; WorkItem (and pooled) are dropped -> buffer returned to pool
+                    // send future is dropped; WriteItem (and pooled) are dropped -> buffer returned to pool
                     tx_dead = true;
                 }
             }
