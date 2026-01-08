@@ -426,39 +426,52 @@ fn io_thread(
                     w.session.on_complete();
                     drop(w);
                 }
-                OpCode::Read(mut r) => {
+                OpCode::Read(r) => {
+                    // Move fields out so we never partially-move `r` and then use it again.
+                    let ReadItem {
+                        off,
+                        len,
+                        pooled,
+                        session,
+                        mut done,
+                        // keep these to ensure lifetime/permits end when we return:
+                        fd: _,
+                        _file: _,
+                        _permit: _,
+                    } = r;
+
                     if res < 0 {
                         let errno = -res;
-                        let e = anyhow!("io_uring read failed at off={}: errno={errno}", r.off);
-                        r.session.set_error_once(anyhow!("{e}"));
-                        if let Some(done) = r.done.take() {
-                            let _ = done.send(Err(e));
+                        let e = anyhow!("io_uring read failed at off={}: errno={errno}", off);
+                        session.set_error_once(anyhow!("{e}"));
+                        if let Some(tx) = done.take() {
+                            let _ = tx.send(Err(e));
                         }
-                        r.session.on_complete();
-                        drop(r);
+                        session.on_complete();
+                        // pooled dropped here (returned to pool)
                     } else {
                         let n = res as usize;
-                        if n > r.len {
+
+                        if n > len {
                             let e = anyhow!(
                                 "io_uring read returned n={} > requested {} at off={}",
-                                n, r.len, r.off
+                                n, len, off
                             );
-                            r.session.set_error_once(anyhow!("{e}"));
-                            if let Some(done) = r.done.take() {
-                                let _ = done.send(Err(e));
+                            session.set_error_once(anyhow!("{e}"));
+                            if let Some(tx) = done.take() {
+                                let _ = tx.send(Err(e));
                             }
-                            r.session.on_complete();
-                            drop(r);
+                            session.on_complete();
                             global_cancel.cancel();
                         } else {
-                            if let Some(done) = r.done.take() {
-                                let _ = done.send(Ok(ReadDone { n, pooled: r.pooled }));
+                            if let Some(tx) = done.take() {
+                                let _ = tx.send(Ok(ReadDone { n, pooled }));
+                                // pooled moved into ReadDone, so don't use it here
                             } else {
-                                // Should never happen; treat as fatal.
-                                r.session.set_error_once(anyhow!("missing read completion sender"));
+                                session.set_error_once(anyhow!("missing read completion sender"));
                                 global_cancel.cancel();
                             }
-                            r.session.on_complete();
+                            session.on_complete();
                         }
                     }
                 }
