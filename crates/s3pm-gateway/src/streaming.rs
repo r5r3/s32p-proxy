@@ -1,21 +1,23 @@
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, Buf};
 use futures_util::Stream;
-use futures_util::stream::{FuturesOrdered, FuturesUnordered, StreamExt, TryStreamExt};
+use futures_util::stream::{FuturesOrdered, StreamExt, TryStreamExt};
 use http_body_util::{StreamBody, BodyExt};
 use hyper::body::{Body, Incoming, Frame};
+use io_uring::{opcode, types, IoUring};
 use libc::O_DIRECT;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, FileExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io;
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
+use std::thread;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tokio::io;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
 
@@ -669,14 +671,6 @@ pub async fn write_object_body_to_file(
     io_sem: Arc<Semaphore>,
     io_total: usize,
 ) -> Result<()> {
-    use io_uring::{opcode, types, IoUring};
-    use std::collections::VecDeque;
-    use std::os::unix::io::{AsRawFd, RawFd};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc as StdArc;
-    use std::thread;
-    use tokio::sync::{mpsc, oneshot};
-
     let chunk = cfg.chunk_size;
     let inflight_cfg = cfg.inflight.max(1);
     let a = ALIGN as u64;
@@ -728,29 +722,31 @@ pub async fn write_object_body_to_file(
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
 
-    // -------------------------
-    // Producer -> Writer channel
-    // -------------------------
-
     struct WorkItem {
         off: u64,
-        write_len: usize, // direct: aligned tail; buffered: exact
+        write_len: usize,
         pooled: PooledBuf,
     }
 
-    // Slack keeps SQ full and reduces producer/writer ping-pong
-    let queue_cap = (allowed * 4).max(8);
-    let (tx, mut rx) = mpsc::channel::<WorkItem>(queue_cap);
+    let depth: usize = allowed.min(128).max(1);
+    let queue_cap: usize = (depth * 4).max(8);
 
-    let cancel = StdArc::new(AtomicBool::new(false));
+    let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(queue_cap);
+
+    // Async backpressure gate for crossbeam::send (so we never block tokio threads).
+    let q_sem = Arc::new(Semaphore::new(queue_cap));
+    let q_sem_w = q_sem.clone();
+
+    // Cancellation replaces AtomicBool + Notify
+    let cancel = CancellationToken::new();
     let cancel_w = cancel.clone();
 
     let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
     let fd: RawFd = file.as_raw_fd();
 
-    // io_uring depth cap
-    let depth: usize = allowed.min(128).max(1);
-
+    // -------------------------
+    // Writer thread (io_uring)
+    // -------------------------
     thread::spawn(move || {
         fn submit_item(
             ring: &mut IoUring,
@@ -762,14 +758,14 @@ pub async fn write_object_body_to_file(
         ) -> Result<()> {
             let WorkItem { off, write_len, pooled } = item;
 
-            // Keep buffer alive until CQE
             let ptr = pooled.as_bytes().as_ptr();
             let len = write_len as u32;
 
+            // Keep buffer alive until CQE
             slots[id] = Some(WorkItem { off, write_len, pooled });
 
             let op = opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(off)
+                .offset(off) // u64
                 .build()
                 .user_data(id as u64);
 
@@ -780,6 +776,7 @@ pub async fn write_object_body_to_file(
             }
 
             *inflight += 1;
+            tracing::debug!("submitting {} at offset {}; inflight {}", id, off, *inflight);
             Ok(())
         }
 
@@ -789,7 +786,7 @@ pub async fn write_object_body_to_file(
             free: &mut VecDeque<usize>,
             inflight: &mut usize,
             first_err: &mut Option<anyhow::Error>,
-            cancel: &AtomicBool,
+            cancel: &CancellationToken,
         ) {
             let mut cq = ring.completion();
             while let Some(cqe) = cq.next() {
@@ -807,7 +804,7 @@ pub async fn write_object_body_to_file(
 
                 let Some(item) = item else {
                     *first_err = Some(anyhow!("io_uring completion for unknown id={id}"));
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.cancel();
                     continue;
                 };
 
@@ -817,7 +814,7 @@ pub async fn write_object_body_to_file(
                         "io_uring write failed at off={}: errno={errno}",
                         item.off
                     ));
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.cancel();
                     continue;
                 }
 
@@ -828,7 +825,7 @@ pub async fn write_object_body_to_file(
                         item.off,
                         item.write_len
                     ));
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.cancel();
                     continue;
                 }
 
@@ -839,7 +836,7 @@ pub async fn write_object_body_to_file(
         let mut ring = match IoUring::new(depth as u32) {
             Ok(r) => r,
             Err(e) => {
-                cancel_w.store(true, Ordering::Relaxed);
+                cancel_w.cancel();
                 let _ = done_tx.send(Err(anyhow!("IoUring::new({depth}) failed: {e}")));
                 return;
             }
@@ -854,7 +851,7 @@ pub async fn write_object_body_to_file(
         let mut first_err: Option<anyhow::Error> = None;
 
         loop {
-            // Always reap everything available first (non-blocking).
+            // Reap available completions first.
             reap_all(
                 &mut ring,
                 &mut slots,
@@ -864,152 +861,103 @@ pub async fn write_object_body_to_file(
                 &cancel_w,
             );
 
-            // If failed: stop submitting, drain channel (to unblock producer), and drain inflight ops.
+            // On error: cancel + drain inflight writes to completion (so buffers can be dropped).
             if first_err.is_some() {
-                // Drain queued work without submitting
-                while !rx_closed {
-                    match rx.try_recv() {
-                        Ok(w) => drop(w),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            rx_closed = true;
-                            break;
-                        }
-                    }
-                }
+                cancel_w.cancel();
 
-                // Need to drain in-flight writes to safely drop buffers.
+                // Wait for all inflight writes to complete.
                 if inflight > 0 {
-                    // Allowed here: "rx is closed and you need to drain" semantics applies
-                    // (we also drain on error).
-                    if let Err(e) = ring.submit_and_wait(1) {
-                        // keep original error if present; otherwise record this
-                        if first_err.is_none() {
-                            first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
-                        }
-                        break;
-                    }
-                    continue; // next iteration will reap_all()
+                    let _ = ring.submit_and_wait(inflight);
+                    continue;
                 }
-
-                // No inflight. Wait for producer to close (so it doesn’t block) then exit.
-                if rx_closed {
-                    break;
-                }
-                match rx.blocking_recv() {
-                    Some(w) => drop(w),
-                    None => {
-                        rx_closed = true;
-                        break;
-                    }
-                }
-                continue;
+                break;
             }
 
-            // Fill SQ up to depth using try_recv (non-blocking).
-            let mut pushed: usize = 0;
+            // Fill SQ up to depth, then submit() once.
+            let mut pushed = 0usize;
 
             while inflight < depth {
                 let Some(id) = free.pop_front() else { break; };
 
                 let work = match rx.try_recv() {
-                    Ok(w) => w,
-                    Err(mpsc::error::TryRecvError::Empty) => {
+                    Ok(w) => {
+                        // release producer slot as soon as the item is dequeued
+                        q_sem_w.add_permits(1);
+                        w
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
                         free.push_front(id);
                         break;
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         rx_closed = true;
                         free.push_front(id);
                         break;
                     }
                 };
 
-                // Push SQE (no submit yet)
-                match submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
-                    Ok(()) => pushed += 1,
-                    Err(_) => {
-                        // SQ full unexpectedly; put id back and break.
-                        free.push_front(id);
-                        // We'll rely on draining condition below if saturated.
-                        break;
-                    }
+                if let Err(_) = submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
+                    free.push_front(id);
+                    break;
                 }
+                pushed += 1;
             }
 
-            // If we queued anything, submit once (batch).
             if pushed > 0 {
                 if let Err(e) = ring.submit() {
                     first_err = Some(anyhow!("io_uring submit failed: {e}"));
-                    cancel_w.store(true, Ordering::Relaxed);
-                    continue;
-                }
-                // Reap again immediately (non-blocking)
-                reap_all(
-                    &mut ring,
-                    &mut slots,
-                    &mut free,
-                    &mut inflight,
-                    &mut first_err,
-                    &cancel_w,
-                );
-                if first_err.is_some() {
                     continue;
                 }
             }
 
-            // Exit when channel closed and no inflight writes.
+            // Reap again (non-blocking).
+            reap_all(
+                &mut ring,
+                &mut slots,
+                &mut free,
+                &mut inflight,
+                &mut first_err,
+                &cancel_w,
+            );
+            if first_err.is_some() {
+                continue;
+            }
+
             if rx_closed && inflight == 0 {
                 break;
             }
 
-            // Only submit_and_wait when:
-            // - saturated (inflight == depth), or
-            // - rx is closed and we need to drain remaining inflight.
+            // Only wait when saturated or draining.
             if inflight == depth || (rx_closed && inflight > 0) {
                 if let Err(e) = ring.submit_and_wait(1) {
                     first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
-                    cancel_w.store(true, Ordering::Relaxed);
+                    cancel_w.cancel();
                 }
-                // next loop will reap_all()
                 continue;
             }
 
-            // Not saturated and rx not closed: block for one item to avoid busy spinning.
+            // Not saturated: block for one work item to avoid spinning.
             if !rx_closed {
-                match rx.blocking_recv() {
-                    None => {
-                        rx_closed = true;
-                    }
-                    Some(work) => {
+                match rx.recv() {
+                    Ok(work) => {
+                        q_sem_w.add_permits(1);
+
                         if let Some(id) = free.pop_front() {
                             if let Err(e) =
                                 submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work)
                             {
-                                free.push_front(id);
                                 first_err = Some(e);
-                                cancel_w.store(true, Ordering::Relaxed);
                                 continue;
                             }
                             if let Err(e) = ring.submit() {
                                 first_err = Some(anyhow!("io_uring submit failed: {e}"));
-                                cancel_w.store(true, Ordering::Relaxed);
                                 continue;
                             }
-                            // Reap any immediate completions
-                            reap_all(
-                                &mut ring,
-                                &mut slots,
-                                &mut free,
-                                &mut inflight,
-                                &mut first_err,
-                                &cancel_w,
-                            );
                         } else {
-                            // Shouldn't happen when inflight < depth, but be defensive.
                             drop(work);
                         }
                     }
+                    Err(_) => rx_closed = true,
                 }
             }
         }
@@ -1022,7 +970,7 @@ pub async fn write_object_body_to_file(
     });
 
     // -------------------------
-    // Producer (async): decode + enqueue
+    // Producer (async): decode + enqueue (crossbeam send guarded by async semaphore)
     // -------------------------
 
     let data_stream = body.into_data_stream().map_err(|e| {
@@ -1066,7 +1014,6 @@ pub async fn write_object_body_to_file(
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        // Direct: aligned tail; Buffered: exact
         let write_len = if direct {
             if real_len == chunk {
                 chunk
@@ -1085,17 +1032,30 @@ pub async fn write_object_body_to_file(
             .map_err(|e| anyhow!("read payload failed at off={off}: {e}"))?;
 
         if write_len > real_len {
+            tracing::debug!("zero-padding {} bytes at offset {}", write_len - real_len, off);
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
-        // Stop enqueueing on cancel or channel dead; but keep draining body.
-        if !cancel.load(Ordering::Relaxed) && !tx_dead {
-            let item = WorkItem { off, write_len, pooled };
-            if tx.send(item).await.is_err() {
-                tx_dead = true;
-            }
-        } else {
+        if tx_dead || cancel.is_cancelled() {
             drop(pooled);
+        } else {
+            // Wait for queue slot OR cancellation (no Notify needed)
+            let permit = tokio::select! {
+                p = q_sem.clone().acquire_owned() => Some(p.map_err(|_| anyhow!("queue semaphore closed"))?),
+                _ = cancel.cancelled() => None,
+            };
+
+            if let Some(permit) = permit {
+                let item = WorkItem { off, write_len, pooled };
+                match tx.send(item) {
+                    Ok(()) => permit.forget(), // writer returns permit on dequeue
+                    Err(_) => tx_dead = true,  // drop permit => slot returned
+                }
+            } else {
+                // cancelled
+                tx_dead = true;
+                drop(pooled);
+            }
         }
 
         off += real_len as u64;
