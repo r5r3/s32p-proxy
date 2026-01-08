@@ -706,7 +706,7 @@ pub async fn write_object_body_to_file(
             .map_err(|e| anyhow!("open {}: {e}", path.display()))?
     };
 
-    // Preallocate best-effort (your existing helper)
+    // Preallocate best-effort
     let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
     try_preallocate(file.as_raw_fd(), prealloc_len).await?;
 
@@ -738,7 +738,8 @@ pub async fn write_object_body_to_file(
         pooled: PooledBuf,
     }
 
-    let queue_cap = (allowed).max(8);
+    // Slack keeps SQ full and reduces producer/writer ping-pong
+    let queue_cap = (allowed * 4).max(8);
     let (tx, mut rx) = mpsc::channel::<WorkItem>(queue_cap);
 
     let cancel = StdArc::new(AtomicBool::new(false));
@@ -746,6 +747,8 @@ pub async fn write_object_body_to_file(
 
     let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
     let fd: RawFd = file.as_raw_fd();
+
+    // io_uring depth cap
     let depth: usize = allowed.min(128).max(1);
 
     thread::spawn(move || {
@@ -759,14 +762,14 @@ pub async fn write_object_body_to_file(
         ) -> Result<()> {
             let WorkItem { off, write_len, pooled } = item;
 
+            // Keep buffer alive until CQE
             let ptr = pooled.as_bytes().as_ptr();
             let len = write_len as u32;
 
-            // Keep buffer alive until CQE
             slots[id] = Some(WorkItem { off, write_len, pooled });
 
             let op = opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(off) // u64
+                .offset(off)
                 .build()
                 .user_data(id as u64);
 
@@ -777,11 +780,10 @@ pub async fn write_object_body_to_file(
             }
 
             *inflight += 1;
-            tracing::debug!("submitted {} bytes at offset {}; inflight: {}", len, off, *inflight);
             Ok(())
         }
 
-        fn reap(
+        fn reap_all(
             ring: &mut IoUring,
             slots: &mut [Option<WorkItem>],
             free: &mut VecDeque<usize>,
@@ -852,8 +854,19 @@ pub async fn write_object_body_to_file(
         let mut first_err: Option<anyhow::Error> = None;
 
         loop {
-            // If failed: stop submitting, drain channel to unblock producer, and drain inflight completions.
+            // Always reap everything available first (non-blocking).
+            reap_all(
+                &mut ring,
+                &mut slots,
+                &mut free,
+                &mut inflight,
+                &mut first_err,
+                &cancel_w,
+            );
+
+            // If failed: stop submitting, drain channel (to unblock producer), and drain inflight ops.
             if first_err.is_some() {
+                // Drain queued work without submitting
                 while !rx_closed {
                     match rx.try_recv() {
                         Ok(w) => drop(w),
@@ -865,28 +878,24 @@ pub async fn write_object_body_to_file(
                     }
                 }
 
+                // Need to drain in-flight writes to safely drop buffers.
                 if inflight > 0 {
+                    // Allowed here: "rx is closed and you need to drain" semantics applies
+                    // (we also drain on error).
                     if let Err(e) = ring.submit_and_wait(1) {
+                        // keep original error if present; otherwise record this
                         if first_err.is_none() {
                             first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
                         }
                         break;
                     }
-                    reap(
-                        &mut ring,
-                        &mut slots,
-                        &mut free,
-                        &mut inflight,
-                        &mut first_err,
-                        &cancel_w,
-                    );
-                    continue;
+                    continue; // next iteration will reap_all()
                 }
 
+                // No inflight. Wait for producer to close (so it doesn’t block) then exit.
                 if rx_closed {
                     break;
                 }
-
                 match rx.blocking_recv() {
                     Some(w) => drop(w),
                     None => {
@@ -897,8 +906,8 @@ pub async fn write_object_body_to_file(
                 continue;
             }
 
-            // Fill SQ up to depth
-            let mut pushed_any = false;
+            // Fill SQ up to depth using try_recv (non-blocking).
+            let mut pushed: usize = 0;
 
             while inflight < depth {
                 let Some(id) = free.pop_front() else { break; };
@@ -916,52 +925,27 @@ pub async fn write_object_body_to_file(
                     }
                 };
 
+                // Push SQE (no submit yet)
                 match submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
-                    Ok(()) => pushed_any = true,
+                    Ok(()) => pushed += 1,
                     Err(_) => {
-                        // SQ full: flush one completion then retry later
+                        // SQ full unexpectedly; put id back and break.
                         free.push_front(id);
-                        if let Err(e) = ring.submit_and_wait(1) {
-                            first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
-                            cancel_w.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        reap(
-                            &mut ring,
-                            &mut slots,
-                            &mut free,
-                            &mut inflight,
-                            &mut first_err,
-                            &cancel_w,
-                        );
+                        // We'll rely on draining condition below if saturated.
                         break;
                     }
                 }
             }
 
-            if first_err.is_some() {
-                continue;
-            }
-
-            if pushed_any {
+            // If we queued anything, submit once (batch).
+            if pushed > 0 {
                 if let Err(e) = ring.submit() {
                     first_err = Some(anyhow!("io_uring submit failed: {e}"));
                     cancel_w.store(true, Ordering::Relaxed);
                     continue;
                 }
-            }
-
-            if rx_closed && inflight == 0 {
-                break;
-            }
-
-            if inflight > 0 {
-                if let Err(e) = ring.submit_and_wait(1) {
-                    first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
-                    cancel_w.store(true, Ordering::Relaxed);
-                    continue;
-                }
-                reap(
+                // Reap again immediately (non-blocking)
+                reap_all(
                     &mut ring,
                     &mut slots,
                     &mut free,
@@ -969,21 +953,60 @@ pub async fn write_object_body_to_file(
                     &mut first_err,
                     &cancel_w,
                 );
-            } else if !rx_closed {
-                // No inflight: block for one item then submit it
+                if first_err.is_some() {
+                    continue;
+                }
+            }
+
+            // Exit when channel closed and no inflight writes.
+            if rx_closed && inflight == 0 {
+                break;
+            }
+
+            // Only submit_and_wait when:
+            // - saturated (inflight == depth), or
+            // - rx is closed and we need to drain remaining inflight.
+            if inflight == depth || (rx_closed && inflight > 0) {
+                if let Err(e) = ring.submit_and_wait(1) {
+                    first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
+                    cancel_w.store(true, Ordering::Relaxed);
+                }
+                // next loop will reap_all()
+                continue;
+            }
+
+            // Not saturated and rx not closed: block for one item to avoid busy spinning.
+            if !rx_closed {
                 match rx.blocking_recv() {
-                    None => rx_closed = true,
+                    None => {
+                        rx_closed = true;
+                    }
                     Some(work) => {
                         if let Some(id) = free.pop_front() {
-                            if let Err(e) = submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
+                            if let Err(e) =
+                                submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work)
+                            {
                                 free.push_front(id);
                                 first_err = Some(e);
                                 cancel_w.store(true, Ordering::Relaxed);
-                            } else if let Err(e) = ring.submit() {
+                                continue;
+                            }
+                            if let Err(e) = ring.submit() {
                                 first_err = Some(anyhow!("io_uring submit failed: {e}"));
                                 cancel_w.store(true, Ordering::Relaxed);
+                                continue;
                             }
+                            // Reap any immediate completions
+                            reap_all(
+                                &mut ring,
+                                &mut slots,
+                                &mut free,
+                                &mut inflight,
+                                &mut first_err,
+                                &cancel_w,
+                            );
                         } else {
+                            // Shouldn't happen when inflight < depth, but be defensive.
                             drop(work);
                         }
                     }
@@ -1043,7 +1066,7 @@ pub async fn write_object_body_to_file(
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        // Aligned tail for direct; exact for buffered
+        // Direct: aligned tail; Buffered: exact
         let write_len = if direct {
             if real_len == chunk {
                 chunk
@@ -1065,6 +1088,7 @@ pub async fn write_object_body_to_file(
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
+        // Stop enqueueing on cancel or channel dead; but keep draining body.
         if !cancel.load(Ordering::Relaxed) && !tx_dead {
             let item = WorkItem { off, write_len, pooled };
             if tx.send(item).await.is_err() {
@@ -1079,13 +1103,16 @@ pub async fn write_object_body_to_file(
 
     drop(tx);
 
+    // Drain/validate remaining HTTP framing (keep-alive correctness)
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
 
+    // Wait for writer
     match done_rx.await {
         Ok(r) => r?,
         Err(_) => return Err(anyhow!("io_uring writer thread terminated without status")),
     }
 
+    // Truncate padded tail
     ftruncate_fd(file.as_raw_fd(), logical_len)?;
     Ok(())
 }
