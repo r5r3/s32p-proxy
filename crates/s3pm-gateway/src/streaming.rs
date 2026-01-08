@@ -7,6 +7,7 @@ use hyper::body::{Body, Incoming, Frame};
 use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, FileExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -658,7 +659,6 @@ pub mod aws_chunked {
     }
 }
 
-/// Stream-write an object body to `path` (Tokio runtime + spawn_blocking pwrite).
 pub async fn write_object_body_to_file(
     body: Incoming,
     path: PathBuf,
@@ -669,13 +669,25 @@ pub async fn write_object_body_to_file(
     io_sem: Arc<Semaphore>,
     io_total: usize,
 ) -> Result<()> {
+    use io_uring::{opcode, types, IoUring};
+    use std::collections::VecDeque;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::thread;
+    use tokio::sync::{mpsc, oneshot};
+
     let chunk = cfg.chunk_size;
     let inflight_cfg = cfg.inflight.max(1);
     let a = ALIGN as u64;
 
+    // Decide direct I/O
     let mut direct = cfg.direct_io && logical_len > chunk as u64;
     if direct && (chunk % ALIGN != 0) {
-        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this upload");
+        tracing::warn!(
+            chunk,
+            "direct_io enabled but chunk not aligned; disabling direct_io for this upload"
+        );
         direct = false;
     }
 
@@ -690,9 +702,11 @@ pub async fn write_object_body_to_file(
         if direct {
             oo.custom_flags(O_DIRECT);
         }
-        oo.open(&path).map_err(|e| anyhow!("open {}: {e}", path.display()))?
+        oo.open(&path)
+            .map_err(|e| anyhow!("open {}: {e}", path.display()))?
     };
 
+    // Preallocate best-effort (your existing helper)
     let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
     try_preallocate(file.as_raw_fd(), prealloc_len).await?;
 
@@ -701,6 +715,7 @@ pub async fn write_object_body_to_file(
         return Ok(());
     }
 
+    // Per-file depth and permits
     let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
     let base = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let available = io_sem.available_permits();
@@ -712,6 +727,280 @@ pub async fn write_object_body_to_file(
         .acquire_many_owned(allowed as u32)
         .await
         .map_err(|_| anyhow!("io permit semaphore closed"))?;
+
+    // -------------------------
+    // Producer -> Writer channel
+    // -------------------------
+
+    struct WorkItem {
+        off: u64,
+        write_len: usize, // direct: aligned tail; buffered: exact
+        pooled: PooledBuf,
+    }
+
+    let queue_cap = (allowed).max(8);
+    let (tx, mut rx) = mpsc::channel::<WorkItem>(queue_cap);
+
+    let cancel = StdArc::new(AtomicBool::new(false));
+    let cancel_w = cancel.clone();
+
+    let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+    let fd: RawFd = file.as_raw_fd();
+    let depth: usize = allowed.min(128).max(1);
+
+    thread::spawn(move || {
+        fn submit_item(
+            ring: &mut IoUring,
+            slots: &mut [Option<WorkItem>],
+            inflight: &mut usize,
+            fd: RawFd,
+            id: usize,
+            item: WorkItem,
+        ) -> Result<()> {
+            let WorkItem { off, write_len, pooled } = item;
+
+            let ptr = pooled.as_bytes().as_ptr();
+            let len = write_len as u32;
+
+            // Keep buffer alive until CQE
+            slots[id] = Some(WorkItem { off, write_len, pooled });
+
+            let op = opcode::Write::new(types::Fd(fd), ptr, len)
+                .offset(off) // u64
+                .build()
+                .user_data(id as u64);
+
+            unsafe {
+                ring.submission()
+                    .push(&op)
+                    .map_err(|_| anyhow!("io_uring SQ full"))?;
+            }
+
+            *inflight += 1;
+            tracing::debug!("submitted {} bytes at offset {}; inflight: {}", len, off, *inflight);
+            Ok(())
+        }
+
+        fn reap(
+            ring: &mut IoUring,
+            slots: &mut [Option<WorkItem>],
+            free: &mut VecDeque<usize>,
+            inflight: &mut usize,
+            first_err: &mut Option<anyhow::Error>,
+            cancel: &AtomicBool,
+        ) {
+            let mut cq = ring.completion();
+            while let Some(cqe) = cq.next() {
+                let id = cqe.user_data() as usize;
+                let res = cqe.result();
+
+                let item = slots.get_mut(id).and_then(|s| s.take());
+                free.push_back(id);
+                *inflight = inflight.saturating_sub(1);
+
+                if first_err.is_some() {
+                    drop(item);
+                    continue;
+                }
+
+                let Some(item) = item else {
+                    *first_err = Some(anyhow!("io_uring completion for unknown id={id}"));
+                    cancel.store(true, Ordering::Relaxed);
+                    continue;
+                };
+
+                if res < 0 {
+                    let errno = -res;
+                    *first_err = Some(anyhow!(
+                        "io_uring write failed at off={}: errno={errno}",
+                        item.off
+                    ));
+                    cancel.store(true, Ordering::Relaxed);
+                    continue;
+                }
+
+                let n = res as usize;
+                if n != item.write_len {
+                    *first_err = Some(anyhow!(
+                        "short io_uring write at off={}: wrote {n}, expected {}",
+                        item.off,
+                        item.write_len
+                    ));
+                    cancel.store(true, Ordering::Relaxed);
+                    continue;
+                }
+
+                drop(item);
+            }
+        }
+
+        let mut ring = match IoUring::new(depth as u32) {
+            Ok(r) => r,
+            Err(e) => {
+                cancel_w.store(true, Ordering::Relaxed);
+                let _ = done_tx.send(Err(anyhow!("IoUring::new({depth}) failed: {e}")));
+                return;
+            }
+        };
+
+        let mut slots: Vec<Option<WorkItem>> = Vec::with_capacity(depth);
+        slots.resize_with(depth, || None);
+
+        let mut free: VecDeque<usize> = (0..depth).collect();
+        let mut inflight: usize = 0;
+        let mut rx_closed = false;
+        let mut first_err: Option<anyhow::Error> = None;
+
+        loop {
+            // If failed: stop submitting, drain channel to unblock producer, and drain inflight completions.
+            if first_err.is_some() {
+                while !rx_closed {
+                    match rx.try_recv() {
+                        Ok(w) => drop(w),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            rx_closed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if inflight > 0 {
+                    if let Err(e) = ring.submit_and_wait(1) {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
+                        }
+                        break;
+                    }
+                    reap(
+                        &mut ring,
+                        &mut slots,
+                        &mut free,
+                        &mut inflight,
+                        &mut first_err,
+                        &cancel_w,
+                    );
+                    continue;
+                }
+
+                if rx_closed {
+                    break;
+                }
+
+                match rx.blocking_recv() {
+                    Some(w) => drop(w),
+                    None => {
+                        rx_closed = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            // Fill SQ up to depth
+            let mut pushed_any = false;
+
+            while inflight < depth {
+                let Some(id) = free.pop_front() else { break; };
+
+                let work = match rx.try_recv() {
+                    Ok(w) => w,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        free.push_front(id);
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        rx_closed = true;
+                        free.push_front(id);
+                        break;
+                    }
+                };
+
+                match submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
+                    Ok(()) => pushed_any = true,
+                    Err(_) => {
+                        // SQ full: flush one completion then retry later
+                        free.push_front(id);
+                        if let Err(e) = ring.submit_and_wait(1) {
+                            first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
+                            cancel_w.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        reap(
+                            &mut ring,
+                            &mut slots,
+                            &mut free,
+                            &mut inflight,
+                            &mut first_err,
+                            &cancel_w,
+                        );
+                        break;
+                    }
+                }
+            }
+
+            if first_err.is_some() {
+                continue;
+            }
+
+            if pushed_any {
+                if let Err(e) = ring.submit() {
+                    first_err = Some(anyhow!("io_uring submit failed: {e}"));
+                    cancel_w.store(true, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
+            if rx_closed && inflight == 0 {
+                break;
+            }
+
+            if inflight > 0 {
+                if let Err(e) = ring.submit_and_wait(1) {
+                    first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
+                    cancel_w.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                reap(
+                    &mut ring,
+                    &mut slots,
+                    &mut free,
+                    &mut inflight,
+                    &mut first_err,
+                    &cancel_w,
+                );
+            } else if !rx_closed {
+                // No inflight: block for one item then submit it
+                match rx.blocking_recv() {
+                    None => rx_closed = true,
+                    Some(work) => {
+                        if let Some(id) = free.pop_front() {
+                            if let Err(e) = submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work) {
+                                free.push_front(id);
+                                first_err = Some(e);
+                                cancel_w.store(true, Ordering::Relaxed);
+                            } else if let Err(e) = ring.submit() {
+                                first_err = Some(anyhow!("io_uring submit failed: {e}"));
+                                cancel_w.store(true, Ordering::Relaxed);
+                            }
+                        } else {
+                            drop(work);
+                        }
+                    }
+                }
+            }
+        }
+
+        let res = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        let _ = done_tx.send(res);
+    });
+
+    // -------------------------
+    // Producer (async): decode + enqueue
+    // -------------------------
 
     let data_stream = body.into_data_stream().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
@@ -747,20 +1036,23 @@ pub async fn write_object_body_to_file(
         Src::Plain(PlainFrameReader::new(data_stream))
     };
 
-    let mut inflight: FuturesUnordered<JoinHandle<std::result::Result<(), anyhow::Error>>> = FuturesUnordered::new();
     let mut off: u64 = 0;
+    let mut tx_dead = false;
 
     while off < logical_len {
-        tracing::debug!("off: {off}, len: {logical_len}, inflight: {}", inflight.len());
-        while inflight.len() >= allowed {
-            let Some(done) = inflight.next().await else { break; };
-            done.map_err(|e| anyhow!("write task join error: {e}"))??;
-        }
-
         let remaining = (logical_len - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        let write_len = chunk;
+        // Aligned tail for direct; exact for buffered
+        let write_len = if direct {
+            if real_len == chunk {
+                chunk
+            } else {
+                align_up(real_len as u64, a) as usize
+            }
+        } else {
+            real_len
+        };
 
         let buf = pool.take();
         let mut pooled = PooledBuf::new(pool.clone(), buf);
@@ -773,28 +1065,27 @@ pub async fn write_object_body_to_file(
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
-        let file2 = file.try_clone()?;
-        let off2 = off;
-
-        inflight.push(tokio::task::spawn_blocking(move || {
-            let src = &pooled.as_bytes()[..write_len];
-            let n = file2
-                .write_at(src, off2)
-                .map_err(|e| anyhow!("write_at failed at off={off2}: {e}"))?;
-            if n != write_len {
-                return Err(anyhow!("short write_at at off={off2}: wrote {n}, expected {write_len}"));
+        if !cancel.load(Ordering::Relaxed) && !tx_dead {
+            let item = WorkItem { off, write_len, pooled };
+            if tx.send(item).await.is_err() {
+                tx_dead = true;
             }
-            Ok::<(), anyhow::Error>(())
-        }));
+        } else {
+            drop(pooled);
+        }
 
         off += real_len as u64;
     }
 
-    while let Some(done) = inflight.next().await {
-        done.map_err(|e| anyhow!("write task join error: {e}"))??;
-    }
+    drop(tx);
 
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
+
+    match done_rx.await {
+        Ok(r) => r?,
+        Err(_) => return Err(anyhow!("io_uring writer thread terminated without status")),
+    }
+
     ftruncate_fd(file.as_raw_fd(), logical_len)?;
     Ok(())
 }

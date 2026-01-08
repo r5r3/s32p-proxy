@@ -82,7 +82,7 @@ fn load_cfg() -> Result<Cfg> {
     let public_scheme = std::env::var("S3PM_PUBLIC_SCHEME").unwrap_or_else(|_| "http".to_string());
     let region = std::env::var("S3PM_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
-    let chunk_size = env_usize("S3PM_CHUNK_SIZE", 1024 * 1024);
+    let chunk_size = env_usize("S3PM_CHUNK_SIZE_MB", 4) * 1024 * 1024;
     let inflight = env_usize("S3PM_INFLIGHT", 16).max(1);
 
     let pool_size_default = inflight.saturating_mul(8).max(1);

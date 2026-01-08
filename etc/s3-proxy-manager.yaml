@@ -58,8 +58,8 @@ workers:
         AWS_SECRET_ACCESS_KEY: "{{secret_key}}"
         S3PM_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
         S3PM_REGION: "{{region}}"
-        S3PM_CHUNK_SIZE: "16777216"   # "4194304"
-        S3PM_INFLIGHT: "8"
+        S3PM_CHUNK_SIZE_MB: "4" 
+        S3PM_INFLIGHT: "32"
         S3PM_DIRECT_IO: "true"
 
 routing:
