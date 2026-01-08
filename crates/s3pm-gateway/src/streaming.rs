@@ -16,7 +16,7 @@ use tokio::io;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
-use crate::uring_writer::{self, WriteItem};
+use crate::uring_writer::UringWriter;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -664,6 +664,7 @@ pub async fn write_object_body_to_file(
     logical_len: u64,
     is_streaming_sigv4: bool,
     cfg: StreamCfg,
+    uring: Arc<UringWriter>,
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
@@ -696,6 +697,7 @@ pub async fn write_object_body_to_file(
         oo.open(&path)
             .map_err(|e| anyhow!("open {}: {e}", path.display()))?
     };
+    let file = Arc::new(file);
 
     // Preallocate best-effort
     let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
@@ -721,12 +723,11 @@ pub async fn write_object_body_to_file(
 
     // io_uring depth (per-file parallelism)
     // and Queue capacity between producer and writer
-    // io_uring depth (per-file parallelism)
     let depth: usize = allowed.max(1);
 
-    // Spawn io_uring writer thread (bounded queue + cancellation + completion)
-    let fd: RawFd = file.as_raw_fd();
-    let (tx, cancel, done_rx) = uring_writer::spawn_uring_writer(depth, fd);
+    // Per-request sender (no per-request ring/thread)
+    let sender = uring.sender(file.clone(), depth);
+    let cancel = sender.cancel_token().clone();
 
     // -------------------------
     // Producer (async): decode + enqueue
@@ -802,10 +803,8 @@ pub async fn write_object_body_to_file(
         } else {
             // bounded async backpressure; also abort on cancellation
             tokio::select! {
-                r = tx.send(WriteItem { off, write_len, pooled }) => {
-                    if r.is_err() {
-                        tx_dead = true;
-                    }
+                r = sender.send(off, write_len, pooled) => {
+                    if r.is_err() { tx_dead = true; }
                 }
                 _ = cancel.cancelled() => {
                     // send future is dropped; WriteItem (and pooled) are dropped -> buffer returned to pool
@@ -817,16 +816,13 @@ pub async fn write_object_body_to_file(
         off += real_len as u64;
     }
 
-    drop(tx);
+    sender.close();
 
     // Drain/validate remaining HTTP framing for keep-alive correctness
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
 
-    // Wait for writer thread result
-    match done_rx.await {
-        Ok(r) => r?,
-        Err(_) => return Err(anyhow!("io_uring writer thread terminated without status")),
-    }
+    // Wait for per-request completion
+    sender.wait().await?;
 
     // Truncate padded tail
     ftruncate_fd(file.as_raw_fd(), logical_len)?;

@@ -34,6 +34,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Semaphore;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
+use crate::uring_writer::UringWriter;
 use crate::streaming::{
     parse_range_header, stream_range_body, write_object_body_to_file,
     ByteRange, StreamCfg,
@@ -220,6 +221,7 @@ struct App {
     pool: Arc<BufPool>,
     io_sem: Arc<Semaphore>,
     io_total: usize,
+    uring: Arc<UringWriter>,
 }
 
 async fn read_small(
@@ -1241,6 +1243,7 @@ async fn handle_put_object(
             inflight: cfg.inflight,
             direct_io: cfg.direct_io,
         },
+        app.uring.clone(),
         app.pool.clone(),
         app.io_sem.clone(),
         app.io_total,
@@ -1276,11 +1279,15 @@ async fn main() -> Result<()> {
     let io_total = cfg.pool_size.max(1);
     let io_sem = Arc::new(Semaphore::new(io_total));
 
+    // Single global io_uring writer sized to the whole buffer pool.
+    let uring = Arc::new(UringWriter::spawn(io_total)?);
+
     let app = Arc::new(App {
         cfg: cfg.clone(),
         pool,
         io_sem,
         io_total,
+        uring,
     });
 
     if let Some(sock_path) = cfg.bind_uds.clone() {
