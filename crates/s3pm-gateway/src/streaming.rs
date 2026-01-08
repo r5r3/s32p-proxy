@@ -709,7 +709,7 @@ pub async fn write_object_body_to_file(
         return Ok(());
     }
 
-    // Per-file depth and permits
+    // Per-file depth / permits
     let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
     let base = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let available = io_sem.available_permits();
@@ -725,19 +725,16 @@ pub async fn write_object_body_to_file(
     struct WorkItem {
         off: u64,
         write_len: usize,
-        pooled: PooledBuf,
+        pooled: PooledBuf, // returned to pool on Drop
     }
 
-    let depth: usize = allowed.min(128).max(1);
-    let queue_cap: usize = (depth * 4).max(8);
+    // io_uring depth (per-file parallelism)
+    // and Queue capacity between producer and writer
+    let depth: usize = allowed.max(1);
 
-    let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(queue_cap);
+    // Bounded async channel: producer send().await provides backpressure
+    let (tx, mut rx) = mpsc::channel::<WorkItem>(depth);
 
-    // Async backpressure gate for crossbeam::send (so we never block tokio threads).
-    let q_sem = Arc::new(Semaphore::new(queue_cap));
-    let q_sem_w = q_sem.clone();
-
-    // Cancellation replaces AtomicBool + Notify
     let cancel = CancellationToken::new();
     let cancel_w = cancel.clone();
 
@@ -761,11 +758,11 @@ pub async fn write_object_body_to_file(
             let ptr = pooled.as_bytes().as_ptr();
             let len = write_len as u32;
 
-            // Keep buffer alive until CQE
+            // keep buffer alive until CQE
             slots[id] = Some(WorkItem { off, write_len, pooled });
 
             let op = opcode::Write::new(types::Fd(fd), ptr, len)
-                .offset(off) // u64
+                .offset(off)
                 .build()
                 .user_data(id as u64);
 
@@ -776,7 +773,7 @@ pub async fn write_object_body_to_file(
             }
 
             *inflight += 1;
-            tracing::debug!("submitting {} at offset {}; inflight {}", id, off, *inflight);
+            tracing::debug!("submitting {} bytes at offset {}; inflight: {}", len, off, *inflight);
             Ok(())
         }
 
@@ -851,7 +848,7 @@ pub async fn write_object_body_to_file(
         let mut first_err: Option<anyhow::Error> = None;
 
         loop {
-            // Reap available completions first.
+            // 1) reap
             reap_all(
                 &mut ring,
                 &mut slots,
@@ -861,11 +858,9 @@ pub async fn write_object_body_to_file(
                 &cancel_w,
             );
 
-            // On error: cancel + drain inflight writes to completion (so buffers can be dropped).
+            // On error: cancel and drain inflight completions
             if first_err.is_some() {
                 cancel_w.cancel();
-
-                // Wait for all inflight writes to complete.
                 if inflight > 0 {
                     let _ = ring.submit_and_wait(inflight);
                     continue;
@@ -873,23 +868,18 @@ pub async fn write_object_body_to_file(
                 break;
             }
 
-            // Fill SQ up to depth, then submit() once.
+            // 2) fill SQ up to depth using non-blocking try_recv
             let mut pushed = 0usize;
-
             while inflight < depth {
                 let Some(id) = free.pop_front() else { break; };
 
                 let work = match rx.try_recv() {
-                    Ok(w) => {
-                        // release producer slot as soon as the item is dequeued
-                        q_sem_w.add_permits(1);
-                        w
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                    Ok(w) => w,
+                    Err(mpsc::error::TryRecvError::Empty) => {
                         free.push_front(id);
                         break;
                     }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
                         rx_closed = true;
                         free.push_front(id);
                         break;
@@ -903,6 +893,7 @@ pub async fn write_object_body_to_file(
                 pushed += 1;
             }
 
+            // 3) submit once per batch
             if pushed > 0 {
                 if let Err(e) = ring.submit() {
                     first_err = Some(anyhow!("io_uring submit failed: {e}"));
@@ -910,7 +901,7 @@ pub async fn write_object_body_to_file(
                 }
             }
 
-            // Reap again (non-blocking).
+            // 4) reap again
             reap_all(
                 &mut ring,
                 &mut slots,
@@ -927,7 +918,7 @@ pub async fn write_object_body_to_file(
                 break;
             }
 
-            // Only wait when saturated or draining.
+            // 5) only wait when saturated or draining
             if inflight == depth || (rx_closed && inflight > 0) {
                 if let Err(e) = ring.submit_and_wait(1) {
                     first_err = Some(anyhow!("io_uring submit_and_wait failed: {e}"));
@@ -936,12 +927,10 @@ pub async fn write_object_body_to_file(
                 continue;
             }
 
-            // Not saturated: block for one work item to avoid spinning.
+            // 6) otherwise block for one item to avoid spin
             if !rx_closed {
-                match rx.recv() {
-                    Ok(work) => {
-                        q_sem_w.add_permits(1);
-
+                match rx.blocking_recv() {
+                    Some(work) => {
                         if let Some(id) = free.pop_front() {
                             if let Err(e) =
                                 submit_item(&mut ring, &mut slots, &mut inflight, fd, id, work)
@@ -957,7 +946,9 @@ pub async fn write_object_body_to_file(
                             drop(work);
                         }
                     }
-                    Err(_) => rx_closed = true,
+                    None => {
+                        rx_closed = true;
+                    }
                 }
             }
         }
@@ -970,7 +961,7 @@ pub async fn write_object_body_to_file(
     });
 
     // -------------------------
-    // Producer (async): decode + enqueue (crossbeam send guarded by async semaphore)
+    // Producer (async): decode + enqueue
     // -------------------------
 
     let data_stream = body.into_data_stream().map_err(|e| {
@@ -1036,25 +1027,22 @@ pub async fn write_object_body_to_file(
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
+        // Even if cancelled, keep consuming body to keep the HTTP connection correct.
+        // But stop enqueueing once writer has failed / channel closed.
         if tx_dead || cancel.is_cancelled() {
             drop(pooled);
         } else {
-            // Wait for queue slot OR cancellation (no Notify needed)
-            let permit = tokio::select! {
-                p = q_sem.clone().acquire_owned() => Some(p.map_err(|_| anyhow!("queue semaphore closed"))?),
-                _ = cancel.cancelled() => None,
-            };
-
-            if let Some(permit) = permit {
-                let item = WorkItem { off, write_len, pooled };
-                match tx.send(item) {
-                    Ok(()) => permit.forget(), // writer returns permit on dequeue
-                    Err(_) => tx_dead = true,  // drop permit => slot returned
+            // bounded async backpressure; also abort on cancellation
+            tokio::select! {
+                r = tx.send(WorkItem { off, write_len, pooled }) => {
+                    if r.is_err() {
+                        tx_dead = true;
+                    }
                 }
-            } else {
-                // cancelled
-                tx_dead = true;
-                drop(pooled);
+                _ = cancel.cancelled() => {
+                    // send future is dropped; WorkItem (and pooled) are dropped -> buffer returned to pool
+                    tx_dead = true;
+                }
             }
         }
 
@@ -1063,10 +1051,10 @@ pub async fn write_object_body_to_file(
 
     drop(tx);
 
-    // Drain/validate remaining HTTP framing (keep-alive correctness)
+    // Drain/validate remaining HTTP framing for keep-alive correctness
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
 
-    // Wait for writer
+    // Wait for writer thread result
     match done_rx.await {
         Ok(r) => r?,
         Err(_) => return Err(anyhow!("io_uring writer thread terminated without status")),

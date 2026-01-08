@@ -10,7 +10,6 @@ http = "1"
 httpdate = "1"
 bytes = "1"
 crossbeam-queue = "0.3"
-crossbeam-channel = "0.5"
 io-uring = "0.7"
 
 hyper = { version = "1", features = ["http1", "server"] }
