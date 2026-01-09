@@ -21,6 +21,8 @@ pub enum S3Op {
     Multipart(MultipartOp),
     /// Versioning related operation.
     Versioning(VersioningOp),
+    /// Object Lock / retention / legal-hold related operation.
+    ObjectLock(ObjectLockOp),
     /// Basic read operations (we’ll add more here later).
     Read(ReadOp),
     /// Basic write operations.
@@ -67,6 +69,27 @@ pub enum VersioningOp {
     /// Any object-level request with ?versionId=...
     ObjectWithVersionId { version_id: String },
     /// Some versioning-ish request we recognized as versioning but couldn't fully parse.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectLockOp {
+    /// GET /{bucket}?object-lock
+    GetBucketObjectLockConfiguration,
+    /// PUT /{bucket}?object-lock
+    PutBucketObjectLockConfiguration,
+
+    /// GET /{bucket}/{key}?retention
+    GetObjectRetention,
+    /// PUT /{bucket}/{key}?retention
+    PutObjectRetention,
+
+    /// GET /{bucket}/{key}?legal-hold
+    GetObjectLegalHold,
+    /// PUT /{bucket}/{key}?legal-hold
+    PutObjectLegalHold,
+
+    /// Some object-lock-ish request we recognized but couldn't fully parse.
     Unknown,
 }
 
@@ -144,6 +167,7 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
     match &class.op {
         S3Op::Multipart(_) => "multipart",
         S3Op::Versioning(_) => "versioning",
+        S3Op::ObjectLock(_) => "object_lock",
         S3Op::Read(_) => "read", // grouped "basic read" ops (GetObject, GetBucketLocation, ...)
         S3Op::Write(_) => "write",
         S3Op::Other => "other",
@@ -173,6 +197,17 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Versioning(op),
+        };
+    }
+
+    // Object lock / retention / legal-hold (query sub-resources).
+    // This must come before versioning so "?retention&versionId=..." is treated as object-lock.
+    if let Some(op) = classify_object_lock(method, &bucket, &key, &query) {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::ObjectLock(op),
         };
     }
 
@@ -254,6 +289,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
     match &class.op {
         S3Op::Multipart(_) => Some("multipart uploads are not implemented"),
         S3Op::Versioning(_) => Some("versioning is not implemented"),
+        S3Op::ObjectLock(_) => Some("object locking is not implemented"),
         S3Op::Read(_) => None, // handled by routing/gateway
         S3Op::Write(_) => None,
         S3Op::Other => None,
@@ -337,6 +373,42 @@ fn classify_versioning(
                 version_id: vid.to_string(),
             });
         }
+    }
+
+    None
+}
+
+fn classify_object_lock(
+    method: &str,
+    bucket: &Option<String>,
+    key: &Option<String>,
+    query: &QueryParams,
+) -> Option<ObjectLockOp> {
+    // Bucket Object Lock configuration: GET/PUT /{bucket}?object-lock
+    if bucket.is_some() && key.is_none() && query.has("object-lock") {
+        return match method {
+            "GET" => Some(ObjectLockOp::GetBucketObjectLockConfiguration),
+            "PUT" => Some(ObjectLockOp::PutBucketObjectLockConfiguration),
+            _ => Some(ObjectLockOp::Unknown),
+        };
+    }
+
+    // Object retention: GET/PUT /{bucket}/{key}?retention
+    if bucket.is_some() && key.is_some() && query.has("retention") {
+        return match method {
+            "GET" => Some(ObjectLockOp::GetObjectRetention),
+            "PUT" => Some(ObjectLockOp::PutObjectRetention),
+            _ => Some(ObjectLockOp::Unknown),
+        };
+    }
+
+    // Object legal hold: GET/PUT /{bucket}/{key}?legal-hold
+    if bucket.is_some() && key.is_some() && query.has("legal-hold") {
+        return match method {
+            "GET" => Some(ObjectLockOp::GetObjectLegalHold),
+            "PUT" => Some(ObjectLockOp::PutObjectLegalHold),
+            _ => Some(ObjectLockOp::Unknown),
+        };
     }
 
     None

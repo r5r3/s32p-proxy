@@ -71,6 +71,9 @@ routing:
     versioning:
       action: "not_implemented"
       message: "versioning is not implemented"
+    object_lock:
+      action: "not_implemented"
+      message: "object lock is not implemented"
     read:
       action: "proxy"
       worker_profile: "s3pm-gateway"
