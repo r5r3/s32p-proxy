@@ -38,6 +38,7 @@ impl BufPool {
             return b;
         }
 
+        tracing::debug!("pool exhausted, allocating additional buffer. # buffers={}", self.q.capacity());
         let mut b = ABuf::with_capacity(self.chunk_size);
         b.resize(self.chunk_size, 0);
         b
