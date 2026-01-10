@@ -187,6 +187,11 @@ impl UringFileSender {
         self.session.close();
     }
 
+    /// get the fd for ladvise
+    pub fn get_fd(&self) -> RawFd {
+        self.fd
+    }
+
     /// Submit a write at `off` for `write_len` bytes from `pooled`.
     pub async fn write(&self, off: u64, write_len: usize, pooled: PooledBuf) -> Result<()> {
         if self.cancel.is_cancelled() {

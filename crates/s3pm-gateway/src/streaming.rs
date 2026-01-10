@@ -326,6 +326,10 @@ async fn stream_segment(
 
         let off = next_off;
         futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
+
+        #[cfg(feature = "lustre")]
+        crate::lustre::advise_willread(sender.get_fd(), off, len as u64);
+    
         next_off = next_off.saturating_add(len as u64);
     }
 
@@ -346,6 +350,10 @@ async fn stream_segment(
 
             let off = next_off;
             futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
+        
+            #[cfg(feature = "lustre")]
+            crate::lustre::advise_willread(sender.get_fd(), off, len as u64);
+
             next_off = next_off.saturating_add(len as u64);
         }
     }
@@ -411,32 +419,29 @@ where
     }
 }
 
-async fn try_preallocate(fd: RawFd, len: u64) -> Result<()> {
+fn try_preallocate(fd: RawFd, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        // Prefer posix_fallocate for portability; treat unsupported as non-fatal.
-        let rc = unsafe { libc::posix_fallocate(fd, 0, len as libc::off_t) };
-        if rc == 0 {
-            return Ok(());
-        }
+    let rc = unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) };
+    if rc == 0 {
+        return Ok(());
+    }
 
-        if rc == libc::EOPNOTSUPP
-            || rc == libc::ENOSYS
-            || rc == libc::EINVAL
-            || rc == libc::ENOTSUP
-            || rc == libc::EBADF
-        {
-            tracing::debug!(rc, "posix_fallocate not supported; continuing without preallocation");
-            Ok(())
-        } else {
-            Err(anyhow!("posix_fallocate({len}) failed: {}", io::Error::from_raw_os_error(rc)))
-        }
-    })
-    .await
-    .map_err(|e| anyhow!("prealloc task join error: {e}"))?
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if errno == libc::EOPNOTSUPP
+        || errno == libc::ENOSYS
+        || errno == libc::EINVAL
+        || errno == libc::ENOTSUP
+    {
+        tracing::debug!(errno, "fallocate not supported; setting size with ftruncate.");
+
+        // try to use ftruncate instead
+        return ftruncate_fd(fd, len);
+    } else {
+        Err(anyhow!("posix_fallocate({len}) failed: {}", errno))
+    }
 }
 
 fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
@@ -698,11 +703,18 @@ pub async fn write_object_body_to_file(
 
     // Preallocate best-effort
     let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
-    try_preallocate(file.as_raw_fd(), prealloc_len).await?;
+    try_preallocate(file.as_raw_fd(), prealloc_len)?;
 
     if logical_len == 0 {
         ftruncate_fd(file.as_raw_fd(), 0)?;
         return Ok(());
+    }
+
+    // Lustre: best-effort lockahead hint for the whole file range we expect to write.
+    #[cfg(feature = "lustre")]
+    {
+        crate::lustre::advise_locknoexpand(file.as_raw_fd(), 0, prealloc_len);
+        crate::lustre::advise_lockahead_write(file.as_raw_fd(), 0, prealloc_len);
     }
 
     // Per-file depth / permits

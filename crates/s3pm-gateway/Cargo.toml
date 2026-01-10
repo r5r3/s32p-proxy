@@ -3,6 +3,10 @@ name = "s3pm-gateway"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+lustre = []
+
 [dependencies]
 mimalloc = "*"
 anyhow = "1"
@@ -33,3 +37,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 s3pm-support = { path = "../s3pm-support" }
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
+

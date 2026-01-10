@@ -7,6 +7,9 @@ mod buffer;
 mod streaming;
 mod uring_io;
 
+#[cfg(feature = "lustre")]
+mod lustre;
+
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
