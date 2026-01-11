@@ -1266,11 +1266,8 @@ async fn main() -> Result<()> {
     let pool = Arc::new(BufPool::new(cfg.chunk_size, cfg.pool_size));
     pool.warm(cfg.pool_size);
 
-    let io_total = cfg.pool_size.max(1);
-    let io_sem = Arc::new(Semaphore::new(io_total));
-
     // Single global io_uring writer sized to the whole buffer pool.
-    let uring = Arc::new(UringIO::spawn(io_total)?);
+    let uring = Arc::new(UringIO::spawn(cfg.pool_size.max(1))?);
 
     let app = Arc::new(App {
         cfg: cfg.clone(),
