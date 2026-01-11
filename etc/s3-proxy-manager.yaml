@@ -60,7 +60,7 @@ workers:
         S3PM_REGION: "{{region}}"
         S3PM_CHUNK_SIZE_MB: "16" 
         S3PM_INFLIGHT: "32"
-        S3PM_POOL_SIZE: "64"
+        S3PM_POOL_SIZE: "96"
         S3PM_DIRECT_IO: "true"
 
 routing:

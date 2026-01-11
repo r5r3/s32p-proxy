@@ -222,8 +222,6 @@ fn statx_info(path: &Path) -> Option<StatxInfo> {
 struct App {
     cfg: Arc<Cfg>,
     pool: Arc<BufPool>,
-    io_sem: Arc<Semaphore>,
-    io_total: usize,
     uring: Arc<UringIO>,
 }
 
@@ -233,8 +231,10 @@ async fn read_small(
     off: u64,
     len: usize,
 ) -> Result<Bytes> {
-    let buf = pool.take();
-    let pooled = PooledBuf::new(pool, buf);
+    let pooled = pool
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("buffer pool closed"))?;
 
     let (n, pooled) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, PooledBuf)> {
         let mut pooled = pooled;
@@ -542,17 +542,6 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
 
     // Small body fast-path (<= one chunk): acquire ONE permit for this file/request.
     if (want_len as usize) <= cfg.chunk_size {
-        let _permit = match app.io_sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => {
-                return s3pm_support::s3resp::internal_error(
-                    "io permit semaphore closed",
-                    Some(req.uri().path()),
-                    None,
-                )
-            }
-        };
-
         let file = Arc::new(std_file);
         let bytes = match read_small(file, app.pool.clone(), want.start, want_len as usize).await {
             Ok(b) => b,
@@ -600,8 +589,6 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
         },
         app.uring.clone(),
         app.pool.clone(),
-        app.io_sem.clone(),
-        app.io_total,
     )
     .await
     {
@@ -1250,8 +1237,6 @@ async fn handle_put_object(
         },
         app.uring.clone(),
         app.pool.clone(),
-        app.io_sem.clone(),
-        app.io_total,
     )
     .await
     {
@@ -1290,8 +1275,6 @@ async fn main() -> Result<()> {
     let app = Arc::new(App {
         cfg: cfg.clone(),
         pool,
-        io_sem,
-        io_total,
         uring,
     });
 

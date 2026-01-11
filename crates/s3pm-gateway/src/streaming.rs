@@ -91,13 +91,12 @@ pub async fn stream_range_body(
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
-    io_sem: Arc<Semaphore>,
-    io_total: usize,
 ) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight.max(1) * 2);
+    const BODY_CHAN_CAP: usize = 48; // small fixed limit
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(BODY_CHAN_CAP);
 
     tokio::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg, uring, pool, io_sem, io_total, tx).await {
+        if let Err(e) = stream_range_task(path, file_size, want, cfg, uring, pool, tx).await {
             tracing::warn!(error = %e, "stream task failed");
         }
     });
@@ -159,8 +158,6 @@ async fn stream_range_task(
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
-    io_sem: Arc<Semaphore>,
-    io_total: usize,
     mut out: mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
     let chunk = cfg.chunk_size;
@@ -190,21 +187,13 @@ async fn stream_range_task(
         return Ok(());
     }
 
-    let base = std::cmp::min(inflight_cfg, needed);
-    let available = io_sem.available_permits();
-    let mut allowed = per_file_permits(base, io_total.max(1), available);
-    allowed = allowed.clamp(1, base);
-
-    let _permits = io_sem
-        .clone()
-        .acquire_many_owned(allowed as u32)
-        .await
-        .map_err(|_| anyhow!("io permit semaphore closed"))?;
+    let allowed = std::cmp::min(inflight_cfg, needed);
+    let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + 48));
 
     let std_file = open_std_file(&path, direct)?;
     let file = Arc::new(std_file);
 
-    let sender = uring.sender(file.clone(), allowed.max(1));
+    let sender = uring.sender(file.clone());
 
     stream_segment(
         &sender,
@@ -217,6 +206,7 @@ async fn stream_range_task(
         allowed,
         direct,
         pool,
+        stream_sem,
         &mut out,
     )
     .await?;
@@ -273,6 +263,7 @@ async fn stream_segment(
     inflight: usize,
     direct: bool,
     pool: Arc<BufPool>,
+    stream_sem: Arc<Semaphore>,
     out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
     let a = ALIGN as u64;
@@ -337,8 +328,10 @@ async fn stream_segment(
         }
         let len = submit_len(next_off);
 
-        let buf = pool.take();
-        let pooled = PooledBuf::new(pool.clone(), buf);
+        let pooled = pool
+            .acquire_for_stream(&stream_sem)
+            .await
+            .map_err(|_| anyhow!("buffer pool closed"))?;
 
         let off = next_off;
         futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
@@ -368,8 +361,10 @@ async fn stream_segment(
 
         // 3) Now take a buffer and submit the NEXT read
         if let Some((off, len)) = next_plan {
-            let buf = pool.take();
-            let pooled = PooledBuf::new(pool.clone(), buf);
+            let pooled = pool
+                .acquire_for_stream(&stream_sem)
+                .await
+                .map_err(|_| anyhow!("buffer pool closed"))?;
 
             futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
             next_off = next_off.saturating_add(len as u64);
@@ -686,8 +681,6 @@ pub async fn write_object_body_to_file(
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
-    io_sem: Arc<Semaphore>,
-    io_total: usize,
 ) -> Result<()> {
     let chunk = cfg.chunk_size;
     let inflight_cfg = cfg.inflight.max(1);
@@ -737,23 +730,11 @@ pub async fn write_object_body_to_file(
 
     // Per-file depth / permits
     let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
-    let base = std::cmp::min(inflight_cfg, needed_chunks.max(1));
-    let available = io_sem.available_permits();
-    let mut allowed = per_file_permits(base, io_total.max(1), available);
-    allowed = allowed.clamp(1, base);
-
-    let _permits = io_sem
-        .clone()
-        .acquire_many_owned(allowed as u32)
-        .await
-        .map_err(|_| anyhow!("io permit semaphore closed"))?;
-
-    // io_uring depth (per-file parallelism)
-    // and Queue capacity between producer and writer
-    let depth: usize = allowed.max(1);
+    let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
+    let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
 
     // Per-request sender (no per-request ring/thread)
-    let sender = uring.sender(file.clone(), depth);
+    let sender = uring.sender(file.clone());
     let cancel = sender.cancel_token().clone();
 
     // -------------------------
@@ -811,8 +792,10 @@ pub async fn write_object_body_to_file(
             real_len
         };
 
-        let buf = pool.take();
-        let mut pooled = PooledBuf::new(pool.clone(), buf);
+        let mut pooled = pool
+            .acquire_for_stream(&stream_sem)
+            .await
+            .map_err(|_| anyhow!("buffer pool closed"))?;
 
         src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
             .await

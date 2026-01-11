@@ -106,7 +106,6 @@ pub struct UringFileSender {
     tx: mpsc::Sender<Msg>,
     file: Arc<std::fs::File>,
     fd: RawFd,
-    inflight: Arc<Semaphore>,
     session: Arc<SessionInner>,
     cancel: CancellationToken,
     done_rx: Option<oneshot::Receiver<Result<()>>>,
@@ -155,11 +154,8 @@ impl UringIO {
         &self.cancel
     }
 
-    /// Create a per-file sender with a max in-flight cap.
-    pub fn sender(&self, file: Arc<std::fs::File>, max_inflight: usize) -> UringFileSender {
-        let max_inflight = max_inflight.max(1);
-        let inflight = Arc::new(Semaphore::new(max_inflight));
-
+    /// Create a per-file sender
+    pub fn sender(&self, file: Arc<std::fs::File>) -> UringFileSender {
         let session_cancel = self.cancel.child_token();
         let session = Arc::new(SessionInner::new(session_cancel.clone()));
         let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
@@ -169,7 +165,6 @@ impl UringIO {
             tx: self.tx.clone(),
             fd: file.as_raw_fd(),
             file,
-            inflight,
             session,
             cancel: session_cancel,
             done_rx: Some(done_rx),
@@ -198,13 +193,6 @@ impl UringFileSender {
             return Err(anyhow!("uring sender cancelled"));
         }
 
-        let permit = self
-            .inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("sender inflight semaphore closed"))?;
-
         self.session.on_submit();
 
         let item = WriteItem {
@@ -213,7 +201,6 @@ impl UringFileSender {
             off,
             len: write_len,
             pooled,
-            _permit: permit,
             session: self.session.clone(),
         };
 
@@ -234,13 +221,6 @@ impl UringFileSender {
             return Err(anyhow!("uring sender cancelled"));
         }
 
-        let permit = self
-            .inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("sender inflight semaphore closed"))?;
-
         self.session.on_submit();
 
         let (done_tx, done_rx) = oneshot::channel::<Result<ReadDone>>();
@@ -251,7 +231,6 @@ impl UringFileSender {
             off,
             len: read_len,
             pooled,
-            _permit: permit,
             session: self.session.clone(),
             done: Some(done_tx),
         };
@@ -315,7 +294,6 @@ struct ReadItem {
     off: u64,
     len: usize,
     pooled: PooledBuf,
-    _permit: OwnedSemaphorePermit,
     session: Arc<SessionInner>,
     done: Option<oneshot::Sender<Result<ReadDone>>>,
 }
@@ -326,7 +304,6 @@ struct WriteItem {
     off: u64,
     len: usize,
     pooled: PooledBuf,
-    _permit: OwnedSemaphorePermit,
     session: Arc<SessionInner>,
 }
 
@@ -442,7 +419,6 @@ fn io_thread(
                         // keep these to ensure lifetime/permits end when we return:
                         fd: _,
                         _file: _,
-                        _permit: _,
                     } = r;
 
                     if res < 0 {
