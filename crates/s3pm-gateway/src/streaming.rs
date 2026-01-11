@@ -92,8 +92,8 @@ pub async fn stream_range_body(
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
 ) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
-    const BODY_CHAN_CAP: usize = 48; // small fixed limit
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(BODY_CHAN_CAP);
+    // the channel must bu able to hold the result of all inflight operations at once
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight);
 
     tokio::spawn(async move {
         if let Err(e) = stream_range_task(path, file_size, want, cfg, uring, pool, tx).await {
@@ -133,24 +133,6 @@ fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
     ((span + chunk_size as u64 - 1) / chunk_size as u64) as usize
 }
 
-/// Decide per-file concurrency based on global permits already out.
-fn per_file_permits(base: usize, io_total: usize, io_available: usize) -> usize {
-    if base <= 1 || io_total <= 1 {
-        return base.max(1);
-    }
-
-    let io_out = io_total.saturating_sub(io_available);
-
-    if io_out > io_total / 2 {
-        let avail = io_available.max(1) as u64;
-        let total = io_total as u64;
-        let scaled = ((base as u64) * (2 * avail) + (total - 1)) / total;
-        scaled as usize
-    } else {
-        base
-    }
-}
-
 async fn stream_range_task(
     path: PathBuf,
     file_size: u64,
@@ -187,8 +169,10 @@ async fn stream_range_task(
         return Ok(());
     }
 
+    // number of allowed IO operations inflight. we need enought buffers to 
+    // directly submit the next batch.
     let allowed = std::cmp::min(inflight_cfg, needed);
-    let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + 48));
+    let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
 
     let std_file = open_std_file(&path, direct)?;
     let file = Arc::new(std_file);
