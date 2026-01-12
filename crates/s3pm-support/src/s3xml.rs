@@ -159,6 +159,39 @@ pub fn list_objects_v2_body(
 }
 
 /* -------------------------
+ * DeleteObjects (multi-delete) response
+ * ------------------------- */
+
+#[derive(Clone, Debug)]
+pub struct DeleteErrorInfo {
+    pub key: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Build XML body for DeleteObjects (POST ?delete).
+pub fn delete_objects_result_body(deleted_keys: &[String], errors: &[DeleteErrorInfo]) -> Result<Vec<u8>> {
+    let doc = DeleteResultDoc {
+        xmlns: S3_XMLNS,
+        deleted: deleted_keys
+            .iter()
+            .map(|k| DeletedEntry { key: k.clone() })
+            .collect(),
+        errors: errors
+            .iter()
+            .map(|e| DeleteErrorEntry {
+                key: e.key.clone(),
+                code: e.code.clone(),
+                message: e.message.clone(),
+            })
+            .collect(),
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+/* -------------------------
  * XML DTOs
  * ------------------------- */
 
@@ -312,5 +345,34 @@ struct CommonPrefixesV2 {
     prefix: String,
 }
 
+// --- internal DTOs for DeleteObjects response ---
 
+#[derive(Debug, Serialize)]
+#[serde(rename = "DeleteResult")]
+struct DeleteResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Deleted", default, skip_serializing_if = "Vec::is_empty")]
+    deleted: Vec<DeletedEntry>,
+
+    #[serde(rename = "Error", default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<DeleteErrorEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeletedEntry {
+    #[serde(rename = "Key")]
+    key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteErrorEntry {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Message")]
+    message: String,
+}
 

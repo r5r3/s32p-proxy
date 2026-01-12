@@ -39,5 +39,5 @@ tempfile = "3"
 # responses and config
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
 url = "2"

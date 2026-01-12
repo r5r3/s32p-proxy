@@ -328,3 +328,25 @@ pub fn put_object_ok(etag: &str) -> HttpResponse {
     resp
 }
 
+/// Convenience: DeleteObject success (204, empty body).
+/// DeleteObject is idempotent; missing keys still return success.
+pub fn delete_object_no_content() -> HttpResponse {
+    let mut resp = response_bytes(StatusCode::NO_CONTENT, "application/xml", Vec::new(), []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+/// Convenience: DeleteObjects success (200, REST-XML DeleteResult).
+pub fn delete_objects_result(
+    deleted_keys: &[String],
+    errors: &[s3xml::DeleteErrorInfo],
+) -> HttpResponse {
+    let body = s3xml::delete_objects_result_body(deleted_keys, errors).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+

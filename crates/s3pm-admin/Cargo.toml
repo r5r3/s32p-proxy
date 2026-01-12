@@ -13,7 +13,7 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 
 # We'll use reqwest directly so we don't depend on undocumented/unstable higher-level helpers.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 
 uuid = { version = "1", features = ["v4"] }
 

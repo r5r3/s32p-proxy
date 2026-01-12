@@ -299,7 +299,7 @@ async fn stream_segment(
     let mut next_section_to_advise: u64 = seg_start.saturating_add(section_bytes); // section #1
 
     #[cfg(feature = "lustre")]
-    let mut advise_section = |start: u64| {
+    let advise_section = |start: u64| {
         if start >= effective_end {
             return;
         }

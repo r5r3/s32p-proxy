@@ -111,6 +111,10 @@ pub enum ReadOp {
 pub enum WriteOp {
     /// PUT /{bucket}/{key} (no query params)
     PutObject,
+    /// DELETE /{bucket}/{key} (no query params)
+    DeleteObject,
+    /// POST /{bucket}?delete
+    DeleteObjects,
 }
 
 /// Parsed query params with lowercased keys.
@@ -272,6 +276,26 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Write(WriteOp::PutObject),
+        };
+    }
+
+    // DeleteObjects (multi-delete): POST /{bucket}?delete (may also include x-id=DeleteObjects etc.)
+    if method == "POST" && bucket.is_some() && key.is_none() && query.has("delete") {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Write(WriteOp::DeleteObjects),
+        };
+    }
+
+    // DeleteObject: DELETE /{bucket}/{key} with *no* query params
+    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Write(WriteOp::DeleteObject),
         };
     }
 

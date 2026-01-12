@@ -19,7 +19,7 @@ url = "2"
 
 # shared S3 REST-XML builders
 serde = { version = "1", features = ["derive"] }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
 
 # build ready-to-use http::Response bodies (works directly with hyper)
 bytes = "1"

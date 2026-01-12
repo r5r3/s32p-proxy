@@ -22,6 +22,8 @@ use hyper::HeaderMap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fs;
@@ -34,7 +36,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::Semaphore;
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::uring_io::UringIO;
@@ -273,6 +274,12 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         }
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
+        }
+        s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::DeleteObject) => {
+            handle_delete_object(req, app, &class).await
+        }
+        s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::DeleteObjects) => {
+            handle_delete_objects(req, app, &class).await
         }
         s3pm_support::classifier::S3Op::Multipart(_) => handle_multipart(req, app, &class).await,
         s3pm_support::classifier::S3Op::Versioning(_) => handle_versioning(req, app, &class).await,
@@ -1251,6 +1258,308 @@ async fn handle_put_object(
 
     let etag = format!("\"{}\"", meta.ino());
     s3pm_support::s3resp::put_object_ok(&etag)
+}
+
+// -------------------------
+// DeleteObject / DeleteObjects
+// -------------------------
+
+fn prune_empty_parents(bucket_root: &Path, mut dir: PathBuf) {
+    loop {
+        if dir == *bucket_root {
+            break;
+        }
+
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => {
+                // removed successfully, keep walking upward
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => break,
+            Err(_e) => {
+                // NotEmpty / other -> stop pruning
+                break;
+            }
+        }
+
+        let Some(parent) = dir.parent() else { break; };
+        dir = parent.to_path_buf();
+    }
+}
+
+async fn handle_delete_object(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Keep consistent with other object ops: no query params for now.
+    if req.uri().query().is_some() {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+
+    if bucket.is_empty() || key.is_empty() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // S3 semantics: if bucket doesn't exist => NoSuchBucket
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+        }
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    // DeleteObject is idempotent: NotFound is still success.
+    match std::fs::remove_file(&obj_path) {
+        Ok(()) => {
+            // best-effort prune empty parent dirs under the bucket root
+            if let (Ok(bucket_root), Some(parent)) =
+                (bucket_root_path(&cfg.posix_root, bucket), obj_path.parent())
+            {
+                prune_empty_parents(&bucket_root, parent.to_path_buf());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // still success
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return s3pm_support::s3resp::access_denied("permission denied", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s3pm_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    }
+
+    s3pm_support::s3resp::delete_object_no_content()
+}
+
+fn local_name(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|&b| b == b':') {
+        Some(i) => &name[i + 1..],
+        None => name,
+    }
+}
+
+/// Minimal parser for DeleteObjects request:
+/// <Delete><Quiet>true</Quiet><Object><Key>k</Key></Object>...</Delete>
+fn parse_delete_objects_request(xml: &[u8]) -> Result<(bool, Vec<String>)> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut quiet = false;
+
+    let mut in_key = false;
+    let mut in_quiet = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let n = local_name(name.as_ref());
+                if n == b"Key" {
+                    in_key = true;
+                } else if n == b"Quiet" {
+                    in_quiet = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let n = local_name(name.as_ref());
+                if n == b"Key" {
+                    in_key = false;
+                } else if n == b"Quiet" {
+                    in_quiet = false;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let s = t.xml_content().map_err(|e| anyhow!("xml text decode error: {e}"))?.into_owned();
+                if in_key {
+                    if !s.is_empty() {
+                        keys.push(s);
+                    }
+                } else if in_quiet {
+                    let v = s.trim();
+                    quiet = v.eq_ignore_ascii_case("true") || v == "1";
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!("bad DeleteObjects XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok((quiet, keys))
+}
+
+async fn handle_delete_objects(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Must be ?delete (classifier already checked), keep defensive.
+    if !class.query.has("delete") {
+        return s3pm_support::s3resp::not_implemented("missing ?delete", None);
+    }
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // S3 semantics: if bucket doesn't exist => NoSuchBucket
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+        }
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let (parts, body) = req.into_parts();
+
+    // Read entire XML body (DeleteObjects bodies are small; S3 limits to 1000 keys)
+    let collected = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                &format!("failed to read body: {e}"),
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+    };
+
+    let (quiet, keys) = match parse_delete_objects_request(&collected) {
+        Ok(v) => v,
+        Err(e) => {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+    };
+
+    // S3 limit is 1000 objects per multi-delete request.
+    if keys.len() > 1000 {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "too many keys in DeleteObjects (max 1000)",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
+
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
+        Ok(p) => p,
+        Err(e) => {
+            return s3pm_support::s3resp::access_denied(&e.to_string(), Some(parts.uri.path()));
+        }
+    };
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut errors: Vec<s3pm_support::s3xml::DeleteErrorInfo> = Vec::new();
+
+    for key in keys {
+        if key.is_empty() {
+            errors.push(s3pm_support::s3xml::DeleteErrorInfo {
+                key,
+                code: s3pm_support::s3xml::error_code::INVALID_REQUEST.to_string(),
+                message: "empty key".to_string(),
+            });
+            continue;
+        }
+
+        let obj_path = match join_object_path(&cfg.posix_root, bucket, &key) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(s3pm_support::s3xml::DeleteErrorInfo {
+                    key,
+                    code: s3pm_support::s3xml::error_code::INVALID_REQUEST.to_string(),
+                    message: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        match std::fs::remove_file(&obj_path) {
+            Ok(()) => {
+                if let Some(parent) = obj_path.parent() {
+                    prune_empty_parents(&bucket_root, parent.to_path_buf());
+                }
+                if !quiet {
+                    deleted.push(key);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // idempotent success
+                if !quiet {
+                    deleted.push(key);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                errors.push(s3pm_support::s3xml::DeleteErrorInfo {
+                    key,
+                    code: s3pm_support::s3xml::error_code::ACCESS_DENIED.to_string(),
+                    message: "permission denied".to_string(),
+                });
+            }
+            Err(e) => {
+                errors.push(s3pm_support::s3xml::DeleteErrorInfo {
+                    key,
+                    code: s3pm_support::s3xml::error_code::INTERNAL_ERROR.to_string(),
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    s3pm_support::s3resp::delete_objects_result(&deleted, &errors)
 }
 
 // ---- main ----

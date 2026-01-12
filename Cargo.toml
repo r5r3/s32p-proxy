@@ -13,6 +13,7 @@ members = [
 
 [workspace.dependencies]
 rustls = { version = "0.23", features = ["aws_lc_rs", "read_buf"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [profile.perf]
 rustflags = ["-C", "target-cpu=native"]
