@@ -290,26 +290,61 @@ async fn stream_segment(
         len.max(1)
     };
 
-    // ---- Lustre WILLREAD #1: hint the initial batch (up to `inflight` chunks) ----
+    // ---- Lustre WILLREAD: section-based, always one section ahead ----
+    // Size of read ahead sections is always chunk_size * inflight
     #[cfg(feature = "lustre")]
-    {
-        // Hint starting at seg_start (or next_off) for approx inflight * chunk_size bytes.
-        // Clamp to the effective_end.
-        let win_start = next_off;
-        let win_bytes = (inflight as u64).saturating_mul(chunk_size as u64);
-        let win_end = std::cmp::min(effective_end, win_start.saturating_add(win_bytes));
-        let win_len = win_end.saturating_sub(win_start);
+    let section_bytes: u64 = (inflight as u64).saturating_mul(chunk_size as u64);
 
-        if win_len > 0 {
-            crate::lustre::advise_willread(sender.get_fd(), win_start, win_len);
+    #[cfg(feature = "lustre")]
+    let mut next_section_to_advise: u64 = seg_start.saturating_add(section_bytes); // section #1
+
+    #[cfg(feature = "lustre")]
+    let mut advise_section = |start: u64| {
+        if start >= effective_end {
+            return;
         }
-    }
+        let end = std::cmp::min(effective_end, start.saturating_add(section_bytes));
+        let len = end.saturating_sub(start);
+        if len > 0 {
+            crate::lustre::advise_willread(sender.get_fd(), start, len);
+        }
+    };
+
+    // Seed: advise the first section (section #0) once, so reads in section #0 are hinted.
+    #[cfg(feature = "lustre")]
+    advise_section(seg_start);
 
 
+    // When we begin reading a section (i.e., submit its first read),
+    // advise the *next* section (one section ahead).
+    #[cfg(feature = "lustre")]
+    let mut maybe_advise_next_section = |off: u64| {
+        // We only trigger at section boundaries: seg_start + k*section_bytes
+        if section_bytes == 0 {
+            return;
+        }
+        let rel = off.saturating_sub(seg_start);
+        if rel % section_bytes != 0 {
+            return; // not a section boundary
+        }
+
+        // We are starting section k; advise section k+1 if that's the next pending section.
+        let next_start = off.saturating_add(section_bytes);
+        if next_start == next_section_to_advise && next_start < effective_end {
+            advise_section(next_start);
+            next_section_to_advise = next_section_to_advise.saturating_add(section_bytes);
+        }
+    };
+
+    // Initial fill
     for _ in 0..inflight {
         if next_off >= effective_end {
             break;
         }
+
+        #[cfg(feature = "lustre")]
+        maybe_advise_next_section(next_off);
+
         let len = submit_len(next_off);
 
         let pooled = pool
@@ -326,31 +361,28 @@ async fn stream_segment(
     while let Some(res) = futs.next().await {
         let Some(bytes) = res? else { break; };
 
-        // 1) Issue WILLREAD for the NEXT chunk (no buffer needed yet)
-        let mut next_plan: Option<(u64, usize)> = None;
-        if next_off < effective_end {
-            let len = submit_len(next_off);
-            next_plan = Some((next_off, len));
-
-            #[cfg(feature = "lustre")]
-            crate::lustre::advise_willread(sender.get_fd(), next_off, len as u64);
-        }
-
-        // 2) Send CURRENT bytes
+        // Send CURRENT bytes
         if !bytes.is_empty() {
             if out.send(Ok(Frame::data(bytes))).await.is_err() {
                 return Ok(());
             }
         }
 
-        // 3) Now take a buffer and submit the NEXT read
-        if let Some((off, len)) = next_plan {
+        // Plan and submit NEXT read
+        if next_off < effective_end {
+            #[cfg(feature = "lustre")]
+            maybe_advise_next_section(next_off);
+            
+            let len = submit_len(next_off);
+
             let pooled = pool
                 .acquire_for_stream(&stream_sem)
                 .await
                 .map_err(|_| anyhow!("buffer pool closed"))?;
 
+            let off = next_off;
             futs.push_back(read_one(sender, pooled, off, len, want_start, want_end));
+
             next_off = next_off.saturating_add(len as u64);
         }
     }

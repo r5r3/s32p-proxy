@@ -463,6 +463,14 @@ s3pm-ctl ... bucket acl-set \
 
 ### Import / Export
 
+Due to the usage of [`io_uring`](https://developers.redhat.com/articles/2023/04/12/why-you-should-use-iouring-network-io), 
+you need RHEL 9.3, or another Linux distribution with a compatible kernel. 
+On RHEL, it is necessary to enable the `io_uring` kernel module:
+
+```bash
+sysctl -w kernel.io_uring_disabled=0
+```
+
 Import a directory YAML into the selected backend:
 
 ```bash
