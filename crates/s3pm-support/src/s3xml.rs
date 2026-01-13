@@ -17,6 +17,7 @@ pub mod error_code {
     pub const INVALID_REQUEST: &str = "InvalidRequest";
     pub const INTERNAL_ERROR: &str = "InternalError";
     pub const SERVICE_UNAVAILABLE: &str = "ServiceUnavailable";
+    pub const ENTITY_TOO_LARGE: &str = "EntityTooLarge";
 
     // Used by gateway for object retrieval errors.
     pub const NO_SUCH_KEY: &str = "NoSuchKey";
@@ -152,6 +153,27 @@ pub fn list_objects_v2_body(
             .iter()
             .map(|p| CommonPrefixesV2 { prefix: p.clone() })
             .collect(),
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+/* -------------------------
+ * CopyObject response
+ * ------------------------- */
+
+/// Build XML body for CopyObject (PUT with x-amz-copy-source).
+/// Includes all optional checksum fields as empty tags (we don't compute checksums during copy).
+pub fn copy_object_result_body(last_modified: &str, etag: &str) -> Result<Vec<u8>> {
+    let doc = CopyObjectResultDoc {
+        xmlns: S3_XMLNS,
+        last_modified: last_modified.to_string(),
+        etag: etag.to_string(),
+        checksum_crc32: Some(String::new()),
+        checksum_crc32c: Some(String::new()),
+        checksum_sha1: Some(String::new()),
+        checksum_sha256: Some(String::new()),
     };
 
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
@@ -343,6 +365,30 @@ struct OwnerV2 {
 struct CommonPrefixesV2 {
     #[serde(rename = "Prefix")]
     prefix: String,
+}
+
+// --- internal DTOs for CopyObject response ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyObjectResult")]
+struct CopyObjectResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+
+    #[serde(rename = "ETag")]
+    etag: String,
+
+    #[serde(rename = "ChecksumCRC32", skip_serializing_if = "Option::is_none")]
+    checksum_crc32: Option<String>,
+    #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "Option::is_none")]
+    checksum_crc32c: Option<String>,
+    #[serde(rename = "ChecksumSHA1", skip_serializing_if = "Option::is_none")]
+    checksum_sha1: Option<String>,
+    #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
+    checksum_sha256: Option<String>,
 }
 
 // --- internal DTOs for DeleteObjects response ---

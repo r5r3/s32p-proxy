@@ -40,7 +40,7 @@ use tokio::net::{TcpListener, UnixListener};
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::uring_io::UringIO;
 use crate::streaming::{
-    parse_range_header, stream_range_body, write_object_body_to_file,
+    copy_file_to_file, parse_range_header, stream_range_body, write_object_body_to_file,
     ByteRange, StreamCfg,
 };
 use s3pm_support;
@@ -62,6 +62,7 @@ struct Cfg {
     inflight: usize,
     pool_size: usize,
     direct_io: bool,
+    copy_max_size: u64,
 }
 
 fn env_bool(k: &str, default: bool) -> bool {
@@ -96,6 +97,10 @@ fn load_cfg() -> Result<Cfg> {
 
     let direct_io = env_bool("S3PM_DIRECT_IO", false);
 
+    // CopyObject single-request size limit (AWS default is 5GB; larger requires multipart copy).
+    let copy_max_size_gb = env_usize("S3PM_COPY_MAX_SIZE_GB", 5).max(1);
+    let copy_max_size = (copy_max_size_gb as u64).saturating_mul(1024u64 * 1024u64 * 1024u64);
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -108,6 +113,7 @@ fn load_cfg() -> Result<Cfg> {
         inflight,
         pool_size,
         direct_io,
+        copy_max_size,
     })
 }
 
@@ -256,7 +262,7 @@ async fn read_small(
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
-    let class = s3pm_support::classifier::classify(req.method().as_str(), req.uri());
+    let class = s3pm_support::classifier::classify_with_headers(req.method().as_str(), req.uri(), Some(req.headers()));
 
     let resp = match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
@@ -274,6 +280,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         }
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
+        }
+        s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::CopyObject) => {
+            handle_copy_object(req, app, &class).await
         }
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::DeleteObject) => {
             handle_delete_object(req, app, &class).await
@@ -1145,6 +1154,55 @@ fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
         .map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
 }
 
+fn percent_decode_path(s: &str) -> Result<String> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                if i + 2 >= b.len() {
+                    return Err(anyhow!("bad percent-encoding in x-amz-copy-source"));
+                }
+                let hi = (b[i + 1] as char).to_digit(16).ok_or_else(|| anyhow!("bad percent-encoding in x-amz-copy-source"))?;
+                let lo = (b[i + 2] as char).to_digit(16).ok_or_else(|| anyhow!("bad percent-encoding in x-amz-copy-source"))?;
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8(out).map_err(|_| anyhow!("x-amz-copy-source is not valid utf-8 after decoding"))?)
+}
+
+fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
+    let raw = headers
+        .get("x-amz-copy-source")
+        .ok_or_else(|| anyhow!("missing x-amz-copy-source"))?
+        .to_str()
+        .map_err(|_| anyhow!("invalid x-amz-copy-source"))?
+        .trim();
+
+    // Strip any version/query component (we don't support versioned copies yet).
+    let raw = raw.split_once('?').map(|(p, _)| p).unwrap_or(raw);
+    let raw = raw.trim_start_matches('/');
+    if raw.is_empty() {
+        return Err(anyhow!("invalid x-amz-copy-source"));
+    }
+
+    let decoded = percent_decode_path(raw)?;
+    let mut it = decoded.splitn(2, '/');
+    let bucket = it.next().unwrap_or("").to_string();
+    let key = it.next().unwrap_or("").to_string();
+    if bucket.is_empty() || key.is_empty() {
+        return Err(anyhow!("invalid x-amz-copy-source (expected /bucket/key)"));
+    }
+    Ok((bucket, key))
+}
+
 /// Returns (is_streaming_sigv4, logical_len)
 fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64)> {
     let is_streaming = header_eq(
@@ -1259,6 +1317,133 @@ async fn handle_put_object(
     let etag = format!("\"{}\"", meta.ino());
     s3pm_support::s3resp::put_object_ok(&etag)
 }
+
+async fn handle_copy_object(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Reject query params for CopyObject for now (copy has no required query params).
+    if req.uri().query().is_some() {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    let dst_bucket = class.bucket.as_deref().unwrap_or("");
+    let dst_key = class.key.as_deref().unwrap_or("");
+    if dst_bucket.is_empty() || dst_key.is_empty() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // destination bucket must exist
+    match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
+        Ok(true) => {}
+        Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let (src_bucket, src_key) = match parse_copy_source(req.headers()) {
+        Ok(v) => v,
+        Err(e) => {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            )
+        }
+    };
+
+    // source bucket must exist
+    match bucket_exists_dir(&cfg.posix_root, &src_bucket) {
+        Ok(true) => {}
+        Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let src_path = match join_object_path(&cfg.posix_root, &src_bucket, &src_key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    let dst_path = match join_object_path(&cfg.posix_root, dst_bucket, dst_key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    let src_meta = match std::fs::metadata(&src_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s3pm_support::s3resp::no_such_key("not found", None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return s3pm_support::s3resp::access_denied("permission denied", None)
+        }
+        Err(e) => {
+            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+        }
+    };
+
+    if src_meta.is_dir() {
+        return s3pm_support::s3resp::no_such_key("not found", None);
+    }
+
+    let size = src_meta.len();
+    if size > cfg.copy_max_size {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::ENTITY_TOO_LARGE,
+            &format!(
+                "CopyObject size {} exceeds configured single-copy limit {} bytes",
+                size, cfg.copy_max_size
+            ),
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    if let Err(e) = copy_file_to_file(
+        src_path,
+        dst_path.clone(),
+        size,
+        StreamCfg {
+            chunk_size: cfg.chunk_size,
+            inflight: cfg.inflight,
+            direct_io: cfg.direct_io,
+        },
+        app.uring.clone(),
+        app.pool.clone(),
+    )
+    .await
+    {
+        return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+    }
+
+    let dst_meta = match std::fs::metadata(&dst_path) {
+        Ok(m) => m,
+        Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+    };
+
+    let etag = format!("\"{}\"", dst_meta.ino());
+    let last_modified = s3pm_support::s3xml::format_s3_time_system(
+        dst_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+    );
+
+    s3pm_support::s3resp::copy_object_ok(&etag, &last_modified)
+}
+
 
 // -------------------------
 // DeleteObject / DeleteObjects

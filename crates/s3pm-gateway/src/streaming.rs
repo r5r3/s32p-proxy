@@ -854,3 +854,191 @@ pub async fn write_object_body_to_file(
     ftruncate_fd(file.as_raw_fd(), logical_len)?;
     Ok(())
 }
+
+
+pub async fn copy_file_to_file(
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    file_size: u64,
+    cfg: StreamCfg,
+    uring: Arc<UringIO>,
+    pool: Arc<BufPool>,
+) -> Result<()> {
+    let chunk = cfg.chunk_size;
+    let inflight_cfg = cfg.inflight.max(1);
+    let a = ALIGN as u64;
+
+    let mut direct = cfg.direct_io && file_size > chunk as u64;
+    if direct && (chunk % ALIGN != 0) {
+        tracing::warn!(
+            chunk,
+            "direct_io enabled but chunk not aligned; disabling direct_io for this copy"
+        );
+        direct = false;
+    }
+
+    if let Some(parent) = dst_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
+    }
+
+    let src_file = Arc::new(open_std_file(&src_path, direct)?);
+
+    let dst_file = {
+        let mut oo = OpenOptions::new();
+        oo.write(true).create(true).truncate(true);
+        if direct {
+            oo.custom_flags(O_DIRECT);
+        }
+        Arc::new(
+            oo.open(&dst_path)
+                .map_err(|e| anyhow!("open {}: {e}", dst_path.display()))?,
+        )
+    };
+
+    let prealloc_len = if direct { align_up(file_size, a) } else { file_size };
+    try_preallocate(dst_file.as_raw_fd(), prealloc_len)?;
+
+    if file_size == 0 {
+        ftruncate_fd(dst_file.as_raw_fd(), 0)?;
+        return Ok(());
+    }
+
+    // Lustre: best-effort hints (read + write) for the full range.
+    #[cfg(feature = "lustre")]
+    {
+        crate::lustre::advise_willread(src_file.as_raw_fd(), 0, prealloc_len);
+        crate::lustre::advise_locknoexpand(dst_file.as_raw_fd(), 0, prealloc_len);
+        crate::lustre::advise_lockahead_write(dst_file.as_raw_fd(), 0, prealloc_len);
+    }
+
+    let needed_chunks = ((file_size + chunk as u64 - 1) / chunk as u64) as usize;
+    let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
+    let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
+
+    let src_sender = uring.sender(src_file.clone());
+    let dst_sender = uring.sender(dst_file.clone());
+
+    let cancel_r = src_sender.cancel_token().clone();
+    let cancel_w = dst_sender.cancel_token().clone();
+
+    async fn read_for_copy(
+        sender: &UringFileSender,
+        pool: Arc<BufPool>,
+        stream_sem: &Arc<Semaphore>,
+        off: u64,
+        read_len: usize,
+        min_data_len: usize,
+        write_len: usize,
+    ) -> Result<(u64, usize, PooledBuf)> {
+        let pooled = pool
+            .acquire_for_stream(stream_sem)
+            .await
+            .map_err(|_| anyhow!("buffer pool closed"))?;
+
+        let (n, mut pooled) = sender.read(off, read_len, pooled).await?;
+        if n < min_data_len {
+            return Err(anyhow!(
+                "unexpected EOF while copying at off={off}: read {n}, need {min_data_len}"
+            ));
+        }
+
+        if write_len > n {
+            pooled.as_mut_bytes()[n..write_len].fill(0);
+        }
+
+        Ok((off, write_len, pooled))
+    }
+
+    let mut futs: FuturesOrdered<_> = FuturesOrdered::new();
+
+    let mut next_off: u64 = 0;
+    let mut had_err: Option<anyhow::Error> = None;
+
+    let plan = |off: u64, file_size: u64, chunk: usize, direct: bool, a: u64| -> (usize, usize) {
+        let remaining = (file_size - off) as usize;
+        let real_len = std::cmp::min(chunk, remaining);
+        let write_len = if direct {
+            if real_len == chunk {
+                chunk
+            } else {
+                align_up(real_len as u64, a) as usize
+            }
+        } else {
+            real_len
+        };
+        (real_len, write_len)
+    };
+
+    // Initial fill
+    for _ in 0..allowed {
+        if next_off >= file_size {
+            break;
+        }
+        let (real_len, write_len) = plan(next_off, file_size, chunk, direct, a);
+        futs.push_back(read_for_copy(
+            &src_sender,
+            pool.clone(),
+            &stream_sem,
+            next_off,
+            write_len,
+            real_len,
+            write_len,
+        ));
+        next_off += real_len as u64;
+    }
+
+    while let Some(res) = futs.next().await {
+        match res {
+            Ok((off, write_len, pooled)) => {
+                if cancel_w.is_cancelled() || cancel_r.is_cancelled() {
+                    drop(pooled);
+                    had_err = had_err.or_else(|| Some(anyhow!("copy cancelled")));
+                    break;
+                }
+
+                if let Err(e) = dst_sender.write(off, write_len, pooled).await {
+                    had_err = Some(e);
+                    cancel_w.cancel();
+                    cancel_r.cancel();
+                    break;
+                }
+            }
+            Err(e) => {
+                had_err = Some(e);
+                cancel_w.cancel();
+                cancel_r.cancel();
+                break;
+            }
+        }
+
+        if next_off < file_size && had_err.is_none() {
+            let (real_len, write_len) = plan(next_off, file_size, chunk, direct, a);
+            futs.push_back(read_for_copy(
+                &src_sender,
+                pool.clone(),
+                &stream_sem,
+                next_off,
+                write_len,
+                real_len,
+                write_len,
+            ));
+            next_off += real_len as u64;
+        }
+    }
+
+    // Ensure we stop submitting and wait for outstanding writes.
+    dst_sender.close();
+    let wait_res = dst_sender.wait().await;
+
+    if let Some(e) = had_err {
+        let _ = wait_res;
+        return Err(e);
+    }
+
+    wait_res?;
+
+    // Truncate padded tail (direct I/O) or enforce exact size.
+    ftruncate_fd(dst_file.as_raw_fd(), file_size)?;
+    Ok(())
+}

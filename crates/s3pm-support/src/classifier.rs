@@ -1,4 +1,4 @@
-use http::Uri;
+use http::{HeaderMap, Uri};
 use std::collections::HashMap;
 
 /// High-level classification for S3 REST requests.
@@ -111,6 +111,8 @@ pub enum ReadOp {
 pub enum WriteOp {
     /// PUT /{bucket}/{key} (no query params)
     PutObject,
+    /// PUT /{bucket}/{key} with x-amz-copy-source
+    CopyObject,
     /// DELETE /{bucket}/{key} (no query params)
     DeleteObject,
     /// POST /{bucket}?delete
@@ -178,9 +180,9 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
     }
 }
 
-/// Classify an incoming request into S3 operation buckets.
-/// Currently focuses on versioning + multipart uploads (to reject as NotImplemented).
-pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
+/// Classify an incoming request into S3 operation buckets, using headers when needed.
+/// (CopyObject is distinguished from PutObject via x-amz-copy-source.)
+pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap>) -> S3RequestClass {
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     let query = QueryParams::from_uri(uri);
 
@@ -266,6 +268,21 @@ pub fn classify(method: &str, uri: &Uri) -> S3RequestClass {
             key,
             query,
             op: S3Op::Read(ReadOp::ListObjectsV2),
+        };
+    }
+
+    // CopyObject: PUT /{bucket}/{key} with *no* query params and x-amz-copy-source
+    if method == "PUT"
+        && bucket.is_some()
+        && key.is_some()
+        && query.is_empty()
+        && headers.is_some_and(|h| h.get("x-amz-copy-source").is_some())
+    {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Write(WriteOp::CopyObject),
         };
     }
 

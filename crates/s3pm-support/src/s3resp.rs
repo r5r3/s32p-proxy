@@ -328,6 +328,20 @@ pub fn put_object_ok(etag: &str) -> HttpResponse {
     resp
 }
 
+/// Convenience: CopyObject success (200, REST-XML CopyObjectResult).
+/// Includes ETag header and keeps the "server" header consistent with gateway responses.
+pub fn copy_object_ok(etag: &str, last_modified: &str) -> HttpResponse {
+    let body = s3xml::copy_object_result_body(last_modified, etag).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, [
+        ("etag", etag.to_string()),
+    ]);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
 /// Convenience: DeleteObject success (204, empty body).
 /// DeleteObject is idempotent; missing keys still return success.
 pub fn delete_object_no_content() -> HttpResponse {

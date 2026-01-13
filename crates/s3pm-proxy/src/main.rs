@@ -81,7 +81,7 @@ impl ProxyHttp for S3ProxyApp {
         // Classify (no body required).
         // This logic is shared with the gateway now (in s3pm-support),
         // so routing decisions won't drift.
-        let class = s3pm_support::classifier::classify(req.method.as_str(), &req.uri);
+        let class = s3pm_support::classifier::classify_with_headers(req.method.as_str(), &req.uri, Some(&req.headers));
         let key = s3pm_support::classifier::class_key(&class);
 
         // Determine route action from config.
