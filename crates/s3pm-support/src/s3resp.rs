@@ -364,3 +364,60 @@ pub fn delete_objects_result(
     resp
 }
 
+/* -------------------------
+ * Multipart helpers
+ * ------------------------- */
+
+pub fn create_multipart_upload_ok(bucket: &str, key: &str, upload_id: &str) -> HttpResponse {
+    let body = s3xml::initiate_multipart_upload_result_body(bucket, key, upload_id)
+        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+pub fn upload_part_ok(etag: &str) -> HttpResponse {
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", Vec::new(), [
+        ("etag", etag.to_string()),
+    ]);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+pub fn list_multipart_uploads_ok(bucket: &str, uploads: &[s3xml::MultipartUploadInfo]) -> HttpResponse {
+    let body = s3xml::list_multipart_uploads_body(bucket, uploads)
+        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+pub fn list_parts_ok(bucket: &str, key: &str, upload_id: &str, parts: &[s3xml::MultipartPartInfo]) -> HttpResponse {
+    let body = s3xml::list_parts_body(bucket, key, upload_id, parts)
+        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+pub fn complete_multipart_upload_ok(location: &str, bucket: &str, key: &str, etag: &str) -> HttpResponse {
+    let body = s3xml::complete_multipart_upload_result_body(location, bucket, key, etag)
+        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, [
+        ("etag", etag.to_string()),
+    ]);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+pub fn abort_multipart_upload_no_content() -> HttpResponse {
+    let mut resp = response_bytes(StatusCode::NO_CONTENT, "application/xml", Vec::new(), []);
+    resp.headers_mut().insert("server", "s3pm-gateway".parse().unwrap());
+    resp
+}
+
+

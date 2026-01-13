@@ -25,6 +25,9 @@ pub mod error_code {
 
     // Used by gateway for bucket-level operations.
     pub const NO_SUCH_BUCKET: &str = "NoSuchBucket";
+
+    // Used for multipart uploads
+    pub const NO_SUCH_UPLOAD: &str = "NoSuchUpload";
 }
 
 /// Minimal bucket info used by ListBuckets.
@@ -211,6 +214,161 @@ pub fn delete_objects_result_body(deleted_keys: &[String], errors: &[DeleteError
 
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
+}
+
+/* -------------------------
+ * Multipart Upload responses
+ * ------------------------- */
+
+#[derive(Clone, Debug)]
+pub struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: String, // ISO8601 Z
+}
+
+#[derive(Clone, Debug)]
+pub struct MultipartPartInfo {
+    pub part_number: u32,
+    pub last_modified: String, // ISO8601 Z
+    pub etag: String,          // include quotes
+    pub size: u64,
+}
+
+pub fn initiate_multipart_upload_result_body(bucket: &str, key: &str, upload_id: &str) -> Result<Vec<u8>> {
+    let doc = InitiateMultipartUploadResultDoc {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+    };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+pub fn list_multipart_uploads_body(bucket: &str, uploads: &[MultipartUploadInfo]) -> Result<Vec<u8>> {
+    let doc = ListMultipartUploadsResultDoc {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        uploads: uploads.iter().map(|u| UploadEntry {
+            key: u.key.clone(),
+            upload_id: u.upload_id.clone(),
+            initiated: u.initiated.clone(),
+        }).collect(),
+    };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+pub fn list_parts_body(bucket: &str, key: &str, upload_id: &str, parts: &[MultipartPartInfo]) -> Result<Vec<u8>> {
+    let doc = ListPartsResultDoc {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+        parts: parts.iter().map(|p| PartEntry {
+            part_number: p.part_number,
+            last_modified: p.last_modified.clone(),
+            etag: p.etag.clone(),
+            size: p.size,
+        }).collect(),
+    };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+pub fn complete_multipart_upload_result_body(location: &str, bucket: &str, key: &str, etag: &str) -> Result<Vec<u8>> {
+    let doc = CompleteMultipartUploadResultDoc {
+        xmlns: S3_XMLNS,
+        location: location.to_string(),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        etag: etag.to_string(),
+    };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+struct InitiateMultipartUploadResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListMultipartUploadsResult")]
+struct ListMultipartUploadsResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Bucket")]
+    bucket: String,
+
+    #[serde(rename = "Upload", default, skip_serializing_if = "Vec::is_empty")]
+    uploads: Vec<UploadEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadEntry {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+    #[serde(rename = "Initiated")]
+    initiated: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListPartsResult")]
+struct ListPartsResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+
+    #[serde(rename = "Part", default, skip_serializing_if = "Vec::is_empty")]
+    parts: Vec<PartEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct PartEntry {
+    #[serde(rename = "PartNumber")]
+    part_number: u32,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+    #[serde(rename = "Size")]
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
+struct CompleteMultipartUploadResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Location")]
+    location: String,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "ETag")]
+    etag: String,
 }
 
 /* -------------------------

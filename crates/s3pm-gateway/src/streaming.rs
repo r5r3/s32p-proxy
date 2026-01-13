@@ -855,6 +855,112 @@ pub async fn write_object_body_to_file(
     Ok(())
 }
 
+pub async fn write_object_body_to_existing_file_at(
+    body: Incoming,
+    file: Arc<std::fs::File>,
+    start_off: u64,
+    logical_len: u64,
+    is_streaming_sigv4: bool,
+    cfg: StreamCfg,
+    uring: Arc<UringIO>,
+    pool: Arc<BufPool>,
+) -> Result<()> {
+    let chunk = cfg.chunk_size;
+    let inflight_cfg = cfg.inflight.max(1);
+
+    if logical_len == 0 {
+        // nothing to write
+        return Ok(());
+    }
+
+    // IMPORTANT: for multipart we MUST NOT pad (would corrupt internal layout),
+    // therefore we do not use O_DIRECT here even if cfg.direct_io is set.
+    let direct = false;
+    let _ = direct;
+
+    // Per-part depth
+    let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
+    let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
+    let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
+
+    let sender = uring.sender(file.clone());
+    let cancel = sender.cancel_token().clone();
+
+    let data_stream = body.into_data_stream().map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
+    });
+
+    enum Src<S> {
+        Plain(PlainFrameReader<S>),
+        Aws(aws_chunked::Decoder<S>),
+    }
+
+    impl<S> Src<S>
+    where
+        S: Stream<Item = io::Result<Bytes>> + Unpin,
+    {
+        async fn read_exact_payload(&mut self, dst: &mut [u8]) -> io::Result<()> {
+            match self {
+                Src::Plain(p) => p.read_exact_payload(dst).await,
+                Src::Aws(d) => d.read_exact_payload(dst).await,
+            }
+        }
+
+        async fn finish(self) -> io::Result<()> {
+            match self {
+                Src::Plain(p) => p.ensure_eof().await,
+                Src::Aws(d) => d.drain_to_eof().await,
+            }
+        }
+    }
+
+    let mut src = if is_streaming_sigv4 {
+        Src::Aws(aws_chunked::Decoder::new(data_stream))
+    } else {
+        Src::Plain(PlainFrameReader::new(data_stream))
+    };
+
+    let mut off_in_part: u64 = 0;
+    let mut tx_dead = false;
+
+    while off_in_part < logical_len {
+        let remaining = (logical_len - off_in_part) as usize;
+        let real_len = std::cmp::min(chunk, remaining);
+
+        let mut pooled = pool
+            .acquire_for_stream(&stream_sem)
+            .await
+            .map_err(|_| anyhow!("buffer pool closed"))?;
+
+        src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
+            .await
+            .map_err(|e| anyhow!("read payload failed at off={}: {e}", start_off + off_in_part))?;
+
+        if tx_dead || cancel.is_cancelled() {
+            drop(pooled);
+        } else {
+            let dst_off = start_off + off_in_part;
+            tokio::select! {
+                r = sender.write(dst_off, real_len, pooled) => {
+                    if r.is_err() { tx_dead = true; }
+                }
+                _ = cancel.cancelled() => {
+                    tx_dead = true;
+                }
+            }
+        }
+
+        off_in_part += real_len as u64;
+    }
+
+    sender.close();
+
+    // Drain/validate remaining HTTP framing for keep-alive correctness
+    src.finish().await.map_err(|e| anyhow!("{e}"))?;
+
+    sender.wait().await?;
+    Ok(())
+}
 
 pub async fn copy_file_to_file(
     src_path: PathBuf,

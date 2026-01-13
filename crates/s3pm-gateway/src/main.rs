@@ -6,6 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod buffer;
 mod streaming;
 mod uring_io;
+mod multipart;
 
 #[cfg(feature = "lustre")]
 mod lustre;
@@ -394,14 +395,18 @@ async fn handle_head_bucket(
     }
 }
 
-async fn handle_multipart(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
+async fn handle_multipart(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
     let cfg = app.cfg.clone();
 
     if let Err(resp) = require_sigv4(&req, &cfg) {
         return resp;
     }
 
-    s3pm_support::s3resp::not_implemented("multipart uploads are not implemented", None)
+    crate::multipart::handle(req, app, class).await
 }
 
 async fn handle_versioning(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {

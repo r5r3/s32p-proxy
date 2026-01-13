@@ -65,15 +65,15 @@ workers:
 
 routing:
   class_map:
-    multipart:
-      action: "not_implemented"
-      message: "multipart uploads are not implemented"
     versioning:
       action: "not_implemented"
       message: "versioning is not implemented"
     object_lock:
       action: "not_implemented"
       message: "object lock is not implemented"
+    multipart:
+      action: "proxy"
+      worker_profile: "s3pm-gateway"
     read:
       action: "proxy"
       worker_profile: "s3pm-gateway"
