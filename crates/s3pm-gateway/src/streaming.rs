@@ -7,7 +7,7 @@ use hyper::body::{Body, Incoming, Frame};
 use libc::O_DIRECT;
 use std::convert::Infallible;
 use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, FileExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,37 +163,60 @@ async fn stream_range_task(
         return Ok(());
     }
 
-    let eff_end = effective_end_for_scheduling(file_size, seg_start, seg_end, chunk, direct);
-    let needed = chunks_needed(seg_start, eff_end, chunk);
-    if needed == 0 {
-        return Ok(());
+    // Largest aligned prefix we can safely read with O_DIRECT without crossing EOF.
+    let aligned_size = align_down(file_size, a);
+
+    // If direct, cap streaming end to aligned_size (NOT align_up(file_size)).
+    let direct_end = if direct {
+        std::cmp::min(seg_end, aligned_size)
+    } else {
+        seg_end
+    };
+
+    // If there is nothing to do in the direct segment, skip it.
+    if direct_end > seg_start {
+        let eff_end = direct_end;
+        let needed = chunks_needed(seg_start, eff_end, chunk);
+        if needed == 0 {
+            return Ok(());
+        }
+
+        let allowed = std::cmp::min(inflight_cfg, needed);
+        let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
+
+        let std_file = open_std_file(&path, direct)?;
+        let file = Arc::new(std_file);
+        let sender = uring.sender(file.clone());
+
+        stream_segment(
+            &sender,
+            file_size,
+            seg_start,
+            direct_end,       // <-- capped
+            want.start,
+            want.end_excl,
+            chunk,
+            allowed,
+            direct,
+            pool.clone(),
+            stream_sem,
+            &mut out,
+        )
+        .await?;
     }
 
-    // number of allowed IO operations inflight. we need enought buffers to 
-    // directly submit the next batch.
-    let allowed = std::cmp::min(inflight_cfg, needed);
-    let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
+    // Buffered tail (only if request actually needs bytes beyond direct_end).
+    let tail_start = std::cmp::max(want.start, direct_end);
+    let tail_end = std::cmp::min(want.end_excl, file_size);
 
-    let std_file = open_std_file(&path, direct)?;
-    let file = Arc::new(std_file);
+    if tail_end > tail_start {
+        let tail_len = (tail_end - tail_start) as usize;
+        let b = read_tail_bytes(&path, pool.clone(), tail_start, tail_len).await?;
 
-    let sender = uring.sender(file.clone());
-
-    stream_segment(
-        &sender,
-        file_size,
-        seg_start,
-        seg_end,
-        want.start,
-        want.end_excl,
-        chunk,
-        allowed,
-        direct,
-        pool,
-        stream_sem,
-        &mut out,
-    )
-    .await?;
+        if !b.is_empty() {
+            let _ = out.send(Ok(Frame::data(b))).await;
+        }
+    }
 
     Ok(())
 }
@@ -205,6 +228,42 @@ fn open_std_file(path: &Path, direct: bool) -> Result<std::fs::File> {
         oo.custom_flags(O_DIRECT);
     }
     oo.open(path).map_err(|e| anyhow!("{e}"))
+}
+
+async fn read_tail_bytes(
+    path: &Path,
+    pool: Arc<BufPool>,
+    off: u64,
+    len: usize,
+) -> Result<Bytes> {
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+
+    let file = Arc::new(OpenOptions::new().read(true).open(path).map_err(|e| anyhow!("{e}"))?);
+
+    let pooled = pool
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("buffer pool closed"))?;
+
+    let (n, pooled) = tokio::task::spawn_blocking(move || -> Result<(usize, PooledBuf)> {
+        let mut pooled = pooled;
+        let dst = &mut pooled.as_mut_bytes()[..len];
+        let n = file
+            .read_at(dst, off)
+            .map_err(|e| anyhow!("tail read_at failed at off={off}: {e}"))?;
+        Ok((n, pooled))
+    })
+    .await
+    .map_err(|e| anyhow!("tail read join error: {e}"))??;
+
+    if n == 0 {
+        return Err(anyhow!("tail unexpected EOF at off={off}"));
+    }
+
+    tracing::debug!("tail read {} bytes", n);
+    Ok(Bytes::from_owner(SliceOwner::new(pooled, 0, n)))
 }
 
 async fn read_one(
@@ -253,13 +312,12 @@ async fn stream_segment(
     let a = ALIGN as u64;
     let mut next_off = seg_start;
 
+    // IMPORTANT: with O_DIRECT we must not issue reads that extend past EOF.
+    // So only stream up to the *largest aligned prefix* of the file.
+    // The remaining (non-aligned) tail must be handled separately (buffered, read_tail_bytes).
     let effective_end = if direct {
-        if file_size == 0 {
-            seg_start
-        } else {
-            let work_end = align_down(file_size.saturating_sub(1), a) + a;
-            std::cmp::min(seg_end, work_end)
-        }
+        let aligned_eof = align_down(file_size, a); // <= file_size, multiple of ALIGN
+        std::cmp::min(seg_end, aligned_eof)
     } else {
         seg_end
     };
