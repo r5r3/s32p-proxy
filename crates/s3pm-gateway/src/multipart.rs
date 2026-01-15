@@ -727,7 +727,7 @@ async fn handle_upload_part(
         Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
     };
 
-    let meta = match read_meta(&dir) {
+    let mut meta = match read_meta(&dir) {
         Ok(m) => m,
         Err(_) => return no_such_upload(Some(req.uri().path())),
     };
@@ -745,13 +745,47 @@ async fn handle_upload_part(
         );
     }
 
-    // Decide where to store:
-    // - If assumed_part_size exists: put into direct.bin at (pn-1)*assumed_part_size
-    // - Else: if we can place sequentially (all previous parts are direct + contiguous), do that
-    // - Else: store as per-part file
+    // Decide where to store, but first possibly "promote" assumed_part_size
+    // based on just the headers (logical_len + part_number).
+    //
+    // New behavior:
+    // - If part 1 arrives and assumed_part_size is None: set assumed_part_size = logical_len immediately.
+    // - If assumed_part_size is None and this part's size matches any existing part size: set assumed_part_size = logical_len.
+    // - Only do this early meta write when assumed_part_size is currently None.
+    // - If assumed_part_size is already set: do NOT write meta here (no two-phase part entry).
+    if meta.assumed_part_size.is_none() {
+        let should_set_assumed = if part_number == 1 {
+            true
+        } else {
+            // If any already-uploaded part has exactly this size, then after accepting this part
+            // we'll have >=2 parts with the same size -> promote immediately.
+            meta.parts.values().any(|p| p.size == logical_len)
+        };
+
+        if should_set_assumed {
+            meta.assumed_part_size = Some(logical_len);
+
+            // Persist assumed_part_size before writing bytes.
+            // This reduces the window where multiple concurrent part uploads all think assumed is None.
+            if let Err(e) = write_meta_atomic(&dir, &meta) {
+                return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+            }
+        }
+    }
+
+    // Compute placement based on (possibly updated) assumed_part_size.
+    //
+    // IMPORTANT SAFETY GUARD:
+    // - If assumed is set, only place into direct.bin if logical_len <= assumed.
+    //   (If logical_len > assumed and we wrote it at (pn-1)*assumed we'd risk overlap/corruption.)
     let direct_off = if let Some(s) = meta.assumed_part_size {
-        Some((part_number as u64 - 1) * s)
+        if logical_len <= s {
+            Some((part_number as u64 - 1) * s)
+        } else {
+            None
+        }
     } else {
+        // As before: only place sequentially into direct if previous parts are direct + contiguous.
         compute_sequential_direct_offset(&meta, part_number)
     };
 
