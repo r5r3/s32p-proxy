@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::os::unix::io::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -19,8 +19,14 @@ use std::time::SystemTime;
 use tokio::sync::Semaphore;
 
 use crate::buffer::BufPool;
-use crate::streaming::{StreamCfg, write_object_body_to_existing_file_at, write_object_body_to_file};
 use crate::uring_io::UringIO;
+use crate::streaming::{
+    copy_file_to_file,
+    direct_io_ok_for_aligned_range,
+    write_object_body,
+    StreamCfg,
+    WriteObjectDest,
+};
 
 type Resp = s3pm_support::s3resp::HttpResponse;
 
@@ -215,6 +221,24 @@ fn ftruncate_file(file: &std::fs::File, len: u64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_cross_device(src_dir: &Path, dst_path: &Path) -> bool {
+    let Ok(src_md) = fs::metadata(src_dir) else { return false };
+    let Some(dst_parent) = dst_path.parent() else { return false };
+    let Ok(dst_md) = fs::metadata(dst_parent) else { return false };
+    src_md.dev() != dst_md.dev()
+}
+
+fn dst_tmp_path(dst_path: &Path, upload_id: &str) -> Result<PathBuf> {
+    let parent = dst_path
+        .parent()
+        .ok_or_else(|| anyhow!("dst_path has no parent: {}", dst_path.display()))?;
+    Ok(parent.join(format!(".s3pm-mpu-tmp-{upload_id}")))
+}
+
+fn is_exdev(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EXDEV)
 }
 
 /// Copy a byte range [0..len) from src file (starting at src_off0) into dst file (starting at dst_off0)
@@ -741,34 +765,75 @@ async fn handle_upload_part(
     let etag = format!("\"p{}-{}\"", part_number, logical_len);
 
     if let Some(off) = direct_off {
-        // Write into direct.bin at offset
+        // Decide direct IO for THIS part+offset (multipart writes MUST NOT pad, so only use O_DIRECT when fully aligned).
+        let mut part_cfg = StreamCfg {
+            chunk_size: cfg.chunk_size,
+            inflight: cfg.inflight,
+            direct_io: cfg.direct_io,
+        };
+
+        let mut use_direct = direct_io_ok_for_aligned_range(off, logical_len, &part_cfg);
+
+        // Open direct.bin; if direct is requested but not supported, fall back to buffered.
         let direct_path = upload_direct_path(&dir);
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&direct_path)
-        {
-            Ok(f) => Arc::new(f),
-            Err(e) => {
-                return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+
+        let file = {
+            let mut oo = OpenOptions::new();
+            oo.read(true).write(true).create(true);
+
+            if use_direct {
+                oo.custom_flags(libc::O_DIRECT);
+            }
+
+            match oo.open(&direct_path) {
+                Ok(f) => Arc::new(f),
+                Err(e) if use_direct => {
+                    tracing::warn!("open direct.bin with O_DIRECT failed (falling back): {e}");
+                    use_direct = false;
+
+                    let f2 = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(&direct_path)
+                        .with_context(|| format!("open direct.bin {}", direct_path.display()))
+                        .map_err(|e| {
+                            return s3pm_support::s3resp::internal_error(
+                                &e.to_string(),
+                                Some(parts.uri.path()),
+                                None,
+                            );
+                        });
+
+                    match f2 {
+                        Ok(f) => Arc::new(f),
+                        Err(resp) => return resp,
+                    }
+                }
+                Err(e) => {
+                    return s3pm_support::s3resp::internal_error(
+                        &e.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
+                }
             }
         };
 
-        if let Err(e) = write_object_body_to_existing_file_at(
+        // IMPORTANT: align the function behavior with how we opened the file.
+        part_cfg.direct_io = use_direct;
+
+        if let Err(e) = write_object_body(
             body,
-            file.clone(),
-            off,
+            WriteObjectDest::File { file: file.clone(), start_off: off },
             logical_len,
             is_streaming_sigv4,
-            StreamCfg {
-                chunk_size: cfg.chunk_size,
-                inflight: cfg.inflight,
-                direct_io: false, // see writer: no padding
-            },
+            part_cfg,
             app.uring.clone(),
             app.pool.clone(),
-        ).await {
+        )
+        .await
+        {
             return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
         }
 
@@ -806,16 +871,18 @@ async fn handle_upload_part(
         }
 
         s3pm_support::s3resp::upload_part_ok(&etag)
+
     } else {
+
         // Store as individual part file
         let parts_dir = upload_parts_dir(&dir);
         let name = part_file_name(part_number);
         let final_path = parts_dir.join(&name);
         let tmp_path = parts_dir.join(format!("{name}.tmp"));
 
-        if let Err(e) = write_object_body_to_file(
+        if let Err(e) = write_object_body(
             body,
-            tmp_path.clone(),
+            WriteObjectDest::Path { path: tmp_path.clone() },
             logical_len,
             is_streaming_sigv4,
             StreamCfg {
@@ -825,7 +892,9 @@ async fn handle_upload_part(
             },
             app.uring.clone(),
             app.pool.clone(),
-        ).await {
+        )
+        .await
+        {
             let _ = fs::remove_file(&tmp_path);
             return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
         }
@@ -1116,37 +1185,130 @@ async fn handle_complete(
                 tracing::warn!("fast path disabled: truncate failed: {e}");
             } else {
                 // Remove existing dst if needed (portable)
-                if dst_path.exists() {
-                    let _ = fs::remove_file(&dst_path);
-                }
                 if let Err(e) = fs::rename(&direct_path, &dst_path) {
-                    can_fast = false;
-                    tracing::warn!("fast path disabled: rename direct->dst failed: {e}");
+                    // Cross-device? do a single copy direct.bin -> dst_tmp, then rename tmp -> dst.
+                    if is_exdev(&e) {
+                        let dst_tmp = match dst_tmp_path(&dst_path, upload_id) {
+                            Ok(p) => p,
+                            Err(err) => {
+                                can_fast = false;
+                                tracing::warn!("fast path disabled: cannot build dst tmp path: {err}");
+                                // fall through to fallback
+                                // (no break/return)
+                                PathBuf::new()
+                            }
+                        };
+
+                        if can_fast {
+                            let _ = fs::remove_file(&dst_tmp);
+
+                            // Copy the already-assembled direct.bin into destination tmp (avoid re-assembly).
+                            let copy_cfg = StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false };
+                            match copy_file_to_file(
+                                direct_path.clone(),
+                                dst_tmp.clone(),
+                                final_size,
+                                copy_cfg,
+                                app.uring.clone(),
+                                app.pool.clone(),
+                            ).await {
+                                Ok(()) => {
+                                    if dst_path.exists() {
+                                        let _ = fs::remove_file(&dst_path);
+                                    }
+                                    if let Err(e2) = fs::rename(&dst_tmp, &dst_path) {
+                                        can_fast = false;
+                                        tracing::warn!("fast path disabled: rename tmp->dst failed: {e2}");
+                                        let _ = fs::remove_file(&dst_tmp);
+                                    } else {
+                                        meta.state = UploadState::Completed;
+                                        let _ = write_meta_atomic(&dir, &meta);
+                                        let _ = fs::remove_dir_all(&dir);
+
+                                        let m = match fs::metadata(&dst_path) {
+                                            Ok(m) => m,
+                                            Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+                                        };
+                                        let etag = format!("\"{}\"", m.ino());
+                                        return s3pm_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag);
+                                    }
+                                }
+                                Err(err) => {
+                                    can_fast = false;
+                                    tracing::warn!("fast path disabled: copy direct->dst_tmp failed: {err}");
+                                    let _ = fs::remove_file(&dst_tmp);
+                                }
+                            }
+                        }
+                    } else {
+                        can_fast = false;
+                        tracing::warn!("fast path disabled: rename direct->dst failed: {e}");
+                    }
                 } else {
                     meta.state = UploadState::Completed;
                     let _ = write_meta_atomic(&dir, &meta);
-
-                    // cleanup upload dir (direct is gone now)
                     let _ = fs::remove_dir_all(&dir);
 
-                    // response etag from final object inode (consistent with gateway)
                     let m = match fs::metadata(&dst_path) {
                         Ok(m) => m,
                         Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
                     };
                     let etag = format!("\"{}\"", m.ino());
-
                     return s3pm_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag);
                 }
             }
         }
     }
 
-    // Fallback: assemble into a staging file within upload dir, then rename to final.
-    let staged_out = dir.join("complete.bin");
-    let out_file = match OpenOptions::new().write(true).create(true).truncate(true).open(&staged_out) {
+    // Fallback: assemble into a staging file.
+    // If dst is on a different filesystem than the upload dir, assemble directly into a tmp file
+    // located next to the final destination (avoids an extra copy).
+    let cross_dev = is_cross_device(&dir, &dst_path);
+
+    let mut staged_in_dst = false;
+    let mut staged_out: PathBuf = dir.join("complete.bin");
+
+    if cross_dev {
+        match dst_tmp_path(&dst_path, upload_id) {
+            Ok(p) => {
+                staged_out = p;
+                staged_in_dst = true;
+            }
+            Err(e) => {
+                tracing::warn!("cannot compute dst tmp path (falling back to upload staging): {e}");
+                staged_in_dst = false;
+            }
+        }
+    }
+
+    // Best-effort cleanup of previous temp/stage file.
+    let _ = fs::remove_file(&staged_out);
+
+    // Open staging output. If staging in dst fails, fall back to upload dir staging.
+    let out_file: Arc<std::fs::File> = match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staged_out)
+    {
         Ok(f) => Arc::new(f),
-        Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+        Err(e) if staged_in_dst => {
+            tracing::warn!("cannot open dst tmp for assembly (falling back to upload staging): {e}");
+            staged_in_dst = false;
+
+            staged_out = dir.join("complete.bin");
+            let _ = fs::remove_file(&staged_out);
+
+            match OpenOptions::new().write(true).create(true).truncate(true).open(&staged_out) {
+                Ok(f) => Arc::new(f),
+                Err(e) => {
+                    return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+                }
+            }
+        }
+        Err(e) => {
+            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+        }
     };
 
     let direct_path = upload_direct_path(&dir);
@@ -1201,12 +1363,65 @@ async fn handle_complete(
         return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
     }
 
-    // Rename staged output into final destination
+    // Ensure exact size (in case of sparse extension)
+    if let Err(e) = ftruncate_file(&out_file, out_off) {
+        let _ = fs::remove_file(&staged_out);
+        return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+    }
+
+    // Close before rename on some FS implementations
+    drop(out_file);
+
+    // Commit staged output into final destination
     if dst_path.exists() {
         let _ = fs::remove_file(&dst_path);
     }
-    if let Err(e) = fs::rename(&staged_out, &dst_path) {
-        return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+
+    if staged_in_dst {
+        // Same filesystem as destination => atomic rename, no extra copy.
+        if let Err(e) = fs::rename(&staged_out, &dst_path) {
+            let _ = fs::remove_file(&staged_out);
+            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+        }
+    } else {
+        // Old behavior: rename if possible, else EXDEV => copy to dst tmp then rename.
+        match fs::rename(&staged_out, &dst_path) {
+            Ok(()) => {}
+            Err(e) if is_exdev(&e) => {
+                let dst_tmp = match dst_tmp_path(&dst_path, upload_id) {
+                    Ok(p) => p,
+                    Err(err) => return s3pm_support::s3resp::internal_error(&err.to_string(), Some(parts.uri.path()), None),
+                };
+                let _ = fs::remove_file(&dst_tmp);
+
+                let copy_cfg = StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false };
+                if let Err(err) = copy_file_to_file(
+                    staged_out.clone(),
+                    dst_tmp.clone(),
+                    out_off,
+                    copy_cfg,
+                    app.uring.clone(),
+                    app.pool.clone(),
+                ).await {
+                    let _ = fs::remove_file(&dst_tmp);
+                    return s3pm_support::s3resp::internal_error(&err.to_string(), Some(parts.uri.path()), None);
+                }
+
+                if dst_path.exists() {
+                    let _ = fs::remove_file(&dst_path);
+                }
+                if let Err(e2) = fs::rename(&dst_tmp, &dst_path) {
+                    let _ = fs::remove_file(&dst_tmp);
+                    return s3pm_support::s3resp::internal_error(&e2.to_string(), Some(parts.uri.path()), None);
+                }
+
+                // best-effort remove original staged_out after successful cross-dev copy
+                let _ = fs::remove_file(&staged_out);
+            }
+            Err(e) => {
+                return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            }
+        }
     }
 
     meta.state = UploadState::Completed;

@@ -506,12 +506,16 @@ where
     }
 }
 
-fn try_preallocate(fd: RawFd, len: u64) -> Result<()> {
+fn try_preallocate_range(fd: RawFd, start: u64, len: u64) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
 
-    let rc = unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) };
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("preallocate range overflow: start={start} len={len}"))?;
+
+    let rc = unsafe { libc::fallocate(fd, 0, start as libc::off_t, len as libc::off_t) };
     if rc == 0 {
         return Ok(());
     }
@@ -522,13 +526,13 @@ fn try_preallocate(fd: RawFd, len: u64) -> Result<()> {
         || errno == libc::EINVAL
         || errno == libc::ENOTSUP
     {
-        tracing::debug!(errno, "fallocate not supported; setting size with ftruncate.");
+        tracing::debug!(errno, "fallocate(range) not supported; setting size with ftruncate.");
 
-        // try to use ftruncate instead
-        return ftruncate_fd(fd, len);
-    } else {
-        Err(anyhow!("posix_fallocate({len}) failed: {}", errno))
+        // Ensure file is at least large enough.
+        return ftruncate_fd(fd, end);
     }
+
+    Err(anyhow!("fallocate(start={start}, len={len}) failed: errno={errno}"))
 }
 
 fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
@@ -747,9 +751,49 @@ pub mod aws_chunked {
     }
 }
 
-pub async fn write_object_body_to_file(
+/// Destination for an upload write.
+pub enum WriteObjectDest {
+    /// Create/truncate and write the whole object starting at offset 0.
+    Path { path: PathBuf },
+
+    /// Write into an already-open file at a fixed start offset (no truncate).
+    File { file: Arc<std::fs::File>, start_off: u64 },
+}
+
+/// For multipart (or any ranged write), we can only use O_DIRECT when:
+/// - direct_io is enabled
+/// - chunk_size is ALIGN-aligned
+/// - start_off and len are ALIGN-aligned
+/// - len >= chunk_size (avoid tiny O_DIRECT writes)
+pub fn direct_io_ok_for_aligned_range(start_off: u64, len: u64, cfg: &StreamCfg) -> bool {
+    let a = ALIGN as u64;
+
+    if !cfg.direct_io {
+        return false;
+    }
+    if cfg.chunk_size % ALIGN != 0 {
+        return false;
+    }
+    if len <= cfg.chunk_size as u64 {
+        return false;
+    }
+    if (start_off % a) != 0 {
+        return false;
+    }
+    if (len % a) != 0 {
+        return false;
+    }
+
+    true
+}
+
+/// Combined upload writer:
+/// - For `WriteObjectDest::Path`: creates/truncates file, may use O_DIRECT and padding, and truncates to `logical_len`.
+/// - For `WriteObjectDest::File`: writes at `start_off` into an existing file, NEVER pads, and only uses O_DIRECT
+///   when the offset+len are aligned and the caller opened the file accordingly.
+pub async fn write_object_body(
     body: Incoming,
-    path: PathBuf,
+    dest: WriteObjectDest,
     logical_len: u64,
     is_streaming_sigv4: bool,
     cfg: StreamCfg,
@@ -760,8 +804,12 @@ pub async fn write_object_body_to_file(
     let inflight_cfg = cfg.inflight.max(1);
     let a = ALIGN as u64;
 
-    // Decide direct I/O
-    let mut direct = cfg.direct_io && logical_len > chunk as u64;
+    // Decide direct I/O (final decision used for scheduling/padding behavior).
+    let mut direct = match &dest {
+        WriteObjectDest::Path { .. } => cfg.direct_io && logical_len > chunk as u64,
+        WriteObjectDest::File { start_off, .. } => direct_io_ok_for_aligned_range(*start_off, logical_len, &cfg),
+    };
+
     if direct && (chunk % ALIGN != 0) {
         tracing::warn!(
             chunk,
@@ -770,51 +818,67 @@ pub async fn write_object_body_to_file(
         direct = false;
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
-    }
+    // Resolve file + start offset + whether we should truncate to logical_len at the end.
+    let (file, start_off, truncate_to_logical) = match dest {
+        WriteObjectDest::Path { path } => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
+            }
 
-    let file = {
-        let mut oo = OpenOptions::new();
-        oo.write(true).create(true).truncate(true);
-        if direct {
-            oo.custom_flags(O_DIRECT);
+            let std_file = {
+                let mut oo = OpenOptions::new();
+                oo.write(true).create(true).truncate(true);
+                if direct {
+                    oo.custom_flags(O_DIRECT);
+                }
+                oo.open(&path)
+                    .map_err(|e| anyhow!("open {}: {e}", path.display()))?
+            };
+            let file = Arc::new(std_file);
+
+            // Preallocate best-effort. For O_DIRECT we may write an aligned tail,
+            // so preallocate the aligned size.
+            let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
+            try_preallocate_range(file.as_raw_fd(), 0, prealloc_len)?;
+
+            // Lustre: best-effort lockahead hint for the whole file range we expect to write.
+            #[cfg(feature = "lustre")]
+            crate::lustre::advise_locknoexpand_and_lockahead_write(file.as_raw_fd(), 0, prealloc_len);
+
+            (file, 0u64, true)
         }
-        oo.open(&path)
-            .map_err(|e| anyhow!("open {}: {e}", path.display()))?
-    };
-    let file = Arc::new(file);
 
-    // Preallocate best-effort
-    let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
-    try_preallocate(file.as_raw_fd(), prealloc_len)?;
+        WriteObjectDest::File { file, start_off } => {
+            // For existing-file writes, we NEVER pad. If direct is enabled, ensure we can
+            // safely issue aligned writes and (best-effort) advise lockahead
+            #[cfg(feature = "lustre")]
+            {
+                let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
+                crate::lustre::advise_locknoexpand_and_lockahead_write(file.as_raw_fd(), start_off, prealloc_len);
+            }
+
+            (file, start_off, false)
+        }
+    };
 
     if logical_len == 0 {
-        ftruncate_fd(file.as_raw_fd(), 0)?;
+        if truncate_to_logical {
+            ftruncate_fd(file.as_raw_fd(), 0)?;
+        }
         return Ok(());
     }
 
-    // Lustre: best-effort lockahead hint for the whole file range we expect to write.
-    #[cfg(feature = "lustre")]
-    {
-        crate::lustre::advise_locknoexpand(file.as_raw_fd(), 0, prealloc_len);
-        crate::lustre::advise_lockahead_write(file.as_raw_fd(), 0, prealloc_len);
-    }
-
-    // Per-file depth / permits
+    // Per-write depth / permits
     let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
     let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
 
-    // Per-request sender (no per-request ring/thread)
+    // Per-request sender (shared ring)
     let sender = uring.sender(file.clone());
     let cancel = sender.cancel_token().clone();
 
-    // -------------------------
-    // Producer (async): decode + enqueue
-    // -------------------------
-
+    // Source stream (plain or AWS-chunked SigV4 streaming)
     let data_stream = body.into_data_stream().map_err(|e| {
         io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
     });
@@ -849,20 +913,33 @@ pub async fn write_object_body_to_file(
         Src::Plain(PlainFrameReader::new(data_stream))
     };
 
-    let mut off: u64 = 0;
+    let mut off_in_obj: u64 = 0;
     let mut tx_dead = false;
 
-    while off < logical_len {
-        let remaining = (logical_len - off) as usize;
+    while off_in_obj < logical_len {
+        let remaining = (logical_len - off_in_obj) as usize;
         let real_len = std::cmp::min(chunk, remaining);
 
-        let write_len = if direct {
+        // For new-file + O_DIRECT we may need to pad the final (short) chunk.
+        // For existing-file writes we MUST NOT pad (would corrupt layout).
+        let write_len = if direct && truncate_to_logical {
             if real_len == chunk {
                 chunk
             } else {
                 align_up(real_len as u64, a) as usize
             }
         } else {
+            // No padding path (includes multipart / existing-file writes).
+            if direct {
+                // Sanity: O_DIRECT requires aligned lengths/offsets.
+                if (real_len as u64) % a != 0 {
+                    return Err(anyhow!(
+                        "direct_io requires aligned write length; got len={} at off={}",
+                        real_len,
+                        start_off + off_in_obj
+                    ));
+                }
+            }
             real_len
         };
 
@@ -871,135 +948,31 @@ pub async fn write_object_body_to_file(
             .await
             .map_err(|_| anyhow!("buffer pool closed"))?;
 
+        // Always read exactly the payload bytes (no padding in the HTTP read).
         src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
             .await
-            .map_err(|e| anyhow!("read payload failed at off={off}: {e}"))?;
+            .map_err(|e| anyhow!("read payload failed at off={}: {e}", start_off + off_in_obj))?;
 
+        // Only pad for the new-file O_DIRECT tail case.
         if write_len > real_len {
-            tracing::debug!("zero-padding {} bytes at offset {}", write_len - real_len, off);
+            tracing::debug!(
+                "zero-padding {} bytes at offset {}",
+                write_len - real_len,
+                start_off + off_in_obj
+            );
             pooled.as_mut_bytes()[real_len..write_len].fill(0);
         }
 
-        // Even if cancelled, keep consuming body to keep the HTTP connection correct.
-        // But stop enqueueing once writer has failed / channel closed.
+        // Keep consuming the body even if cancelled; just stop enqueueing writes.
         if tx_dead || cancel.is_cancelled() {
             drop(pooled);
         } else {
-            // bounded async backpressure; also abort on cancellation
+            let dst_off = start_off
+                .checked_add(off_in_obj)
+                .ok_or_else(|| anyhow!("write offset overflow: start_off={start_off} off={off_in_obj}"))?;
+
             tokio::select! {
-                r = sender.write(off, write_len, pooled) => {
-                    if r.is_err() { tx_dead = true; }
-                }
-                _ = cancel.cancelled() => {
-                    // send future is dropped; WriteItem (and pooled) are dropped -> buffer returned to pool
-                    tx_dead = true;
-                }
-            }
-        }
-
-        off += real_len as u64;
-    }
-
-    sender.close();
-
-    // Drain/validate remaining HTTP framing for keep-alive correctness
-    src.finish().await.map_err(|e| anyhow!("{e}"))?;
-
-    // Wait for per-request completion
-    sender.wait().await?;
-
-    // Truncate padded tail
-    ftruncate_fd(file.as_raw_fd(), logical_len)?;
-    Ok(())
-}
-
-pub async fn write_object_body_to_existing_file_at(
-    body: Incoming,
-    file: Arc<std::fs::File>,
-    start_off: u64,
-    logical_len: u64,
-    is_streaming_sigv4: bool,
-    cfg: StreamCfg,
-    uring: Arc<UringIO>,
-    pool: Arc<BufPool>,
-) -> Result<()> {
-    let chunk = cfg.chunk_size;
-    let inflight_cfg = cfg.inflight.max(1);
-
-    if logical_len == 0 {
-        // nothing to write
-        return Ok(());
-    }
-
-    // IMPORTANT: for multipart we MUST NOT pad (would corrupt internal layout),
-    // therefore we do not use O_DIRECT here even if cfg.direct_io is set.
-    let direct = false;
-    let _ = direct;
-
-    // Per-part depth
-    let needed_chunks = ((logical_len + chunk as u64 - 1) / chunk as u64) as usize;
-    let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
-    let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
-
-    let sender = uring.sender(file.clone());
-    let cancel = sender.cancel_token().clone();
-
-    let data_stream = body.into_data_stream().map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
-    });
-
-    enum Src<S> {
-        Plain(PlainFrameReader<S>),
-        Aws(aws_chunked::Decoder<S>),
-    }
-
-    impl<S> Src<S>
-    where
-        S: Stream<Item = io::Result<Bytes>> + Unpin,
-    {
-        async fn read_exact_payload(&mut self, dst: &mut [u8]) -> io::Result<()> {
-            match self {
-                Src::Plain(p) => p.read_exact_payload(dst).await,
-                Src::Aws(d) => d.read_exact_payload(dst).await,
-            }
-        }
-
-        async fn finish(self) -> io::Result<()> {
-            match self {
-                Src::Plain(p) => p.ensure_eof().await,
-                Src::Aws(d) => d.drain_to_eof().await,
-            }
-        }
-    }
-
-    let mut src = if is_streaming_sigv4 {
-        Src::Aws(aws_chunked::Decoder::new(data_stream))
-    } else {
-        Src::Plain(PlainFrameReader::new(data_stream))
-    };
-
-    let mut off_in_part: u64 = 0;
-    let mut tx_dead = false;
-
-    while off_in_part < logical_len {
-        let remaining = (logical_len - off_in_part) as usize;
-        let real_len = std::cmp::min(chunk, remaining);
-
-        let mut pooled = pool
-            .acquire_for_stream(&stream_sem)
-            .await
-            .map_err(|_| anyhow!("buffer pool closed"))?;
-
-        src.read_exact_payload(&mut pooled.as_mut_bytes()[..real_len])
-            .await
-            .map_err(|e| anyhow!("read payload failed at off={}: {e}", start_off + off_in_part))?;
-
-        if tx_dead || cancel.is_cancelled() {
-            drop(pooled);
-        } else {
-            let dst_off = start_off + off_in_part;
-            tokio::select! {
-                r = sender.write(dst_off, real_len, pooled) => {
+                r = sender.write(dst_off, write_len, pooled) => {
                     if r.is_err() { tx_dead = true; }
                 }
                 _ = cancel.cancelled() => {
@@ -1008,7 +981,7 @@ pub async fn write_object_body_to_existing_file_at(
             }
         }
 
-        off_in_part += real_len as u64;
+        off_in_obj = off_in_obj.saturating_add(real_len as u64);
     }
 
     sender.close();
@@ -1016,7 +989,14 @@ pub async fn write_object_body_to_existing_file_at(
     // Drain/validate remaining HTTP framing for keep-alive correctness
     src.finish().await.map_err(|e| anyhow!("{e}"))?;
 
+    // Wait for io_uring completion
     sender.wait().await?;
+
+    // For new-file writes, ensure exact size (truncate away any O_DIRECT padding).
+    if truncate_to_logical {
+        ftruncate_fd(file.as_raw_fd(), logical_len)?;
+    }
+
     Ok(())
 }
 
@@ -1046,6 +1026,11 @@ pub async fn copy_file_to_file(
             .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
     }
 
+    // With O_DIRECT we must never issue reads past EOF. We'll copy only the aligned prefix via io_uring,
+    // and handle any unaligned tail via read_tail_bytes (buffered) + one final padded O_DIRECT write.
+    let aligned_size = if direct { align_down(file_size, a) } else { file_size };
+    let needs_tail = direct && aligned_size < file_size;
+
     let src_file = Arc::new(open_std_file(&src_path, direct)?);
 
     let dst_file = {
@@ -1061,7 +1046,7 @@ pub async fn copy_file_to_file(
     };
 
     let prealloc_len = if direct { align_up(file_size, a) } else { file_size };
-    try_preallocate(dst_file.as_raw_fd(), prealloc_len)?;
+    try_preallocate_range(dst_file.as_raw_fd(), 0, prealloc_len)?;
 
     if file_size == 0 {
         ftruncate_fd(dst_file.as_raw_fd(), 0)?;
@@ -1076,7 +1061,14 @@ pub async fn copy_file_to_file(
         crate::lustre::advise_lockahead_write(dst_file.as_raw_fd(), 0, prealloc_len);
     }
 
-    let needed_chunks = ((file_size + chunk as u64 - 1) / chunk as u64) as usize;
+    // Only schedule aligned prefix through uring when direct I/O is active.
+    let scheduled_size = aligned_size;
+
+    let needed_chunks = if scheduled_size == 0 {
+        0usize
+    } else {
+        ((scheduled_size + chunk as u64 - 1) / chunk as u64) as usize
+    };
     let allowed = std::cmp::min(inflight_cfg, needed_chunks.max(1));
     let stream_sem = Arc::new(Semaphore::new(allowed.max(1)));
 
@@ -1119,13 +1111,15 @@ pub async fn copy_file_to_file(
     let mut next_off: u64 = 0;
     let mut had_err: Option<anyhow::Error> = None;
 
-    let plan = |off: u64, file_size: u64, chunk: usize, direct: bool, a: u64| -> (usize, usize) {
-        let remaining = (file_size - off) as usize;
+    let plan = |off: u64, end: u64, chunk: usize, direct: bool, a: u64| -> (usize, usize) {
+        let remaining = (end - off) as usize;
         let real_len = std::cmp::min(chunk, remaining);
         let write_len = if direct {
             if real_len == chunk {
                 chunk
             } else {
+                // For the aligned prefix, remaining is always a multiple of ALIGN, so this is safe
+                // and will not extend past `end`.
                 align_up(real_len as u64, a) as usize
             }
         } else {
@@ -1134,50 +1128,14 @@ pub async fn copy_file_to_file(
         (real_len, write_len)
     };
 
-    // Initial fill
-    for _ in 0..allowed {
-        if next_off >= file_size {
-            break;
-        }
-        let (real_len, write_len) = plan(next_off, file_size, chunk, direct, a);
-        futs.push_back(read_for_copy(
-            &src_sender,
-            pool.clone(),
-            &stream_sem,
-            next_off,
-            write_len,
-            real_len,
-            write_len,
-        ));
-        next_off += real_len as u64;
-    }
-
-    while let Some(res) = futs.next().await {
-        match res {
-            Ok((off, write_len, pooled)) => {
-                if cancel_w.is_cancelled() || cancel_r.is_cancelled() {
-                    drop(pooled);
-                    had_err = had_err.or_else(|| Some(anyhow!("copy cancelled")));
-                    break;
-                }
-
-                if let Err(e) = dst_sender.write(off, write_len, pooled).await {
-                    had_err = Some(e);
-                    cancel_w.cancel();
-                    cancel_r.cancel();
-                    break;
-                }
-            }
-            Err(e) => {
-                had_err = Some(e);
-                cancel_w.cancel();
-                cancel_r.cancel();
+    // ---- Copy aligned prefix via io_uring (possibly empty) ----
+    if scheduled_size > 0 {
+        // Initial fill
+        for _ in 0..allowed {
+            if next_off >= scheduled_size {
                 break;
             }
-        }
-
-        if next_off < file_size && had_err.is_none() {
-            let (real_len, write_len) = plan(next_off, file_size, chunk, direct, a);
+            let (real_len, write_len) = plan(next_off, scheduled_size, chunk, direct, a);
             futs.push_back(read_for_copy(
                 &src_sender,
                 pool.clone(),
@@ -1188,6 +1146,74 @@ pub async fn copy_file_to_file(
                 write_len,
             ));
             next_off += real_len as u64;
+        }
+
+        while let Some(res) = futs.next().await {
+            match res {
+                Ok((off, write_len, pooled)) => {
+                    if cancel_w.is_cancelled() || cancel_r.is_cancelled() {
+                        drop(pooled);
+                        had_err = had_err.or_else(|| Some(anyhow!("copy cancelled")));
+                        break;
+                    }
+
+                    if let Err(e) = dst_sender.write(off, write_len, pooled).await {
+                        had_err = Some(e);
+                        cancel_w.cancel();
+                        cancel_r.cancel();
+                        break;
+                    }
+                }
+                Err(e) => {
+                    had_err = Some(e);
+                    cancel_w.cancel();
+                    cancel_r.cancel();
+                    break;
+                }
+            }
+
+            if next_off < scheduled_size && had_err.is_none() {
+                let (real_len, write_len) = plan(next_off, scheduled_size, chunk, direct, a);
+                futs.push_back(read_for_copy(
+                    &src_sender,
+                    pool.clone(),
+                    &stream_sem,
+                    next_off,
+                    write_len,
+                    real_len,
+                    write_len,
+                ));
+                next_off += real_len as u64;
+            }
+        }
+    }
+
+    // ---- Tail handling for unaligned file sizes in direct I/O mode ----
+    if had_err.is_none() && needs_tail {
+        let tail_off = aligned_size;
+        let tail_len = (file_size - tail_off) as usize;
+
+        // Buffered read of the exact tail bytes (no O_DIRECT, no read past EOF).
+        let tail = read_tail_bytes(&src_path, pool.clone(), tail_off, tail_len).await?;
+
+        // Write tail into the direct destination as one final padded aligned write.
+        // We will ftruncate() to file_size at the end to remove the padding.
+        let write_len = align_up(tail_len as u64, a) as usize;
+
+        let mut pooled = pool
+            .acquire_for_stream(&stream_sem)
+            .await
+            .map_err(|_| anyhow!("buffer pool closed"))?;
+
+        pooled.as_mut_bytes()[..tail_len].copy_from_slice(&tail);
+        if write_len > tail_len {
+            pooled.as_mut_bytes()[tail_len..write_len].fill(0);
+        }
+
+        if let Err(e) = dst_sender.write(tail_off, write_len, pooled).await {
+            had_err = Some(e);
+            cancel_w.cancel();
+            cancel_r.cancel();
         }
     }
 
@@ -1206,3 +1232,4 @@ pub async fn copy_file_to_file(
     ftruncate_fd(dst_file.as_raw_fd(), file_size)?;
     Ok(())
 }
+

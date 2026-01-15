@@ -41,8 +41,13 @@ use tokio::net::{TcpListener, UnixListener};
 use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::uring_io::UringIO;
 use crate::streaming::{
-    copy_file_to_file, parse_range_header, stream_range_body, write_object_body_to_file,
-    ByteRange, StreamCfg,
+    copy_file_to_file,
+    parse_range_header,
+    stream_range_body,
+    write_object_body,
+    ByteRange,
+    StreamCfg,
+    WriteObjectDest,
 };
 use s3pm_support;
 
@@ -1295,9 +1300,9 @@ async fn handle_put_object(
     let (parts, body) = req.into_parts();
 
     // Stream-write
-    if let Err(e) = write_object_body_to_file(
+    if let Err(e) = write_object_body(
         body,
-        obj_path.clone(),
+        WriteObjectDest::Path { path: obj_path.clone() },
         logical_len,
         is_streaming_sigv4,
         StreamCfg {

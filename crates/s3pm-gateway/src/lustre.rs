@@ -17,10 +17,10 @@ pub mod bindings {
 }
 
 use bindings::{
-    llapi_lu_ladvise, 
-    llapi_ladvise, 
-    lu_ladvise_type::{self, LU_LADVISE_LOCKAHEAD, LU_LADVISE_LOCKNOEXPAND, LU_LADVISE_WILLREAD}, 
-    ladvise_flag::LF_ASYNC
+    llapi_lu_ladvise,
+    llapi_ladvise,
+    ladvise_flag::LF_ASYNC,
+    lu_ladvise_type::{self, LU_LADVISE_LOCKAHEAD, LU_LADVISE_LOCKNOEXPAND, LU_LADVISE_WILLREAD},
 };
 
 /// Lockahead mode values used by LL_IOC_LADVISE / LU_LADVISE_LOCKAHEAD.
@@ -32,9 +32,9 @@ pub enum LockaheadMode {
     WriteUser = 2,
 }
 
-fn ladvise_range(fd: RawFd, advice: lu_ladvise_type, start: u64, len: u64, value1: u64) -> Result<()> {
+fn build_adv(advice: lu_ladvise_type, start: u64, len: u64, value1: u64) -> Result<llapi_lu_ladvise> {
     if len == 0 {
-        return Ok(());
+        return Err(anyhow!("ladvise len=0 is not valid for {advice:?}"));
     }
 
     let end = start
@@ -47,25 +47,50 @@ fn ladvise_range(fd: RawFd, advice: lu_ladvise_type, start: u64, len: u64, value
     adv.lla_end = end as _;
     adv.lla_value1 = value1 as _;
     adv.lla_value2 = 0;
+    Ok(adv)
+}
 
-    // prrform will read async
-    let flag = match advice {
-        LU_LADVISE_WILLREAD => LF_ASYNC as u64,
-        _ => 0,
-    };
+/// Submit one llapi_ladvise() RPC with N advices.
+///
+/// NOTE: `llapi_ladvise()` takes an array of `llapi_lu_ladvise` plus a `num_advise`.
+/// We compute flags for the whole call:
+/// - if any advice is WILLREAD, we use LF_ASYNC (same behavior as your current code)
+fn ladvise_many(fd: RawFd, advs: &mut [llapi_lu_ladvise]) -> Result<()> {
+    if advs.is_empty() {
+        return Ok(());
+    }
 
+    // If any advice wants async behavior, apply it to the whole call.
+    let mut flags: u64 = 0;
+    for a in advs.iter() {
+        if a.lla_advice == (LU_LADVISE_WILLREAD as u16) {
+            flags |= LF_ASYNC as u64;
+            break;
+        }
+    }
 
-    let rc = unsafe { llapi_ladvise(fd as i32, flag, 1, &mut adv as *mut _) };
+    let rc = unsafe { llapi_ladvise(fd as i32, flags, advs.len() as i32, advs.as_mut_ptr()) };
     if rc == 0 {
         Ok(())
     } else {
-        Err(anyhow!("llapi_ladvise({advice:?}) failed: {}", std::io::Error::last_os_error()))
+        Err(anyhow!(
+            "llapi_ladvise(n={}) failed: {}",
+            advs.len(),
+            std::io::Error::last_os_error()
+        ))
     }
+}
+
+fn ladvise_range(fd: RawFd, advice: lu_ladvise_type, start: u64, len: u64, value1: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut adv = build_adv(advice, start, len, value1)?;
+    ladvise_many(fd, std::slice::from_mut(&mut adv))
 }
 
 /// Best-effort: prevent Lustre from expanding extent locks beyond [start, start+len).
 pub fn advise_locknoexpand(fd: RawFd, start: u64, len: u64) {
-    // value1/value2 are unused for LOCKNOEXPAND; pass 0.
     if let Err(e) = ladvise_range(fd, LU_LADVISE_LOCKNOEXPAND, start, len, 0) {
         tracing::debug!("locknoexpand failed: {e}");
     } else {
@@ -75,7 +100,13 @@ pub fn advise_locknoexpand(fd: RawFd, start: u64, len: u64) {
 
 /// Best-effort: lockahead for writes over [start, start+len).
 pub fn advise_lockahead_write(fd: RawFd, start: u64, len: u64) {
-    if let Err(e) = ladvise_range(fd, LU_LADVISE_LOCKAHEAD, start, len, LockaheadMode::WriteUser as u64) {
+    if let Err(e) = ladvise_range(
+        fd,
+        LU_LADVISE_LOCKAHEAD,
+        start,
+        len,
+        LockaheadMode::WriteUser as u64,
+    ) {
         tracing::debug!("lockahead write failed: {e}");
     } else {
         tracing::debug!("lockahead write succeeded: start={start}, len={len}");
@@ -84,7 +115,6 @@ pub fn advise_lockahead_write(fd: RawFd, start: u64, len: u64) {
 
 /// Best-effort: tell Lustre we will read [start, start+len).
 pub fn advise_willread(fd: RawFd, start: u64, len: u64) {
-    // value1/value2 are unused for WILLREAD; pass 0.
     if let Err(e) = ladvise_range(fd, LU_LADVISE_WILLREAD, start, len, 0) {
         tracing::debug!("willread failed: {e}");
     } else {
@@ -92,3 +122,31 @@ pub fn advise_willread(fd: RawFd, start: u64, len: u64) {
     }
 }
 
+/// Best-effort: submit LOCKNOEXPAND + LOCKAHEAD(WRITE) together in ONE llapi_ladvise() RPC.
+pub fn advise_locknoexpand_and_lockahead_write(fd: RawFd, start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+
+    let mut advs = match (
+        build_adv(LU_LADVISE_LOCKNOEXPAND, start, len, 0),
+        build_adv(
+            LU_LADVISE_LOCKAHEAD,
+            start,
+            len,
+            LockaheadMode::WriteUser as u64,
+        ),
+    ) {
+        (Ok(a), Ok(b)) => vec![a, b],
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::debug!("locknoexpand+lockahead build failed: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = ladvise_many(fd, &mut advs) {
+        tracing::debug!("locknoexpand+lockahead write failed: {e}");
+    } else {
+        tracing::debug!("locknoexpand+lockahead write succeeded: start={start}, len={len}");
+    }
+}
