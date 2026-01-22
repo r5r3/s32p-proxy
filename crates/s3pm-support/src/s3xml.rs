@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use quick_xml::se::to_string as to_xml_string;
+use quick_xml::{events::Event, se::to_string as to_xml_string, Reader};
 use serde::Serialize;
 use std::time::SystemTime;
 use time::{macros::format_description, OffsetDateTime, UtcOffset};
@@ -578,5 +578,127 @@ struct DeleteErrorEntry {
     code: String,
     #[serde(rename = "Message")]
     message: String,
+}
+
+/* -------------------------
+ * XML request parsers (gateway)
+ * ------------------------- */
+
+fn local_name(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|&b| b == b':') {
+        Some(i) => &name[i + 1..],
+        None => name,
+    }
+}
+
+/// Minimal parser for DeleteObjects request:
+/// <Delete><Quiet>true</Quiet><Object><Key>k</Key></Object>...</Delete>
+pub fn parse_delete_objects_request(xml: &[u8]) -> Result<(bool, Vec<String>)> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut quiet = false;
+
+    let mut in_key = false;
+    let mut in_quiet = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let n = local_name(name.as_ref());
+                if n == b"Key" {
+                    in_key = true;
+                } else if n == b"Quiet" {
+                    in_quiet = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let n = local_name(name.as_ref());
+                if n == b"Key" {
+                    in_key = false;
+                } else if n == b"Quiet" {
+                    in_quiet = false;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let s = t
+                    .xml_content()
+                    .map_err(|e| anyhow!("xml text decode error: {e}"))?
+                    .into_owned();
+                if in_key {
+                    if !s.is_empty() {
+                        keys.push(s);
+                    }
+                } else if in_quiet {
+                    let v = s.trim();
+                    quiet = v.eq_ignore_ascii_case("true") || v == "1";
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!("bad DeleteObjects XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok((quiet, keys))
+}
+
+/// Parse CompleteMultipartUpload body and return sorted unique PartNumber list.
+pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut parts: Vec<u32> = Vec::new();
+    let mut in_part_number = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"PartNumber" {
+                    in_part_number = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"PartNumber" {
+                    in_part_number = false;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_part_number {
+                    let s = t
+                        .xml_content()
+                        .map_err(|e| anyhow!("xml text decode error: {e}"))?
+                        .into_owned();
+                    let pn: u32 = s
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow!("invalid PartNumber: {s}"))?;
+                    parts.push(pn);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!("bad CompleteMultipartUpload XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if parts.is_empty() {
+        return Err(anyhow!("no parts in CompleteMultipartUpload"));
+    }
+
+    parts.sort_unstable();
+    parts.dedup();
+    Ok(parts)
 }
 

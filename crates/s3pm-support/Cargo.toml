@@ -25,3 +25,7 @@ quick-xml = { version = "0.39", features = ["serialize"] }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
+
+# for file system helpers
+libc = "0.2"
+

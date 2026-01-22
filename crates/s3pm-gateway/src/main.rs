@@ -23,15 +23,10 @@ use hyper::HeaderMap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fs;
-use std::fs::OpenOptions;
-use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,6 +45,15 @@ use crate::streaming::{
     WriteObjectDest,
 };
 use s3pm_support;
+use s3pm_support::fs_helpers::{
+    bucket_exists_dir,
+    bucket_root_path,
+    join_object_path,
+    open_file,
+    statx_info,
+    OpenMode,
+    OpenDirect,
+};
 
 type Resp = s3pm_support::s3resp::HttpResponse;
 
@@ -123,112 +127,6 @@ fn load_cfg() -> Result<Cfg> {
     })
 }
 
-// ---- path mapping and other helpers ----
-
-fn join_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
-    if bucket.is_empty() || bucket.contains('/') || bucket == "." || bucket == ".." {
-        return Err(anyhow!("invalid bucket"));
-    }
-
-    let mut out = root.join(bucket);
-    for part in key.split('/') {
-        if part.is_empty() {
-            continue;
-        }
-        if part == "." || part == ".." {
-            return Err(anyhow!("invalid key segment"));
-        }
-        if part.as_bytes().contains(&0) {
-            return Err(anyhow!("NUL in key segment"));
-        }
-        out.push(part);
-    }
-    Ok(out)
-}
-
-fn bucket_root_path(root: &Path, bucket: &str) -> Result<PathBuf> {
-    join_object_path(root, bucket, "")
-}
-
-fn bucket_exists_dir(root: &Path, bucket: &str) -> Result<bool> {
-    let p = bucket_root_path(root, bucket)?;
-    Ok(p.exists() && p.is_dir())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StatxInfo {
-    ino: u64,
-    size: u64,
-    uid: u32,
-    mtime: SystemTime,
-}
-
-fn system_time_from_unix(sec: i64, nsec: u32) -> SystemTime {
-    use std::time::Duration;
-    if sec >= 0 {
-        SystemTime::UNIX_EPOCH + Duration::new(sec as u64, nsec)
-    } else {
-        let d = Duration::new((-sec) as u64, nsec);
-        SystemTime::UNIX_EPOCH - d
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn statx_info(path: &Path) -> Option<StatxInfo> {
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.is_empty() || bytes.contains(&0) {
-        return None;
-    }
-    let c_path = CString::new(bytes).ok()?;
-
-    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-    let mask: libc::c_uint =
-        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
-
-    let rc = unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            libc::AT_STATX_DONT_SYNC,
-            mask,
-            &mut stx as *mut libc::statx,
-        )
-    };
-
-    if rc != 0 {
-        return None;
-    }
-
-    let mtime = system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
-
-    Some(StatxInfo {
-        ino: stx.stx_ino as u64,
-        size: stx.stx_size as u64,
-        uid: stx.stx_uid as u32,
-        mtime,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn statx_info(path: &Path) -> Option<StatxInfo> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-    #[cfg(unix)]
-    {
-        Some(StatxInfo {
-            ino: meta.ino(),
-            size: meta.len(),
-            uid: meta.uid(),
-            mtime,
-        })
-    }
-
-    #[cfg(not(unix))]
-    {
-        Some(StatxInfo { ino: 0, size: meta.len(), uid: 0, mtime })
-    }
-}
 
 // ---- request handler ----
 
@@ -469,20 +367,25 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
     };
 
     // open once (buffered) to stat + inode + size
-    let std_file = match OpenOptions::new().read(true).open(&obj_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s3pm_support::s3resp::no_such_key("not found", None)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s3pm_support::s3resp::access_denied("permission denied", None)
-        }
+    let (std_file, _used_direct) = match open_file(&obj_path, OpenMode::Read, OpenDirect::Buffered) {
+        Ok(v) => v,
         Err(e) => {
-            return s3pm_support::s3resp::internal_error(
-                &e.to_string(),
-                Some(req.uri().path()),
-                None,
-            );
+            let ioe = e.downcast_ref::<std::io::Error>();
+            match ioe.map(|x| x.kind()) {
+                Some(std::io::ErrorKind::NotFound) => {
+                    return s3pm_support::s3resp::no_such_key("not found", None)
+                }
+                Some(std::io::ErrorKind::PermissionDenied) => {
+                    return s3pm_support::s3resp::access_denied("permission denied", None)
+                }
+                _ => {
+                    return s3pm_support::s3resp::internal_error(
+                        &e.to_string(),
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+            }
         }
     };
 
@@ -1553,66 +1456,6 @@ async fn handle_delete_object(
     s3pm_support::s3resp::delete_object_no_content()
 }
 
-fn local_name(name: &[u8]) -> &[u8] {
-    match name.iter().rposition(|&b| b == b':') {
-        Some(i) => &name[i + 1..],
-        None => name,
-    }
-}
-
-/// Minimal parser for DeleteObjects request:
-/// <Delete><Quiet>true</Quiet><Object><Key>k</Key></Object>...</Delete>
-fn parse_delete_objects_request(xml: &[u8]) -> Result<(bool, Vec<String>)> {
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut buf = Vec::new();
-    let mut keys: Vec<String> = Vec::new();
-    let mut quiet = false;
-
-    let mut in_key = false;
-    let mut in_quiet = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = e.name();
-                let n = local_name(name.as_ref());
-                if n == b"Key" {
-                    in_key = true;
-                } else if n == b"Quiet" {
-                    in_quiet = true;
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                let n = local_name(name.as_ref());
-                if n == b"Key" {
-                    in_key = false;
-                } else if n == b"Quiet" {
-                    in_quiet = false;
-                }
-            }
-            Ok(Event::Text(t)) => {
-                let s = t.xml_content().map_err(|e| anyhow!("xml text decode error: {e}"))?.into_owned();
-                if in_key {
-                    if !s.is_empty() {
-                        keys.push(s);
-                    }
-                } else if in_quiet {
-                    let v = s.trim();
-                    quiet = v.eq_ignore_ascii_case("true") || v == "1";
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(anyhow!("bad DeleteObjects XML: {e}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    Ok((quiet, keys))
-}
 
 async fn handle_delete_objects(
     req: Request<Incoming>,
@@ -1666,7 +1509,7 @@ async fn handle_delete_objects(
         }
     };
 
-    let (quiet, keys) = match parse_delete_objects_request(&collected) {
+    let (quiet, keys) = match s3pm_support::s3xml::parse_delete_objects_request(&collected) {
         Ok(v) => v,
         Err(e) => {
             return s3pm_support::s3resp::s3_error(

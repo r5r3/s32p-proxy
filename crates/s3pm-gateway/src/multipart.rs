@@ -5,13 +5,11 @@ use http::{Request, StatusCode};
 use http::request::Parts;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,6 +24,15 @@ use crate::streaming::{
     write_object_body,
     StreamCfg,
     WriteObjectDest,
+};
+use s3pm_support::fs_helpers::{
+    bucket_exists_dir,
+    bucket_root_path,
+    join_object_path,
+    ftruncate_file,
+    open_file,
+    OpenDirect,
+    OpenMode
 };
 
 type Resp = s3pm_support::s3resp::HttpResponse;
@@ -142,12 +149,12 @@ fn gen_upload_id() -> String {
 }
 
 fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)
-        .with_context(|| format!("open lock {}", path.display()))?;
+    let (f, _used_direct) = open_file(
+        path,
+        OpenMode::ReadWriteCreate,
+        OpenDirect::Buffered,
+    )
+    .with_context(|| format!("open lock {}", path.display()))?;
 
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
@@ -209,18 +216,6 @@ fn compute_sequential_direct_offset(meta: &UploadMeta, part_number: u32) -> Opti
 
 fn part_file_name(part_number: u32) -> String {
     format!("part-{:05}.bin", part_number)
-}
-
-fn ftruncate_file(file: &std::fs::File, len: u64) -> Result<()> {
-    let rc = unsafe { libc::ftruncate(file.as_raw_fd(), len as libc::off_t) };
-    if rc != 0 {
-        return Err(anyhow!(
-            "ftruncate({}) failed: {}",
-            len,
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
 }
 
 fn is_cross_device(src_dir: &Path, dst_path: &Path) -> bool {
@@ -301,63 +296,6 @@ async fn copy_range_to_range(
     Ok(())
 }
 
-fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut buf = Vec::new();
-    let mut parts: Vec<u32> = Vec::new();
-    let mut in_part_number = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = e.name();
-                let n = name.as_ref();
-                let local = crate::local_name(n);
-                if local == b"PartNumber" {
-                    in_part_number = true;
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                let n = name.as_ref();
-                let local = crate::local_name(n);
-                if local == b"PartNumber" {
-                    in_part_number = false;
-                }
-            }
-            Ok(Event::Text(t)) => {
-                if in_part_number {
-                    let s = t
-                        .xml_content()
-                        .map_err(|e| anyhow!("xml text decode error: {e}"))?
-                        .into_owned();
-                    let pn: u32 = s
-                        .trim()
-                        .parse()
-                        .map_err(|_| anyhow!("invalid PartNumber: {s}"))?;
-                    parts.push(pn);
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(anyhow!("bad CompleteMultipartUpload XML: {e}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    if parts.is_empty() {
-        return Err(anyhow!("no parts in CompleteMultipartUpload"));
-    }
-
-    // De-dup and sort
-    parts.sort_unstable();
-    parts.dedup();
-
-    Ok(parts)
-}
-
 fn build_location(parts: &Parts, scheme: &str) -> String {
     let host = parts
         .headers
@@ -380,8 +318,6 @@ fn no_such_upload(resource: Option<&str>) -> Resp {
 }
 
 pub async fn handle(req: Request<Incoming>, app: Arc<crate::App>, class: &s3pm_support::classifier::S3RequestClass) -> Resp {
-    let cfg = app.cfg.clone();
-
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
 
@@ -431,13 +367,13 @@ async fn handle_create_mpu(
         );
     }
 
-    match crate::bucket_exists_dir(&cfg.posix_root, bucket) {
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     }
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -493,13 +429,13 @@ async fn handle_list_uploads(
         );
     }
 
-    match crate::bucket_exists_dir(&cfg.posix_root, bucket) {
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     }
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -566,7 +502,7 @@ async fn handle_list_parts(
         );
     }
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -632,7 +568,7 @@ async fn handle_abort(
         );
     }
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -712,7 +648,7 @@ async fn handle_upload_part(
         }
     };
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -812,38 +748,12 @@ async fn handle_upload_part(
         let direct_path = upload_direct_path(&dir);
 
         let file = {
-            let mut oo = OpenOptions::new();
-            oo.read(true).write(true).create(true);
-
-            if use_direct {
-                oo.custom_flags(libc::O_DIRECT);
-            }
-
-            match oo.open(&direct_path) {
-                Ok(f) => Arc::new(f),
-                Err(e) if use_direct => {
-                    tracing::warn!("open direct.bin with O_DIRECT failed (falling back): {e}");
-                    use_direct = false;
-
-                    let f2 = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .open(&direct_path)
-                        .with_context(|| format!("open direct.bin {}", direct_path.display()))
-                        .map_err(|e| {
-                            return s3pm_support::s3resp::internal_error(
-                                &e.to_string(),
-                                Some(parts.uri.path()),
-                                None,
-                            );
-                        });
-
-                    match f2 {
-                        Ok(f) => Arc::new(f),
-                        Err(resp) => return resp,
-                    }
-                }
+            let (f, used_direct) = match open_file(
+                &direct_path,
+                OpenMode::ReadWriteCreate,
+                if use_direct { OpenDirect::TryDirect } else { OpenDirect::Buffered },
+            ) {
+                Ok(v) => v,
                 Err(e) => {
                     return s3pm_support::s3resp::internal_error(
                         &e.to_string(),
@@ -851,11 +761,19 @@ async fn handle_upload_part(
                         None,
                     );
                 }
+            };
+
+            if use_direct && !used_direct {
+                tracing::warn!("open direct.bin with O_DIRECT failed (falling back)");
             }
+
+            use_direct = used_direct;
+            Arc::new(f)
         };
 
         // IMPORTANT: align the function behavior with how we opened the file.
         part_cfg.direct_io = use_direct;
+
 
         if let Err(e) = write_object_body(
             body,
@@ -1003,7 +921,7 @@ async fn handle_complete(
         );
     }
 
-    let bucket_root = match crate::bucket_root_path(&cfg.posix_root, bucket) {
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
@@ -1028,7 +946,7 @@ async fn handle_complete(
         }
     };
 
-    let requested_parts = match parse_complete_parts(&collected) {
+    let requested_parts = match s3pm_support::s3xml::parse_complete_parts(&collected) {
         Ok(v) => v,
         Err(e) => {
             return s3pm_support::s3resp::s3_error(
@@ -1136,7 +1054,7 @@ async fn handle_complete(
         }
     }
 
-    let dst_path = match crate::join_object_path(&cfg.posix_root, bucket, key) {
+    let dst_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(parts.uri.path())),
     };
@@ -1148,17 +1066,22 @@ async fn handle_complete(
     }
 
     // Ensure any missing parts are copied INTO direct.bin (not direct->final), then rename direct.bin to final.
+    let mut direct_file_opt: Option<Arc<std::fs::File>> = None;
+    let direct_path = upload_direct_path(&dir);
     if can_fast {
-        let direct_path = upload_direct_path(&dir);
-
-        let direct_file = match OpenOptions::new().read(true).write(true).create(true).open(&direct_path) {
-            Ok(f) => Arc::new(f),
+        match open_file(&direct_path, OpenMode::ReadWriteCreate, OpenDirect::Buffered) {
+            Ok((f, _used_direct)) => {
+                direct_file_opt = Some(Arc::new(f));
+            }
             Err(e) => {
                 can_fast = false;
                 tracing::warn!("fast path disabled: open direct.bin failed: {e}");
-                Arc::new(OpenOptions::new().read(true).write(true).create(true).open(&direct_path).unwrap())
             }
-        };
+        }
+    }
+
+    if can_fast {
+        let direct_file = direct_file_opt.expect("direct_file must be present when can_fast");
 
         // For every part stored as file, copy into direct at expected offset.
         for pn in 1..=last_pn {
@@ -1174,8 +1097,12 @@ async fn handle_complete(
                 }
                 PartStored::File { name } => {
                     let src_path = upload_parts_dir(&dir).join(&name);
-                    let src_file = match OpenOptions::new().read(true).open(&src_path) {
-                        Ok(f) => Arc::new(f),
+                    let src_file = match open_file(
+                        &src_path,
+                        OpenMode::Read,
+                        OpenDirect::Buffered,
+                    ) {
+                        Ok((f, _used_direct)) => Arc::new(f),
                         Err(e) => {
                             can_fast = false;
                             tracing::warn!("fast path disabled: open part file failed: {e}");
@@ -1215,7 +1142,6 @@ async fn handle_complete(
         if can_fast {
             // Truncate direct to final size and rename into place (no direct->final copy)
             if let Err(e) = ftruncate_file(&direct_file, final_size) {
-                can_fast = false;
                 tracing::warn!("fast path disabled: truncate failed: {e}");
             } else {
                 // Remove existing dst if needed (portable)
@@ -1251,7 +1177,6 @@ async fn handle_complete(
                                         let _ = fs::remove_file(&dst_path);
                                     }
                                     if let Err(e2) = fs::rename(&dst_tmp, &dst_path) {
-                                        can_fast = false;
                                         tracing::warn!("fast path disabled: rename tmp->dst failed: {e2}");
                                         let _ = fs::remove_file(&dst_tmp);
                                     } else {
@@ -1268,14 +1193,12 @@ async fn handle_complete(
                                     }
                                 }
                                 Err(err) => {
-                                    can_fast = false;
                                     tracing::warn!("fast path disabled: copy direct->dst_tmp failed: {err}");
                                     let _ = fs::remove_file(&dst_tmp);
                                 }
                             }
                         }
                     } else {
-                        can_fast = false;
                         tracing::warn!("fast path disabled: rename direct->dst failed: {e}");
                     }
                 } else {
@@ -1319,34 +1242,55 @@ async fn handle_complete(
     let _ = fs::remove_file(&staged_out);
 
     // Open staging output. If staging in dst fails, fall back to upload dir staging.
-    let out_file: Arc<std::fs::File> = match OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&staged_out)
-    {
-        Ok(f) => Arc::new(f),
+    let out_file: Arc<std::fs::File> = match open_file(
+        &staged_out,
+        OpenMode::WriteCreateTruncate,
+        OpenDirect::Buffered,
+    ) {
+        Ok((f, _used_direct)) => Arc::new(f),
+
         Err(e) if staged_in_dst => {
-            tracing::warn!("cannot open dst tmp for assembly (falling back to upload staging): {e}");
+            tracing::warn!(
+                "cannot open dst tmp for assembly (falling back to upload staging): {e}"
+            );
             staged_in_dst = false;
 
             staged_out = dir.join("complete.bin");
             let _ = fs::remove_file(&staged_out);
 
-            match OpenOptions::new().write(true).create(true).truncate(true).open(&staged_out) {
-                Ok(f) => Arc::new(f),
-                Err(e) => {
-                    return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            match open_file(
+                &staged_out,
+                OpenMode::WriteCreateTruncate,
+                OpenDirect::Buffered,
+            ) {
+                Ok((f2, _used_direct2)) => Arc::new(f2),
+                Err(e2) => {
+                    return s3pm_support::s3resp::internal_error(
+                        &e2.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 }
             }
         }
+
         Err(e) => {
-            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s3pm_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
     };
 
     let direct_path = upload_direct_path(&dir);
-    let direct_file = OpenOptions::new().read(true).open(&direct_path).ok().map(Arc::new);
+    let direct_file = match open_file(&direct_path, OpenMode::Read, OpenDirect::Buffered) {
+        Ok((f, _used_direct)) => Some(Arc::new(f)),
+        Err(e) => {
+            tracing::warn!("cannot open direct.bin {}: {e}", direct_path.display());
+            None
+        }
+    };
 
     let mut out_off: u64 = 0;
     for pn in 1..=last_pn {
@@ -1371,9 +1315,15 @@ async fn handle_complete(
             }
             PartStored::File { name } => {
                 let src_path = upload_parts_dir(&dir).join(&name);
-                let src_file = match OpenOptions::new().read(true).open(&src_path) {
-                    Ok(f) => Arc::new(f),
-                    Err(e) => return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+                let src_file = match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered) {
+                    Ok((f, _used_direct)) => Arc::new(f),
+                    Err(e) => {
+                        return s3pm_support::s3resp::internal_error(
+                            &e.to_string(),
+                            Some(parts.uri.path()),
+                            None,
+                        );
+                    }
                 };
                 if let Err(e) = copy_range_to_range(
                     src_file,
@@ -1390,11 +1340,6 @@ async fn handle_complete(
             }
         }
         out_off = out_off.saturating_add(part.size);
-    }
-
-    // Ensure exact size (in case of sparse extension)
-    if let Err(e) = ftruncate_file(&out_file, out_off) {
-        return s3pm_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
     }
 
     // Ensure exact size (in case of sparse extension)

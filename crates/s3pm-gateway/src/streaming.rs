@@ -4,11 +4,9 @@ use futures_util::Stream;
 use futures_util::stream::{FuturesOrdered, StreamExt, TryStreamExt};
 use http_body_util::{StreamBody, BodyExt};
 use hyper::body::{Body, Incoming, Frame};
-use libc::O_DIRECT;
 use std::convert::Infallible;
-use std::fs::OpenOptions;
-use std::os::unix::fs::{OpenOptionsExt, FileExt};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,6 +15,15 @@ use tokio::sync::{mpsc, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
 use crate::uring_io::{UringIO, UringFileSender};
+use s3pm_support::fs_helpers::{
+    align_down,
+    align_up,
+    ftruncate_file,
+    open_file,
+    OpenMode,
+    OpenDirect,
+    try_preallocate_range,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -29,12 +36,6 @@ pub struct StreamCfg {
     pub chunk_size: usize,
     pub inflight: usize,
     pub direct_io: bool,
-}
-
-fn align_down(x: u64, a: u64) -> u64 { (x / a) * a }
-fn align_up(x: u64, a: u64) -> u64 {
-    let y = x.saturating_add(a - 1);
-    (y / a) * a
 }
 
 pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
@@ -104,27 +105,6 @@ pub async fn stream_range_body(
     Ok(StreamBody::new(ReceiverStream::new(rx)))
 }
 
-fn effective_end_for_scheduling(
-    file_size: u64,
-    seg_start: u64,
-    seg_end: u64,
-    _chunk_size: usize,
-    direct: bool,
-) -> u64 {
-    if !direct {
-        return seg_end;
-    }
-
-    let a = ALIGN as u64;
-    if file_size == 0 {
-        return seg_start;
-    }
-
-    let work_end = align_down(file_size.saturating_sub(1), a) + a;
-    let capped = std::cmp::min(seg_end, work_end);
-    if capped < seg_start { seg_start } else { capped }
-}
-
 fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
     if eff_end <= seg_start {
         return 0;
@@ -184,7 +164,7 @@ async fn stream_range_task(
         let allowed = std::cmp::min(inflight_cfg, needed);
         let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
 
-        let std_file = open_std_file(&path, direct)?;
+        let (std_file, _used_direct) = open_file(&path, OpenMode::Read, OpenDirect::Buffered)?;
         let file = Arc::new(std_file);
         let sender = uring.sender(file.clone());
 
@@ -221,15 +201,6 @@ async fn stream_range_task(
     Ok(())
 }
 
-fn open_std_file(path: &Path, direct: bool) -> Result<std::fs::File> {
-    let mut oo = OpenOptions::new();
-    oo.read(true);
-    if direct {
-        oo.custom_flags(O_DIRECT);
-    }
-    oo.open(path).map_err(|e| anyhow!("{e}"))
-}
-
 async fn read_tail_bytes(
     path: &Path,
     pool: Arc<BufPool>,
@@ -240,7 +211,8 @@ async fn read_tail_bytes(
         return Ok(Bytes::new());
     }
 
-    let file = Arc::new(OpenOptions::new().read(true).open(path).map_err(|e| anyhow!("{e}"))?);
+    let (f, _used_direct) = open_file(path, OpenMode::Read, OpenDirect::Buffered)?;
+    let file = Arc::new(f);
 
     let pooled = pool
         .acquire()
@@ -506,47 +478,6 @@ where
     }
 }
 
-fn try_preallocate_range(fd: RawFd, start: u64, len: u64) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
-
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| anyhow!("preallocate range overflow: start={start} len={len}"))?;
-
-    let rc = unsafe { libc::fallocate(fd, 0, start as libc::off_t, len as libc::off_t) };
-    if rc == 0 {
-        return Ok(());
-    }
-
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    if errno == libc::EOPNOTSUPP
-        || errno == libc::ENOSYS
-        || errno == libc::EINVAL
-        || errno == libc::ENOTSUP
-    {
-        tracing::debug!(errno, "fallocate(range) not supported; setting size with ftruncate.");
-
-        // Ensure file is at least large enough.
-        return ftruncate_fd(fd, end);
-    }
-
-    Err(anyhow!("fallocate(start={start}, len={len}) failed: errno={errno}"))
-}
-
-fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
-    let rc = unsafe { libc::ftruncate(fd, len as libc::off_t) };
-    if rc != 0 {
-        return Err(anyhow!(
-            "ftruncate({}) failed: {}",
-            len,
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
 pub mod aws_chunked {
     use super::*;
     use futures_util::Stream;
@@ -774,7 +705,7 @@ pub fn direct_io_ok_for_aligned_range(start_off: u64, len: u64, cfg: &StreamCfg)
     if cfg.chunk_size % ALIGN != 0 {
         return false;
     }
-    if len <= cfg.chunk_size as u64 {
+    if len < cfg.chunk_size as u64 {
         return false;
     }
     if (start_off % a) != 0 {
@@ -826,15 +757,13 @@ pub async fn write_object_body(
                     .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
             }
 
-            let std_file = {
-                let mut oo = OpenOptions::new();
-                oo.write(true).create(true).truncate(true);
-                if direct {
-                    oo.custom_flags(O_DIRECT);
-                }
-                oo.open(&path)
-                    .map_err(|e| anyhow!("open {}: {e}", path.display()))?
-            };
+            let (std_file, _used_direct) = open_file(
+                &path,
+                OpenMode::WriteCreateTruncate,
+                if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+            )
+            .map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+
             let file = Arc::new(std_file);
 
             // Preallocate best-effort. For O_DIRECT we may write an aligned tail,
@@ -864,7 +793,7 @@ pub async fn write_object_body(
 
     if logical_len == 0 {
         if truncate_to_logical {
-            ftruncate_fd(file.as_raw_fd(), 0)?;
+            ftruncate_file(&file, 0)?;
         }
         return Ok(());
     }
@@ -994,7 +923,7 @@ pub async fn write_object_body(
 
     // For new-file writes, ensure exact size (truncate away any O_DIRECT padding).
     if truncate_to_logical {
-        ftruncate_fd(file.as_raw_fd(), logical_len)?;
+        ftruncate_file(&file, logical_len)?;
     }
 
     Ok(())
@@ -1031,25 +960,26 @@ pub async fn copy_file_to_file(
     let aligned_size = if direct { align_down(file_size, a) } else { file_size };
     let needs_tail = direct && aligned_size < file_size;
 
-    let src_file = Arc::new(open_std_file(&src_path, direct)?);
+    let (src_f, _src_used_direct) = open_file(
+        &src_path,
+        OpenMode::Read,
+        if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+    )?;
+    let src_file = Arc::new(src_f);
 
-    let dst_file = {
-        let mut oo = OpenOptions::new();
-        oo.write(true).create(true).truncate(true);
-        if direct {
-            oo.custom_flags(O_DIRECT);
-        }
-        Arc::new(
-            oo.open(&dst_path)
-                .map_err(|e| anyhow!("open {}: {e}", dst_path.display()))?,
-        )
-    };
+    let (dst_f, _dst_used_direct) = open_file(
+        &dst_path,
+        OpenMode::WriteCreateTruncate,
+        if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+    )
+    .map_err(|e| anyhow!("open {}: {e}", dst_path.display()))?;
+    let dst_file = Arc::new(dst_f);
 
     let prealloc_len = if direct { align_up(file_size, a) } else { file_size };
     try_preallocate_range(dst_file.as_raw_fd(), 0, prealloc_len)?;
 
     if file_size == 0 {
-        ftruncate_fd(dst_file.as_raw_fd(), 0)?;
+        ftruncate_file(&dst_file, 0)?;
         return Ok(());
     }
 
@@ -1229,7 +1159,7 @@ pub async fn copy_file_to_file(
     wait_res?;
 
     // Truncate padded tail (direct I/O) or enforce exact size.
-    ftruncate_fd(dst_file.as_raw_fd(), file_size)?;
+    ftruncate_file(&dst_file, file_size)?;
     Ok(())
 }
 

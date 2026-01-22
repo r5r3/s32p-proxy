@@ -6,7 +6,6 @@ use s3pm_support::s3resp;
 
 // Re-export shared error codes + shared bucket info type to keep call-sites unchanged.
 pub use s3pm_support::s3xml::error_code;
-pub use s3pm_support::s3xml::BucketInfo;
 
 /* -------------------------
  * Hyper -> Pingora adapter
@@ -74,17 +73,4 @@ pub async fn respond_not_implemented(
 ) -> pingora::Result<()> {
     let resp = s3resp::not_implemented(message, resource);
     respond_hyper(session, resp, /* close = */ true).await
-}
-
-/// Convenience: ListBuckets success (200).
-pub async fn respond_list_buckets(
-    session: &mut Session,
-    owner_id: &str,
-    owner_display_name: &str,
-    buckets: &[BucketInfo],
-) -> pingora::Result<()> {
-    let resp = s3resp::list_buckets(owner_id, owner_display_name, buckets);
-
-    // GET / has no request body; safe to keepalive
-    respond_hyper(session, resp, /* close = */ false).await
 }
