@@ -99,33 +99,152 @@ This repository is a Rust workspace with multiple crates:
   - Preserves SigV4-critical headers (notably the original `Host`)
   - Has a `response_filter` hook for response header rewriting
 
-- **Request classification** (`src/classifier.rs`)
-  - Classifies requests by parsing path + query parameters
-  - Currently focuses on **multipart uploads** and **versioning** detection
+- **Request classification** (`crates/s3pm-support/src/classifier.rs`)
+  - Shared by proxy + gateway (single source of truth for routing decisions)
+  - Parses path + query parameters (and selected headers where needed, e.g. `x-amz-copy-source`)
+  - Produces a high-level operation class key:
+    - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV2`, `GetBucketLocation`, `HeadBucket`)
+    - `write` (e.g. `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`)
+    - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
+    - `versioning` (detected, but not implemented yet)
+    - `object_lock` (detected, but not implemented yet)
+    - `other`
 
 - **Config-driven routing** (`etc/s3-proxy-manager.yaml`)
-  - Routes based on classifier class keys:
-    - `multipart`
-    - `versioning`
-    - `other`
-  - Each class maps to:
-    - `not_implemented` (local response)
+  - Routes based on the classifier class keys above.
+  - Each class maps to one action:
     - `proxy` (selects a worker profile)
+    - `not_implemented` (local S3 NotImplemented response, but only after SigV4 validation)
+  - If a specific class key is not configured, the proxy falls back to the `other` route.
 
 #### Gateway (`s3pm-gateway`)
 
-- experimental alternative to `versitygw`
-- implemented commands:
+Experimental alternative to `versitygw`. Implements a growing subset of the S3 REST API directly on top of a POSIX filesystem.
+
+Implemented operations:
+
+- **Read**
   - `GetObject`
   - `HeadObject`
   - `HeadBucket`
   - `GetBucketLocation`
   - `ListObjectsV2`
-- notes:
-  - supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
-  - rejects query parameters for now (including presigned URLs), except `?location` and `?list-type=2`.
-  - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM).
-  - `ETag` generated from inode number.
+- **Write**
+  - `PutObject` (streaming upload)
+  - `CopyObject` (server-side copy; size-limited by configuration)
+  - `DeleteObject`
+  - `DeleteObjects` (`POST /?delete`)
+- **Multipart**
+  - `CreateMultipartUpload` (`POST ?uploads`)
+  - `UploadPart` (`PUT ?partNumber=N&uploadId=...`)
+  - `ListParts` (`GET ?uploadId=...`)
+  - `ListMultipartUploads` (`GET /bucket?uploads`)
+  - `CompleteMultipartUpload` (`POST ?uploadId=...`)
+  - `AbortMultipartUpload` (`DELETE ?uploadId=...`)
+
+Notes / behavior:
+
+- Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
+- Rejects most query parameters for now (including presigned URLs), except those required for:
+  - `?location`, `?list-type=2`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
+- `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
+- `ETag` for final objects is generated from the inode number.
+
+#### Multipart upload (`s3pm-gateway`) — server-side assembly algorithm
+
+Multipart uploads are implemented in `crates/s3pm-gateway/src/multipart.rs`.
+
+The design goal is to **avoid creating a full extra copy of the object on the server** during completion. The gateway does this by writing parts into an **assembly file** that can be **renamed into place** as the final object.
+
+### On-disk layout (per bucket)
+
+For a bucket with root `<bucket_root>`, the gateway reserves a hidden directory (default name: `.s3pm-mpu`):
+
+- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/meta.json`  
+  JSON metadata for the upload (bucket/key, state, and a map of uploaded parts).
+- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/lock`  
+  A file used with `flock(LOCK_EX)` to serialize metadata updates and completion.
+- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/direct.bin`  
+  The **assembly file** (random-access writes at part offsets).
+- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/parts/part-00001.bin` (etc.)  
+  Fallback storage for parts that cannot safely be placed into `direct.bin`.
+
+The gateway also prevents clients from reading/writing/deleting objects *inside* the reserved multipart directory by treating that first path segment as “reserved”.
+
+### Part upload placement
+
+When a part arrives (`PUT ?partNumber=N&uploadId=...`), the gateway decides where to store it:
+
+1. It reads and updates `meta.json` under an exclusive lock (short critical section).
+2. It tries to determine a stable **assumed part size**:
+   - If part **#1** is uploaded and no size is known yet, its length becomes the assumed part size.
+   - If no assumed size exists and the gateway sees **two parts with the same size**, it promotes that size to the assumed part size.
+3. If an assumed part size is known and the part is **not larger** than it, the gateway computes the direct placement offset:
+
+   `offset = (partNumber - 1) * assumed_part_size`
+
+   and writes the request body **directly into `direct.bin` at that offset** (random-access file write).
+4. Otherwise, it writes the part as an individual file under `parts/` and records that in metadata.
+
+Metadata records, per part:
+- size
+- an upload-time ETag (stable, client-visible; completion does not validate ETags)
+- timestamp
+- storage kind: `{ direct: off }` or `{ file: name }`
+
+### Completion: assembling without a full server-side copy
+
+On `CompleteMultipartUpload` (`POST ?uploadId=...`), the gateway:
+
+1. Reads the XML body (requested part numbers).
+2. Takes an **exclusive lock** for the entire completion to prevent concurrent `UploadPart` and to make the final rename deterministic.
+3. Validates the request:
+   - Parts must be **contiguous** starting at 1 (`1..=lastPart`).
+   - Every requested part must exist in `meta.json`.
+
+Then it chooses one of two assembly paths:
+
+#### Fast path (rename `direct.bin` into place)
+
+This path is taken when the upload matches the classic “fixed-size parts + last part shorter or equal” layout:
+
+- `assumed_part_size` is known
+- parts `1..last-1` are **exactly** `assumed_part_size`
+- any parts already stored as `direct` are at the expected offsets
+
+Fast-path algorithm:
+
+1. Compute final object size:
+
+   `final_size = (lastPart - 1) * assumed_part_size + size(lastPart)`
+2. Ensure all missing parts are present in `direct.bin`:
+   - For parts stored as separate files, copy them **into `direct.bin` at their final offsets** (range copy).
+3. `ftruncate(direct.bin, final_size)`
+4. **Rename** `direct.bin` → `<final_object_path>`
+
+If the rename fails with cross-device (`EXDEV`), the gateway performs a **single** copy of the already-assembled `direct.bin` into a temp file next to the destination and renames that temp file into place. Importantly, it still avoids “assemble → copy again” behavior.
+
+✅ **Why this avoids a full copy:** in the common case (same filesystem), completion becomes a metadata operation (`rename`) after assembling into `direct.bin`. There is no “write whole object into a second file” step.
+
+#### Fallback path (sequential staging file)
+
+If the fixed-size/offset conditions don’t hold, the gateway assembles sequentially:
+
+1. Create a staging output file:
+   - If the upload directory is on a different filesystem than the destination, the staging file is created **next to the destination** (to avoid an extra copy later).
+2. Copy parts in order into the staging file:
+   - For `direct` parts: copy the required range out of `direct.bin`.
+   - For `file` parts: copy the entire part file.
+3. Rename staging file → final object path.
+
+Finally, on success the gateway marks the upload as completed, returns the completion XML + ETag, and removes the upload directory.
+
+### Practical highlights
+
+- The gateway’s “happy path” is optimized for **large objects**: parts are placed directly into their final offsets, and completion is typically a truncate + rename.
+- The implementation is careful to avoid data corruption:
+  - Direct placement is only used when offsets can be computed safely (no overlap risk).
+  - Metadata updates are protected by `flock` and written atomically (`meta.json.tmp` → rename).
 
 #### Directory backends (users, buckets, ACLs)
 
@@ -540,10 +659,12 @@ ACL notes:
 
 ## Known limitations / TODO
 
-- **Multipart uploads** are detected and currently return `NotImplemented`
-  - Only after request validation (SigV4) to avoid turning invalid requests into “useful” responses
 - **Versioning-related** requests are detected and currently return `NotImplemented`
-- More S3 API coverage still needed (ListObjectsV2, PUT object streaming, etc.)
+- **Object Lock–related** requests are detected and currently return `NotImplemented`
+- Multipart notes / current constraints:
+  - `CompleteMultipartUpload` currently requires **contiguous part numbers starting at 1**.
+  - Completion does not validate client-provided part ETags (the gateway uses a stable, upload-time ETag per part).
+  - Multipart copy / UploadPartCopy is not implemented.
 - More production hardening:
   - rate limiting / max concurrent starts
   - negative caching for repeated invalid requests
