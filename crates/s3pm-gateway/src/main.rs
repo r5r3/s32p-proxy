@@ -73,6 +73,7 @@ struct Cfg {
     pool_size: usize,
     direct_io: bool,
     copy_max_size: u64,
+    mpu_dir_name: String,
 }
 
 fn env_bool(k: &str, default: bool) -> bool {
@@ -111,6 +112,17 @@ fn load_cfg() -> Result<Cfg> {
     let copy_max_size_gb = env_usize("S3PM_COPY_MAX_SIZE_GB", 5).max(1);
     let copy_max_size = (copy_max_size_gb as u64).saturating_mul(1024u64 * 1024u64 * 1024u64);
 
+    // upload directory for multipart uploads
+    let mpu_dir_name = std::env::var("S3PM_MPU_DIR").unwrap_or_else(|_| ".s3pm-mpu".to_string());
+    if mpu_dir_name.is_empty()
+        || mpu_dir_name == "."
+        || mpu_dir_name == ".."
+        || mpu_dir_name.contains('/')
+        || mpu_dir_name.contains('\\')
+    {
+        return Err(anyhow!("invalid S3PM_MPU_DIR={mpu_dir_name:?} (must be a single path component)"));
+    }
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -124,6 +136,7 @@ fn load_cfg() -> Result<Cfg> {
         pool_size,
         direct_io,
         copy_max_size,
+        mpu_dir_name,
     })
 }
 
@@ -134,6 +147,23 @@ struct App {
     cfg: Arc<Cfg>,
     pool: Arc<BufPool>,
     uring: Arc<UringIO>,
+}
+
+fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
+    // We reserve keys whose FIRST path segment is exactly mpu_dir_name.
+    // Examples that match:
+    //   ".s3pm-mpu"
+    //   ".s3pm-mpu/"
+    //   ".s3pm-mpu/anything"
+    // Examples that do NOT match:
+    //   "foo/.s3pm-mpu/bar"
+    let key_or_prefix = key_or_prefix.trim_end_matches('/');
+
+    if key_or_prefix == mpu_dir_name {
+        return true;
+    }
+    key_or_prefix.strip_prefix(mpu_dir_name)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 async fn read_small(
@@ -353,6 +383,11 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
 
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
+
+    // hide multipart upload dir
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s3pm_support::s3resp::no_such_key("not found", None);
+    }
 
     // If the bucket is missing, S3 expects NoSuchBucket (not NoSuchKey).
     match bucket_exists_dir(&cfg.posix_root, bucket) {
@@ -828,6 +863,24 @@ async fn handle_list_objects_v2(
     let continuation_token_in = class.query.first("continuation-token").map(|s| s.to_string());
     let start_after = class.query.first("start-after").map(|s| s.to_string());
 
+    // check the prefix, we don't list multipart upload dirs
+    if !prefix.is_empty() && is_reserved_first_segment(&prefix, cfg.mpu_dir_name.as_str()) {
+        // behave as if it doesn't exist
+        return s3pm_support::s3resp::list_objects_v2(
+            bucket,
+            Some(&prefix),
+            if recursive { None } else { Some("/") },
+            0,
+            max_keys,
+            false,
+            continuation_token_in.as_deref(),
+            None,
+            start_after.as_deref(),
+            &[],
+            &[],
+        );
+    }
+
     let (dir_prefix, leaf_filter) = split_prefix(&prefix);
 
     // Filesystem start dir is bucket + dir_prefix
@@ -903,6 +956,17 @@ async fn handle_list_objects_v2(
         vec![ListV2Frame { dir: dir_prefix.clone(), after: "".to_string() }]
     };
 
+    // Reject continuation tokens that descend into the reserved dir
+    if token_stack.iter().any(|fr| is_reserved_first_segment(&fr.dir, &cfg.mpu_dir_name)) {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "continuation-token points into a reserved prefix",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
     if token_stack.is_empty() {
         token_stack.push(ListV2Frame { dir: dir_prefix.clone(), after: "".to_string() });
     }
@@ -951,6 +1015,11 @@ async fn handle_list_objects_v2(
         let it = top.entries[top.idx].clone();
         top.idx += 1;
         top.after = it.sort_key.clone();
+
+        // Hide the internal MPU directory at bucket root (and never descend into it)
+        if top.dir_key.is_empty() && it.is_dir && it.name == cfg.mpu_dir_name {
+            continue;
+        }
 
         if it.is_dir {
             if !recursive {
@@ -1153,6 +1222,11 @@ async fn handle_put_object(
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
 
+    // don't allow to write into the multipart upload directory
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s3pm_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
     if bucket.is_empty() || key.is_empty() {
         return s3pm_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
@@ -1279,6 +1353,13 @@ async fn handle_copy_object(
         }
     };
 
+    // source and destination must not contain the multipart upload directory
+    if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
+        || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
+    {
+        return s3pm_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
     // source bucket must exist
     match bucket_exists_dir(&cfg.posix_root, &src_bucket) {
         Ok(true) => {}
@@ -1403,6 +1484,11 @@ async fn handle_delete_object(
 
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
+
+    // don't delete file from multipart upload dir
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s3pm_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
 
     if bucket.is_empty() || key.is_empty() {
         return s3pm_support::s3resp::s3_error(
@@ -1549,6 +1635,16 @@ async fn handle_delete_objects(
                 key,
                 code: s3pm_support::s3xml::error_code::INVALID_REQUEST.to_string(),
                 message: "empty key".to_string(),
+            });
+            continue;
+        }
+
+        // do not delete file from multipart upload dir
+        if is_reserved_first_segment(&key, &cfg.mpu_dir_name) {
+            errors.push(s3pm_support::s3xml::DeleteErrorInfo {
+                key,
+                code: s3pm_support::s3xml::error_code::ACCESS_DENIED.to_string(),
+                message: "reserved key prefix".to_string(),
             });
             continue;
         }

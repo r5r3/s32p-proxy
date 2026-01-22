@@ -78,16 +78,16 @@ enum PartStored {
     File { name: String },
 }
 
-fn bucket_mpu_root(bucket_root: &Path) -> PathBuf {
-    bucket_root.join(".s3pm-mpu")
+fn bucket_mpu_root(bucket_root: &Path, mpu_dir_name: &str) -> PathBuf {
+    bucket_root.join(mpu_dir_name)
 }
 
-fn uploads_root(bucket_root: &Path) -> PathBuf {
-    bucket_mpu_root(bucket_root).join("uploads")
+fn uploads_root(bucket_root: &Path, mpu_dir_name: &str) -> PathBuf {
+    bucket_mpu_root(bucket_root, mpu_dir_name).join("uploads")
 }
 
-fn upload_dir(bucket_root: &Path, upload_id: &str) -> PathBuf {
-    uploads_root(bucket_root).join(upload_id)
+fn upload_dir(bucket_root: &Path, mpu_dir_name: &str, upload_id: &str) -> PathBuf {
+    uploads_root(bucket_root, mpu_dir_name).join(upload_id)
 }
 
 fn upload_meta_path(dir: &Path) -> PathBuf {
@@ -379,7 +379,7 @@ async fn handle_create_mpu(
     };
 
     let upload_id = gen_upload_id();
-    let dir = upload_dir(&bucket_root, &upload_id);
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, &upload_id);
 
     if let Err(e) = fs::create_dir_all(upload_parts_dir(&dir)) {
         return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
@@ -440,7 +440,7 @@ async fn handle_list_uploads(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
 
-    let root = uploads_root(&bucket_root);
+    let root = uploads_root(&bucket_root, &cfg.mpu_dir_name);
     let mut out: Vec<s3pm_support::s3xml::MultipartUploadInfo> = Vec::new();
 
     let rd = match fs::read_dir(&root) {
@@ -507,7 +507,7 @@ async fn handle_list_parts(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
 
-    let dir = upload_dir(&bucket_root, upload_id);
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
     if !dir.exists() {
         return no_such_upload(Some(req.uri().path()));
     }
@@ -573,7 +573,7 @@ async fn handle_abort(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
 
-    let dir = upload_dir(&bucket_root, upload_id);
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
     if !dir.exists() {
         // S3 treats abort as idempotent-ish; but commonly NoSuchUpload.
         return no_such_upload(Some(req.uri().path()));
@@ -652,7 +652,7 @@ async fn handle_upload_part(
         Ok(p) => p,
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
-    let dir = upload_dir(&bucket_root, upload_id);
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
     if !dir.exists() {
         return no_such_upload(Some(req.uri().path()));
     }
@@ -926,7 +926,7 @@ async fn handle_complete(
         Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     };
 
-    let dir = upload_dir(&bucket_root, upload_id);
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
     if !dir.exists() {
         return no_such_upload(Some(req.uri().path()));
     }
