@@ -21,8 +21,6 @@ pub mod s3xml;
 /// Each binary (proxy/gateway) wraps this into its own response type (Pingora vs Hyper).
 pub mod s3resp;
 
-/// Linux filesystem helpers shared across crates.
-pub mod fs_helpers;
 
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {

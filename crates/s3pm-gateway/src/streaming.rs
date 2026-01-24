@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Semaphore};
 
 use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
 use crate::uring_io::{UringIO, UringFileSender};
-use s3pm_support::fs_helpers::{
+use crate::fs_helpers::{
     align_down,
     align_up,
     ftruncate_file,

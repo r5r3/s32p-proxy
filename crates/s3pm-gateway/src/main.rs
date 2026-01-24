@@ -7,6 +7,7 @@ mod buffer;
 mod streaming;
 mod uring_io;
 mod multipart;
+mod fs_helpers;
 
 #[cfg(feature = "lustre")]
 mod lustre;
@@ -44,8 +45,7 @@ use crate::streaming::{
     StreamCfg,
     WriteObjectDest,
 };
-use s3pm_support;
-use s3pm_support::fs_helpers::{
+use crate::fs_helpers::{
     bucket_exists_dir,
     bucket_root_path,
     join_object_path,
@@ -54,6 +54,7 @@ use s3pm_support::fs_helpers::{
     OpenMode,
     OpenDirect,
 };
+use s3pm_support;
 
 type Resp = s3pm_support::s3resp::HttpResponse;
 

@@ -25,7 +25,7 @@ use crate::streaming::{
     StreamCfg,
     WriteObjectDest,
 };
-use s3pm_support::fs_helpers::{
+use crate::fs_helpers::{
     bucket_exists_dir,
     bucket_root_path,
     join_object_path,
