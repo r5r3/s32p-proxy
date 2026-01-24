@@ -774,7 +774,6 @@ async fn handle_upload_part(
         // IMPORTANT: align the function behavior with how we opened the file.
         part_cfg.direct_io = use_direct;
 
-
         if let Err(e) = write_object_body(
             body,
             WriteObjectDest::File { file: file.clone(), start_off: off },
@@ -1010,6 +1009,21 @@ async fn handle_complete(
                 Some(parts.uri.path()),
                 None,
             );
+        }
+    }
+
+    // Lustre: best-effort async prefetch for all part files before we start copying.
+    #[cfg(feature = "lustre")]
+    {
+        for pn in 1..=last_pn {
+            if let Some(part) = meta.parts.get(&pn) {
+                if let PartStored::File { name } = &part.stored {
+                    let src_path = upload_parts_dir(&dir).join(name);
+                    if let Ok((f, _)) = open_file(&src_path, OpenMode::Read, OpenDirect::Buffered) {
+                        crate::lustre::advise_willread(f.as_raw_fd(), 0, part.size);
+                    }
+                }
+            }
         }
     }
 

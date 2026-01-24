@@ -771,22 +771,11 @@ pub async fn write_object_body(
             let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
             try_preallocate_range(file.as_raw_fd(), 0, prealloc_len)?;
 
-            // Lustre: best-effort lockahead hint for the whole file range we expect to write.
-            #[cfg(feature = "lustre")]
-            crate::lustre::advise_locknoexpand_and_lockahead_write(file.as_raw_fd(), 0, prealloc_len);
-
             (file, 0u64, true)
         }
 
         WriteObjectDest::File { file, start_off } => {
             // For existing-file writes, we NEVER pad. If direct is enabled, ensure we can
-            // safely issue aligned writes and (best-effort) advise lockahead
-            #[cfg(feature = "lustre")]
-            {
-                let prealloc_len = if direct { align_up(logical_len, a) } else { logical_len };
-                crate::lustre::advise_locknoexpand_and_lockahead_write(file.as_raw_fd(), start_off, prealloc_len);
-            }
-
             (file, start_off, false)
         }
     };
@@ -983,13 +972,9 @@ pub async fn copy_file_to_file(
         return Ok(());
     }
 
-    // Lustre: best-effort hints (read + write) for the full range.
+    // Lustre: best-effort hints read for the full range.
     #[cfg(feature = "lustre")]
-    {
-        crate::lustre::advise_willread(src_file.as_raw_fd(), 0, prealloc_len);
-        crate::lustre::advise_locknoexpand(dst_file.as_raw_fd(), 0, prealloc_len);
-        crate::lustre::advise_lockahead_write(dst_file.as_raw_fd(), 0, prealloc_len);
-    }
+    crate::lustre::advise_willread(src_file.as_raw_fd(), 0, prealloc_len);
 
     // Only schedule aligned prefix through uring when direct I/O is active.
     let scheduled_size = aligned_size;
