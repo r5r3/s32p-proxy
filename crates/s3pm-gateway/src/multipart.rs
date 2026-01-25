@@ -31,6 +31,8 @@ use crate::fs_helpers::{
     join_object_path,
     ftruncate_file,
     open_file,
+    stripe_count_for_size,
+    LustreStriping,
     OpenDirect,
     OpenMode
 };
@@ -153,6 +155,7 @@ fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
         path,
         OpenMode::ReadWriteCreate,
         OpenDirect::Buffered,
+        None,
     )
     .with_context(|| format!("open lock {}", path.display()))?;
 
@@ -744,6 +747,15 @@ async fn handle_upload_part(
 
         let mut use_direct = direct_io_ok_for_aligned_range(off, logical_len, &part_cfg);
 
+        #[cfg(feature = "lustre")]
+        let direct_striping = {
+            let part_size = meta.assumed_part_size.unwrap_or(logical_len);
+            let stripe_size = std::cmp::min(cfg.chunk_size as u64, part_size);
+            Some(LustreStriping::new(stripe_size, cfg.lustre_max_stripe_count))
+        };
+        #[cfg(not(feature = "lustre"))]
+        let direct_striping: Option<LustreStriping> = None;
+
         // Open direct.bin; if direct is requested but not supported, fall back to buffered.
         let direct_path = upload_direct_path(&dir);
 
@@ -752,6 +764,7 @@ async fn handle_upload_part(
                 &direct_path,
                 OpenMode::ReadWriteCreate,
                 if use_direct { OpenDirect::TryDirect } else { OpenDirect::Buffered },
+                direct_striping,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -831,9 +844,17 @@ async fn handle_upload_part(
         let final_path = parts_dir.join(&name);
         let tmp_path = parts_dir.join(format!("{name}.tmp"));
 
+        #[cfg(feature = "lustre")]
+        let part_striping = Some(LustreStriping::new(
+            cfg.chunk_size as u64,
+            stripe_count_for_size(logical_len, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+        ));
+        #[cfg(not(feature = "lustre"))]
+        let part_striping: Option<LustreStriping> = None;
+
         if let Err(e) = write_object_body(
             body,
-            WriteObjectDest::Path { path: tmp_path.clone() },
+            WriteObjectDest::Path { path: tmp_path.clone(), striping: part_striping },
             logical_len,
             is_streaming_sigv4,
             StreamCfg {
@@ -1019,7 +1040,7 @@ async fn handle_complete(
             if let Some(part) = meta.parts.get(&pn) {
                 if let PartStored::File { name } = &part.stored {
                     let src_path = upload_parts_dir(&dir).join(name);
-                    if let Ok((f, _)) = open_file(&src_path, OpenMode::Read, OpenDirect::Buffered) {
+                    if let Ok((f, _)) = open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
                         crate::lustre::advise_willread(f.as_raw_fd(), 0, part.size);
                     }
                 }
@@ -1082,8 +1103,18 @@ async fn handle_complete(
     // Ensure any missing parts are copied INTO direct.bin (not direct->final), then rename direct.bin to final.
     let mut direct_file_opt: Option<Arc<std::fs::File>> = None;
     let direct_path = upload_direct_path(&dir);
+
+    #[cfg(feature = "lustre")]
+    let direct_striping = {
+        let part_size = meta.assumed_part_size.unwrap_or(cfg.chunk_size as u64);
+        let stripe_size = std::cmp::min(cfg.chunk_size as u64, part_size);
+        Some(LustreStriping::new(stripe_size, cfg.lustre_max_stripe_count))
+    };
+    #[cfg(not(feature = "lustre"))]
+    let direct_striping: Option<LustreStriping> = None;
+
     if can_fast {
-        match open_file(&direct_path, OpenMode::ReadWriteCreate, OpenDirect::Buffered) {
+        match open_file(&direct_path, OpenMode::ReadWriteCreate, OpenDirect::Buffered, direct_striping) {
             Ok((f, _used_direct)) => {
                 direct_file_opt = Some(Arc::new(f));
             }
@@ -1115,6 +1146,7 @@ async fn handle_complete(
                         &src_path,
                         OpenMode::Read,
                         OpenDirect::Buffered,
+                        None,
                     ) {
                         Ok((f, _used_direct)) => Arc::new(f),
                         Err(e) => {
@@ -1177,11 +1209,20 @@ async fn handle_complete(
                             let _ = fs::remove_file(&dst_tmp);
 
                             // Copy the already-assembled direct.bin into destination tmp (avoid re-assembly).
+                            #[cfg(feature = "lustre")]
+                            let dst_striping = Some(LustreStriping::new(
+                                cfg.chunk_size as u64,
+                                stripe_count_for_size(final_size, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+                            ));
+                            #[cfg(not(feature = "lustre"))]
+                            let dst_striping: Option<LustreStriping> = None;
+
                             let copy_cfg = StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false };
                             match copy_file_to_file(
                                 direct_path.clone(),
                                 dst_tmp.clone(),
                                 final_size,
+                                dst_striping,
                                 copy_cfg,
                                 app.uring.clone(),
                                 app.pool.clone(),
@@ -1256,10 +1297,19 @@ async fn handle_complete(
     let _ = fs::remove_file(&staged_out);
 
     // Open staging output. If staging in dst fails, fall back to upload dir staging.
+    #[cfg(feature = "lustre")]
+    let staging_striping = Some(LustreStriping::new(
+        cfg.chunk_size as u64,
+        stripe_count_for_size(final_size, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+    ));
+    #[cfg(not(feature = "lustre"))]
+    let staging_striping: Option<LustreStriping> = None;
+
     let out_file: Arc<std::fs::File> = match open_file(
         &staged_out,
         OpenMode::WriteCreateTruncate,
         OpenDirect::Buffered,
+        staging_striping,
     ) {
         Ok((f, _used_direct)) => Arc::new(f),
 
@@ -1276,6 +1326,7 @@ async fn handle_complete(
                 &staged_out,
                 OpenMode::WriteCreateTruncate,
                 OpenDirect::Buffered,
+                staging_striping,
             ) {
                 Ok((f2, _used_direct2)) => Arc::new(f2),
                 Err(e2) => {
@@ -1298,7 +1349,7 @@ async fn handle_complete(
     };
 
     let direct_path = upload_direct_path(&dir);
-    let direct_file = match open_file(&direct_path, OpenMode::Read, OpenDirect::Buffered) {
+    let direct_file = match open_file(&direct_path, OpenMode::Read, OpenDirect::Buffered, None) {
         Ok((f, _used_direct)) => Some(Arc::new(f)),
         Err(e) => {
             tracing::warn!("cannot open direct.bin {}: {e}", direct_path.display());
@@ -1329,7 +1380,7 @@ async fn handle_complete(
             }
             PartStored::File { name } => {
                 let src_path = upload_parts_dir(&dir).join(&name);
-                let src_file = match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered) {
+                let src_file = match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
                     Ok((f, _used_direct)) => Arc::new(f),
                     Err(e) => {
                         return s3pm_support::s3resp::internal_error(
@@ -1392,6 +1443,7 @@ async fn handle_complete(
                     staged_out.clone(),
                     dst_tmp.clone(),
                     out_off,
+                    None, // file on different FS
                     copy_cfg,
                     app.uring.clone(),
                     app.pool.clone(),

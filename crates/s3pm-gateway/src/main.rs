@@ -51,6 +51,8 @@ use crate::fs_helpers::{
     join_object_path,
     open_file,
     statx_info,
+    stripe_count_for_size,
+    LustreStriping,
     OpenMode,
     OpenDirect,
 };
@@ -75,6 +77,7 @@ struct Cfg {
     direct_io: bool,
     copy_max_size: u64,
     mpu_dir_name: String,
+    lustre_max_stripe_count: u32
 }
 
 fn env_bool(k: &str, default: bool) -> bool {
@@ -124,6 +127,9 @@ fn load_cfg() -> Result<Cfg> {
         return Err(anyhow!("invalid S3PM_MPU_DIR={mpu_dir_name:?} (must be a single path component)"));
     }
 
+    // Maximum Lustre stripe count (only effective with --features lustre)
+    let lustre_max_stripe_count = env_usize("S3PM_LUSTRE_MAX_STRIPE_COUNT", 4).max(1) as u32;
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -138,6 +144,7 @@ fn load_cfg() -> Result<Cfg> {
         direct_io,
         copy_max_size,
         mpu_dir_name,
+        lustre_max_stripe_count,
     })
 }
 
@@ -403,7 +410,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
     };
 
     // open once (buffered) to stat + inode + size
-    let (std_file, _used_direct) = match open_file(&obj_path, OpenMode::Read, OpenDirect::Buffered) {
+    let (std_file, _used_direct) = match open_file(&obj_path, OpenMode::Read, OpenDirect::Buffered, None) {
         Ok(v) => v,
         Err(e) => {
             let ioe = e.downcast_ref::<std::io::Error>();
@@ -1277,10 +1284,18 @@ async fn handle_put_object(
 
     let (parts, body) = req.into_parts();
 
+    #[cfg(feature = "lustre")]
+    let striping = Some(LustreStriping::new(
+        cfg.chunk_size as u64,
+        stripe_count_for_size(logical_len, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+    ));
+    #[cfg(not(feature = "lustre"))]
+    let striping: Option<LustreStriping> = None;
+
     // Stream-write
     if let Err(e) = write_object_body(
         body,
-        WriteObjectDest::Path { path: obj_path.clone() },
+        WriteObjectDest::Path { path: obj_path.clone(), striping },
         logical_len,
         is_streaming_sigv4,
         StreamCfg {
@@ -1396,6 +1411,15 @@ async fn handle_copy_object(
     }
 
     let size = src_meta.len();
+
+    #[cfg(feature = "lustre")]
+    let dst_striping = Some(LustreStriping::new(
+        cfg.chunk_size as u64,
+        stripe_count_for_size(size, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+    ));
+    #[cfg(not(feature = "lustre"))]
+    let dst_striping: Option<LustreStriping> = None;
+
     if size > cfg.copy_max_size {
         return s3pm_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
@@ -1413,6 +1437,7 @@ async fn handle_copy_object(
         src_path,
         dst_path.clone(),
         size,
+        dst_striping,
         StreamCfg {
             chunk_size: cfg.chunk_size,
             inflight: cfg.inflight,

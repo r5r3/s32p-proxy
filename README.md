@@ -148,6 +148,14 @@ Notes / behavior:
 - Rejects most query parameters for now (including presigned URLs), except those required for:
   - `?location`, `?list-type=2`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
 - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
+- When built with `--features lustre`, the gateway creates new files with Lustre striping via `llapi_file_create()`.
+  - Config: `S3PM_LUSTRE_MAX_STRIPE_COUNT` (default: `4`) caps the stripe count.
+  - **Serial uploads** (`PutObject`, `CopyObject`, and any temp/staging files):
+    - `stripe_size = S3PM_CHUNK_SIZE_MB`
+    - `stripe_count = ceil(file_size / stripe_size)`, capped by `S3PM_LUSTRE_MAX_STRIPE_COUNT`
+  - **Multipart uploads**:
+    - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S3PM_LUSTRE_MAX_STRIPE_COUNT`
+    - individual part files are striped like serial uploads.
 - `ETag` for final objects is generated from the inode number.
 
 #### Multipart upload (`s3pm-gateway`) — server-side assembly algorithm

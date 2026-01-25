@@ -25,8 +25,9 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
         .clang_args(clang_args)
-        // Keep the surface area small: only what we need for lockahead via llapi_ladvise.
+        // Keep the surface area small: only what we need.
         .allowlist_function("llapi_ladvise.*")
+        .allowlist_function("llapi_file_create")
         .allowlist_type("llapi_lu_ladvise.*")
         .allowlist_type("lu_ladvise_type")
         .rustified_enum("lu_ladvise_type")

@@ -22,6 +22,7 @@ use crate::fs_helpers::{
     open_file,
     OpenMode,
     OpenDirect,
+    LustreStriping,
     try_preallocate_range,
 };
 
@@ -164,7 +165,7 @@ async fn stream_range_task(
         let allowed = std::cmp::min(inflight_cfg, needed);
         let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
 
-        let (std_file, _used_direct) = open_file(&path, OpenMode::Read, OpenDirect::Buffered)?;
+        let (std_file, _used_direct) = open_file(&path, OpenMode::Read, OpenDirect::Buffered, None)?;
         let file = Arc::new(std_file);
         let sender = uring.sender(file.clone());
 
@@ -211,7 +212,7 @@ async fn read_tail_bytes(
         return Ok(Bytes::new());
     }
 
-    let (f, _used_direct) = open_file(path, OpenMode::Read, OpenDirect::Buffered)?;
+    let (f, _used_direct) = open_file(path, OpenMode::Read, OpenDirect::Buffered, None)?;
     let file = Arc::new(f);
 
     let pooled = pool
@@ -685,7 +686,7 @@ pub mod aws_chunked {
 /// Destination for an upload write.
 pub enum WriteObjectDest {
     /// Create/truncate and write the whole object starting at offset 0.
-    Path { path: PathBuf },
+    Path { path: PathBuf, striping: Option<LustreStriping> },
 
     /// Write into an already-open file at a fixed start offset (no truncate).
     File { file: Arc<std::fs::File>, start_off: u64 },
@@ -751,7 +752,7 @@ pub async fn write_object_body(
 
     // Resolve file + start offset + whether we should truncate to logical_len at the end.
     let (file, start_off, truncate_to_logical) = match dest {
-        WriteObjectDest::Path { path } => {
+        WriteObjectDest::Path { path, striping } => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| anyhow!("create_dir_all {}: {e}", parent.display()))?;
@@ -761,6 +762,7 @@ pub async fn write_object_body(
                 &path,
                 OpenMode::WriteCreateTruncate,
                 if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+                striping,
             )
             .map_err(|e| anyhow!("open {}: {e}", path.display()))?;
 
@@ -922,6 +924,7 @@ pub async fn copy_file_to_file(
     src_path: PathBuf,
     dst_path: PathBuf,
     file_size: u64,
+    dst_striping: Option<LustreStriping>,
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
@@ -953,6 +956,7 @@ pub async fn copy_file_to_file(
         &src_path,
         OpenMode::Read,
         if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+        None,
     )?;
     let src_file = Arc::new(src_f);
 
@@ -960,6 +964,7 @@ pub async fn copy_file_to_file(
         &dst_path,
         OpenMode::WriteCreateTruncate,
         if direct { OpenDirect::Direct } else { OpenDirect::Buffered },
+        dst_striping,
     )
     .map_err(|e| anyhow!("open {}: {e}", dst_path.display()))?;
     let dst_file = Arc::new(dst_f);

@@ -78,8 +78,49 @@ pub enum OpenDirect {
     TryDirect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LustreStriping {
+    /// Stripe size in bytes.
+    pub stripe_size: u64,
+    /// Stripe count (number of OSTs). Must be >= 1.
+    pub stripe_count: i32,
+    /// Stripe offset (starting OST index). Use -1 for default.
+    pub stripe_offset: i32,
+    /// Stripe pattern. Use 0 (LOV_PATTERN_RAID0) for normal striping.
+    pub stripe_pattern: u32,
+}
+
+impl LustreStriping {
+    pub fn new(stripe_size: u64, stripe_count: u32) -> Self {
+        Self {
+            stripe_size,
+            stripe_count: stripe_count.max(1) as i32,
+            stripe_offset: -1,
+            stripe_pattern: 0,
+        }
+    }
+}
+
+/// Compute a stripe count matching file size (ceil(file_size / stripe_size)),
+/// capped by `max_stripe_count` (and always >= 1).
+pub fn stripe_count_for_size(file_size: u64, stripe_size: u64, max_stripe_count: u32) -> u32 {
+    if stripe_size == 0 {
+        return 1;
+    }
+    let mut n = ((file_size + stripe_size - 1) / stripe_size) as u32;
+    if n < 1 {
+        n = 1;
+    }
+    if max_stripe_count > 0 && n > max_stripe_count {
+        n = max_stripe_count;
+    }
+    n
+}
+
 fn is_direct_io_not_supported(e: &io::Error) -> bool {
-    let Some(errno) = e.raw_os_error() else { return false };
+    let Some(errno) = e.raw_os_error() else {
+        return false;
+    };
     errno == libc::EINVAL
         || errno == libc::EOPNOTSUPP
         || errno == libc::ENOTSUP
@@ -110,15 +151,86 @@ fn open_file_io(path: &Path, mode: OpenMode, direct: bool) -> io::Result<File> {
 
 /// Open a file with the requested mode and direct I/O behavior.
 /// Returns (file, used_direct).
-pub fn open_file(path: &Path, mode: OpenMode, direct: OpenDirect) -> Result<(File, bool)> {
+///
+/// When the `lustre` feature is enabled, the caller may request Lustre striping for newly
+/// created files via `striping`.
+pub fn open_file(
+    path: &Path,
+    mode: OpenMode,
+    direct: OpenDirect,
+    striping: Option<LustreStriping>,
+) -> Result<(File, bool)> {
+    // Lustre striping must be set at file creation time.
+    #[cfg(all(feature = "lustre", target_os = "linux"))]
+    {
+        if let Some(s) = striping {
+            let should_create = match mode {
+                OpenMode::Read => false,
+                OpenMode::WriteCreateTruncate => true,
+                OpenMode::ReadWriteCreate => !path.exists(),
+            };
+
+            if should_create {
+                // llapi_file_create() fails with EEXIST. For truncate-writes, remove the old file first.
+                if matches!(mode, OpenMode::WriteCreateTruncate) {
+                    match std::fs::remove_file(path) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "remove_file {} failed before llapi_file_create: {e}",
+                                path.display()
+                            ))
+                        }
+                    }
+                }
+
+                // Best-effort create with striping. If a racing creator wins (EEXIST), just open.
+                match crate::lustre::file_create(
+                    path,
+                    s.stripe_size,
+                    s.stripe_offset,
+                    s.stripe_count,
+                    s.stripe_pattern,
+                ) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            "created lustre-striped file {:?} stripe_size={} stripe_count={}",
+                            path,
+                            s.stripe_size,
+                            s.stripe_count
+                        );
+                    }
+                    Err(e) => {
+                        let is_eexist = e
+                            .downcast_ref::<io::Error>()
+                            .and_then(|ioe| ioe.raw_os_error())
+                            .is_some_and(|errno| errno == libc::EEXIST);
+
+                        if !is_eexist {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     match direct {
-        OpenDirect::Buffered => Ok((open_file_io(path, mode, false).map_err(anyhow::Error::from)?, false)),
-        OpenDirect::Direct => Ok((open_file_io(path, mode, true).map_err(anyhow::Error::from)?, true)),
+        OpenDirect::Buffered => Ok((
+            open_file_io(path, mode, false).map_err(anyhow::Error::from)?,
+            false,
+        )),
+        OpenDirect::Direct => Ok((
+            open_file_io(path, mode, true).map_err(anyhow::Error::from)?,
+            true,
+        )),
         OpenDirect::TryDirect => match open_file_io(path, mode, true) {
             Ok(f) => Ok((f, true)),
-            Err(e) if is_direct_io_not_supported(&e) => {
-                Ok((open_file_io(path, mode, false).map_err(anyhow::Error::from)?, false))
-            }
+            Err(e) if is_direct_io_not_supported(&e) => Ok((
+                open_file_io(path, mode, false).map_err(anyhow::Error::from)?,
+                false,
+            )),
             Err(e) => Err(anyhow!(e)),
         },
     }
@@ -150,9 +262,9 @@ pub fn try_preallocate_range(fd: RawFd, start: u64, len: u64) -> Result<()> {
         return Ok(());
     }
 
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| anyhow!("preallocate range overflow: start={start} len={len}"))?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        anyhow!("preallocate range overflow: start={start} len={len}")
+    })?;
 
     let rc = unsafe { libc::fallocate(fd, 0, start as libc::off_t, len as libc::off_t) };
     if rc == 0 {
@@ -201,7 +313,8 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
 
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
     let mask: libc::c_uint =
-        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
+        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID)
+            as libc::c_uint;
 
     let rc = unsafe {
         libc::statx(
@@ -216,7 +329,8 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
         return None;
     }
 
-    let mtime = system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
+    let mtime =
+        system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
 
     Some(StatxInfo {
         ino: stx.stx_ino as u64,
