@@ -52,7 +52,6 @@ This repository is a Rust workspace with multiple crates:
 │  • maps access key → unix user           │
 │  • looks up user + ACLs via Directory    │
 │    (YAML file or OpenBao)                │
-│  • local ListBuckets response            │
 │  • classifies requests (query+path)      │
 │  • routes by "request class" via YAML    │
 │    (proxy to profile or local response)  │
@@ -103,7 +102,7 @@ This repository is a Rust workspace with multiple crates:
   - Shared by proxy + gateway (single source of truth for routing decisions)
   - Parses path + query parameters (and selected headers where needed, e.g. `x-amz-copy-source`)
   - Produces a high-level operation class key:
-    - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV2`, `GetBucketLocation`, `HeadBucket`)
+    - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV2`, `ListBuckets`, `GetBucketLocation`, `HeadBucket`)
     - `write` (e.g. `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`)
     - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
     - `versioning` (detected, but not implemented yet)
@@ -127,6 +126,7 @@ Implemented operations:
   - `GetObject`
   - `HeadObject`
   - `HeadBucket`
+  - `ListBuckets`
   - `GetBucketLocation`
   - `ListObjectsV2`
 - **Write**
@@ -286,12 +286,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
 
 - Shared response helpers in `src/responses.rs`
   - S3 REST-XML errors (e.g. `AccessDenied`, `SignatureDoesNotMatch`, `NotImplemented`)
-  - A `ListBuckets` XML body builder and response helper
   - General `respond_bytes()` helper for header/body responses
-
-Implemented local operations:
-
-- **ListBuckets** (`GET /`) is answered locally (after SigV4 validation).
 
 #### SigV4 validation behavior
 
@@ -302,7 +297,7 @@ Implemented local operations:
   - Once a worker is already running, the proxy does **not** fully validate SigV4;
     it only extracts the access key for routing and forwards the request to the worker
 
-- Workers (VersityGW) still validate SigV4 again (cannot be disabled).
+- Workers (VersityGW or s3pm-gateway) still validate SigV4 again (cannot be disabled).
 
 #### Worker lifecycle management (`src/worker_manager.rs`)
 
