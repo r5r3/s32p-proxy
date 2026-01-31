@@ -207,6 +207,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let class = s3pm_support::classifier::classify_with_headers(req.method().as_str(), req.uri(), Some(req.headers()));
 
     let resp = match &class.op {
+        s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::ListBuckets) => {
+            handle_list_buckets(req, app, &class).await
+        }
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::GetBucketLocation) => {
             handle_get_bucket_location(req, app, &class).await
         }
@@ -276,6 +279,278 @@ fn query_is_only_location(req: &Request<Incoming>) -> bool {
             let first = parts.next().unwrap_or("");
             parts.next().is_none() && (first == "location" || first.starts_with("location="))
         })
+}
+
+// -------------------------
+// ListBuckets (pagination)
+// -------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ListBucketsToken {
+    v: u8,
+    bucket_region: Option<String>,
+    prefix: Option<String>,
+    after: String,
+}
+
+fn encode_list_buckets_token(tok: &ListBucketsToken) -> Result<String> {
+    let js = serde_json::to_vec(tok)?;
+    Ok(URL_SAFE_NO_PAD.encode(js))
+}
+
+fn decode_list_buckets_token(s: &str) -> Result<ListBucketsToken> {
+    let raw = URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|e| anyhow!("bad continuation-token: {e}"))?;
+    let tok: ListBucketsToken = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow!("bad continuation-token json: {e}"))?;
+    Ok(tok)
+}
+
+async fn handle_list_buckets(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    // Optional params
+    let bucket_region_q = if class.query.has("bucket-region") {
+        Some(class.query.first("bucket-region").unwrap_or("").to_string())
+    } else {
+        None
+    };
+
+    // AWS requires that the request is made to the regional endpoint that matches bucket-region.
+    if let Some(br) = bucket_region_q.as_deref() {
+        if !br.is_empty() && br != cfg.region.as_str() {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                "bucket-region does not match this endpoint region",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    }
+
+    let prefix_q = if class.query.has("prefix") {
+        Some(class.query.first("prefix").unwrap_or("").to_string())
+    } else {
+        None
+    };
+
+    let continuation_in = class
+        .query
+        .first("continuation-token")
+        .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) });
+
+    let max_buckets_in = match class.query.first("max-buckets") {
+        None => None,
+        Some(s) => match s.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return s3pm_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                    "invalid max-buckets",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+    };
+
+    if let Some(m) = max_buckets_in {
+        if m < 1 || m > 10_000 {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                "max-buckets must be between 1 and 10000",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    }
+
+    let paginated = max_buckets_in.is_some()
+        || class.query.has("bucket-region")
+        || class.query.has("prefix")
+        || class.query.has("continuation-token");
+
+    // Per AWS docs: if bucket-region/prefix/continuation-token are specified without max-buckets,
+    // apply a default page size of 10,000.
+    let page_size = if let Some(m) = max_buckets_in {
+        Some(m)
+    } else if paginated {
+        Some(10_000)
+    } else {
+        None
+    };
+
+    // Load buckets from the POSIX root (top-level directories).
+    let mut buckets: Vec<(String, SystemTime)> = Vec::new();
+    let rd = match fs::read_dir(&cfg.posix_root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            return s3pm_support::s3resp::access_denied(
+                &format!("read_dir failed: {e}"),
+                Some(req.uri().path()),
+            );
+        }
+    };
+
+    for ent in rd {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let ft = match ent.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let ft = match ent.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let (is_dir, created) = if ft.is_symlink() {
+            let link_path = ent.path();
+            let target = match fs::read_link(&link_path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let target = if target.is_relative() {
+                match link_path.parent() {
+                    Some(p) => p.join(target),
+                    None => continue,
+                }
+            } else {
+                target
+            };
+            match fs::metadata(&target) {
+                Ok(m) => (m.is_dir(), m.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH)),
+                Err(_) => continue,
+            }
+        } else {
+            let m = match ent.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            (ft.is_dir(), m.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH))
+        };
+
+        if !is_dir {
+            continue;
+        }
+
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+
+        buckets.push((name, created));
+    }
+
+    // Sort lexicographically by bucket name.
+    buckets.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Apply prefix filter.
+    if let Some(pfx) = prefix_q.as_deref() {
+        buckets.retain(|(name, _)| name.starts_with(pfx));
+    }
+
+    // Apply continuation token.
+    let mut start_after = String::new();
+    if let Some(ct) = &continuation_in {
+        match decode_list_buckets_token(ct) {
+            Ok(tok) => {
+                // Validate token matches request filters.
+                if tok.v != 1 {
+                    return s3pm_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                        "unsupported continuation-token version",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                if tok.prefix != prefix_q || tok.bucket_region != bucket_region_q {
+                    return s3pm_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                        "continuation-token does not match request parameters",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                start_after = tok.after;
+            }
+            Err(e) => {
+                return s3pm_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        }
+    }
+
+    if !start_after.is_empty() {
+        buckets.retain(|(name, _)| name.as_str() > start_after.as_str());
+    }
+
+    let mut next_token_out: Option<String> = None;
+    let mut page: Vec<(String, SystemTime)> = buckets;
+
+    if let Some(ps) = page_size {
+        let ps = ps as usize;
+        if page.len() > ps {
+            let last_name = page[ps - 1].0.clone();
+            page.truncate(ps);
+
+            let tok = ListBucketsToken {
+                v: 1,
+                bucket_region: bucket_region_q.clone(),
+                prefix: prefix_q.clone(),
+                after: last_name,
+            };
+            match encode_list_buckets_token(&tok) {
+                Ok(s) => next_token_out = Some(s),
+                Err(e) => {
+                    return s3pm_support::s3resp::internal_error(
+                        &e.to_string(),
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    let include_bucket_region = paginated;
+    let out: Vec<s3pm_support::s3xml::BucketInfo> = page
+        .into_iter()
+        .map(|(name, creation_date)| s3pm_support::s3xml::BucketInfo {
+            name,
+            bucket_region: include_bucket_region.then(|| cfg.region.clone()),
+            bucket_arn: None,
+            creation_date,
+        })
+        .collect();
+
+    s3pm_support::s3resp::list_buckets_paginated(
+        &cfg.access_key,
+        &cfg.access_key,
+        &out,
+        prefix_q.as_deref(),
+        next_token_out.as_deref(),
+    )
 }
 
 async fn handle_get_bucket_location(

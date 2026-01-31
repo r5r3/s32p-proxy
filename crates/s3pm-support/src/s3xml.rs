@@ -34,7 +34,11 @@ pub mod error_code {
 #[derive(Clone, Debug)]
 pub struct BucketInfo {
     pub name: String,
-    pub creation_date: OffsetDateTime,
+    /// Optional bucket region (used by paginated ListBuckets responses).
+    pub bucket_region: Option<String>,
+    /// Optional bucket ARN.
+    pub bucket_arn: Option<String>,
+    pub creation_date: SystemTime,
 }
 
 /* -------------------------
@@ -60,26 +64,40 @@ pub fn s3_error_body(
     Ok(xml.into_bytes())
 }
 
-pub fn list_buckets_body(
+pub fn list_buckets_body(owner_id: &str, owner_display_name: &str, buckets: &[BucketInfo]) -> Result<Vec<u8>> {
+    list_buckets_body_paginated(owner_id, owner_display_name, buckets, None, None)
+}
+
+/// Build XML body for ListBuckets (optionally paginated/filter-aware).
+///
+/// `next_continuation_token` is included only when there are more buckets to list.
+/// `prefix` is echoed in the response only when it was provided in the request.
+pub fn list_buckets_body_paginated(
     owner_id: &str,
     owner_display_name: &str,
     buckets: &[BucketInfo],
+    prefix: Option<&str>,
+    next_continuation_token: Option<&str>,
 ) -> Result<Vec<u8>> {
     let doc = ListAllMyBucketsResult {
         xmlns: S3_XMLNS,
-        owner: Owner {
-            id: owner_id.to_string(),
-            display_name: owner_display_name.to_string(),
-        },
         buckets: Buckets {
             bucket: buckets
                 .iter()
                 .map(|b| Bucket {
+                    bucket_arn: b.bucket_arn.clone(),
+                    bucket_region: b.bucket_region.clone(),
+                    creation_date: format_s3_time_system(b.creation_date),
                     name: b.name.clone(),
-                    creation_date: format_s3_time_utc_z(b.creation_date),
                 })
                 .collect(),
         },
+        owner: Owner {
+            id: owner_id.to_string(),
+            display_name: owner_display_name.to_string(),
+        },
+        continuation_token: next_continuation_token.map(|s| s.to_string()),
+        prefix: prefix.map(|s| s.to_string()),
     };
 
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
@@ -391,17 +409,25 @@ struct ErrorDocument {
     host_id: Option<String>,
 }
 
+// --- public DTOs for ListBuckets ---
+
 #[derive(Debug, Serialize)]
 #[serde(rename = "ListAllMyBucketsResult")]
 struct ListAllMyBucketsResult {
     #[serde(rename = "@xmlns")]
     xmlns: &'static str,
 
+    #[serde(rename = "Buckets")]
+    buckets: Buckets,
+
     #[serde(rename = "Owner")]
     owner: Owner,
 
-    #[serde(rename = "Buckets")]
-    buckets: Buckets,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<String>,
+
+    #[serde(rename = "Prefix", skip_serializing_if = "Option::is_none")]
+    prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,6 +446,12 @@ struct Buckets {
 
 #[derive(Debug, Serialize)]
 struct Bucket {
+    #[serde(rename = "BucketArn", skip_serializing_if = "Option::is_none")]
+    bucket_arn: Option<String>,
+
+    #[serde(rename = "BucketRegion", skip_serializing_if = "Option::is_none")]
+    bucket_region: Option<String>,
+
     #[serde(rename = "Name")]
     name: String,
     #[serde(rename = "CreationDate")]
@@ -701,4 +733,3 @@ pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
     parts.dedup();
     Ok(parts)
 }
-

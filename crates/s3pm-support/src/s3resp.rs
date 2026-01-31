@@ -176,9 +176,28 @@ pub fn service_unavailable(message: &str, resource: Option<&str>, request_id: Op
 
 /// Convenience: ListBuckets success (200).
 pub fn list_buckets(owner_id: &str, owner_display_name: &str, buckets: &[s3xml::BucketInfo]) -> HttpResponse {
-    let body = s3xml::list_buckets_body(owner_id, owner_display_name, buckets).unwrap_or_else(|_| {
-        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
-    });
+    list_buckets_paginated(owner_id, owner_display_name, buckets, None, None)
+}
+
+/// Convenience: ListBuckets success (200), with optional pagination/filter fields.
+///
+/// `prefix` is echoed back in the response only when provided.
+/// `next_continuation_token` is included only when there are more buckets to list.
+pub fn list_buckets_paginated(
+    owner_id: &str,
+    owner_display_name: &str,
+    buckets: &[s3xml::BucketInfo],
+    prefix: Option<&str>,
+    next_continuation_token: Option<&str>,
+) -> HttpResponse {
+    let body = s3xml::list_buckets_body_paginated(
+        owner_id,
+        owner_display_name,
+        buckets,
+        prefix,
+        next_continuation_token,
+    )
+    .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
 
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }

@@ -95,6 +95,8 @@ pub enum ObjectLockOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOp {
+    /// GET / (ListBuckets)
+    ListBuckets,
     /// GET /{bucket}/{key} (no query params)
     GetObject,
     /// HEAD /{bucket}/{key} (no query params)
@@ -185,6 +187,16 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
 pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap>) -> S3RequestClass {
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     let query = QueryParams::from_uri(uri);
+
+    // ListBuckets: GET / (may include pagination/filter query params)
+    if method == "GET" && bucket.is_none() && key.is_none() {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Read(ReadOp::ListBuckets),
+        };
+    }
 
     // Detect multipart first (uploadId can coexist with versionId in theory,
     // but multipart routing is usually clearer).
