@@ -107,6 +107,7 @@ This repository is a Rust workspace with multiple crates:
     - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
     - `versioning` (detected, but not implemented yet)
     - `object_lock` (detected, but not implemented yet)
+    - `bucket_admin` (CreateBucket/DeleteBucket; detected, but not implemented yet)
     - `other`
 
 - **Config-driven routing** (`etc/s3-proxy-manager.yaml`)
