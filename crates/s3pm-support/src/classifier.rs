@@ -27,6 +27,8 @@ pub enum S3Op {
     Read(ReadOp),
     /// Basic write operations.
     Write(WriteOp),
+    /// Bucket administration operations.
+    BucketAdmin(BucketAdminOp),
     /// Anything else (for now).
     Other,
 }
@@ -121,6 +123,14 @@ pub enum WriteOp {
     DeleteObjects,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketAdminOp {
+    /// PUT /{bucket}
+    CreateBucket,
+    /// DELETE /{bucket}
+    DeleteBucket,
+}
+
 /// Parsed query params with lowercased keys.
 /// Values are percent-decoded (via url::form_urlencoded), which is correct for routing.
 /// Presence-only parameters are stored as empty string value (e.g. "?uploads" -> ("uploads","")).
@@ -176,8 +186,9 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
         S3Op::Multipart(_) => "multipart",
         S3Op::Versioning(_) => "versioning",
         S3Op::ObjectLock(_) => "object_lock",
-        S3Op::Read(_) => "read", // grouped "basic read" ops (GetObject, GetBucketLocation, ...)
+        S3Op::Read(_) => "read",
         S3Op::Write(_) => "write",
+        S3Op::BucketAdmin(_) => "bucket_admin",
         S3Op::Other => "other",
     }
 }
@@ -248,6 +259,27 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
             op: S3Op::Read(ReadOp::HeadBucket),
         };
     }
+
+    // CreateBucket: PUT /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
+    if method == "PUT" && bucket.is_some() && key.is_none() && (query.is_empty() || query.is_only("x-id")) {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::BucketAdmin(BucketAdminOp::CreateBucket),
+        };
+    }
+
+    // DeleteBucket: DELETE /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
+    if method == "DELETE" && bucket.is_some() && key.is_none() && (query.is_empty() || query.is_only("x-id")) {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::BucketAdmin(BucketAdminOp::DeleteBucket),
+        };
+    }
+
 
     // GetObject: GET /{bucket}/{key} with *no* query params
     if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
@@ -345,6 +377,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
         S3Op::ObjectLock(_) => Some("object locking is not implemented"),
         S3Op::Read(_) => None, // handled by routing/gateway
         S3Op::Write(_) => None,
+        S3Op::BucketAdmin(_) => Some("bucket administration is not implemented"),
         S3Op::Other => None,
     }
 }

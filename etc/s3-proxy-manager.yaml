@@ -80,6 +80,9 @@ routing:
     write:
       action: "proxy"
       worker_profile: "s3pm-gateway"
+    bucket_admin:
+      action: "not_implemented"
+      message: "bucket administration is not implemented"
     other:
       action: "proxy"
       worker_profile: "versitygw-default"
