@@ -56,7 +56,7 @@ This repository is a Rust workspace with multiple crates:
 │  • routes by "request class" via YAML    │
 │    (proxy to profile or local response)  │
 │  • gates worker spawn with SigV4         │
-│    header-only validation                │
+│    verification (auth header or presign) │
 │  • reverse proxies to per-user worker    │
 │  • optional response header rewriting    │
 └───────────────────┬──────────────────────┘
@@ -146,8 +146,9 @@ Implemented operations:
 Notes / behavior:
 
 - Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
-- Rejects most query parameters for now (including presigned URLs), except those required for:
+- Rejects most query parameters for now, except those required for:
   - `?location`, `?list-type=2`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
+- **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as “effective” query parameters for routing/handling.
 - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
 - When built with `--features lustre`, the gateway creates new files with Lustre striping via `llapi_file_create()`.
   - Config: `S3PM_LUSTRE_MAX_STRIPE_COUNT` (default: `4`) caps the stripe count.
@@ -292,8 +293,9 @@ Group membership is resolved from the OS at runtime (username → gids → group
 #### SigV4 validation behavior
 
 - **DoS mitigation via “spawn gating”**
-  - If a worker is **not running**, the proxy performs **SigV4 header-only verification**
-    using `aws-sigv4` and the client-provided `x-amz-content-sha256`
+  - If a worker is **not running**, the proxy performs **SigV4 verification without reading the body**:
+    - Standard SigV4 auth header (`Authorization`, `x-amz-content-sha256`)
+    - SigV4 **presigned URLs** (query signature; typically `UNSIGNED-PAYLOAD`)
   - Only if the signature is valid will the proxy start the worker
   - Once a worker is already running, the proxy does **not** fully validate SigV4;
     it only extracts the access key for routing and forwards the request to the worker
@@ -642,7 +644,7 @@ mcli ls --debug S3PM
 
 Notes:
 
-- For the first request when no worker exists, the proxy validates SigV4 (header-only) before spawning.
+- For the first request when no worker exists, the proxy validates SigV4 (auth header or presigned URL) before spawning.
 - VersityGW validates SigV4 again.
 
 ---
