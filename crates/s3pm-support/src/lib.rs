@@ -46,6 +46,103 @@ pub struct PresignedSigV4Auth {
     pub security_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigV4VerifyErrorKind {
+    AccessDenied,
+    SignatureDoesNotMatch,
+}
+
+#[derive(Debug, Clone)]
+pub struct SigV4VerifyError {
+    pub kind: SigV4VerifyErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for SigV4VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for SigV4VerifyError {}
+
+fn ve(kind: SigV4VerifyErrorKind, msg: impl Into<String>) -> SigV4VerifyError {
+    SigV4VerifyError {
+        kind,
+        message: msg.into(),
+    }
+}
+
+/// Verify either:
+/// - standard SigV4 header Authorization, or
+/// - SigV4 presigned URL (query params)
+///
+/// `expected_access_key`:
+/// - If `Some`, the signer access key must match it.
+/// - If `None`, no access-key match is enforced (useful if caller already selected credentials by key).
+pub fn verify_sigv4_request_any(
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    expected_access_key: Option<&str>,
+    secret_key: &str,
+    public_scheme: &str,
+) -> std::result::Result<(), SigV4VerifyError> {
+    // Header-style SigV4
+    if headers.get("authorization").is_some() {
+        let auth = parse_authorization(headers)
+            .map_err(|e| ve(SigV4VerifyErrorKind::AccessDenied, format!("bad Authorization: {e}")))?;
+
+        if let Some(exp) = expected_access_key {
+            if auth.access_key != exp {
+                return Err(ve(
+                    SigV4VerifyErrorKind::AccessDenied,
+                    "unknown access key",
+                ));
+            }
+        }
+
+        verify_sigv4_header_only(method, uri, headers, &auth, secret_key, public_scheme).map_err(
+            |e| ve(SigV4VerifyErrorKind::SignatureDoesNotMatch, e.to_string()),
+        )?;
+
+        return Ok(());
+    }
+
+    // Presigned URL SigV4
+    let p = parse_presigned_query(uri).map_err(|e| {
+        ve(
+            SigV4VerifyErrorKind::AccessDenied,
+            format!("bad presign params: {e}"),
+        )
+    })?;
+
+    let auth = match p {
+        Some(a) => a,
+        None => {
+            return Err(ve(
+                SigV4VerifyErrorKind::AccessDenied,
+                "missing Authorization and missing presign params",
+            ))
+        }
+    };
+
+    if let Some(exp) = expected_access_key {
+        if auth.access_key != exp {
+            return Err(ve(
+                SigV4VerifyErrorKind::AccessDenied,
+                "unknown access key",
+            ));
+        }
+    }
+
+    verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key, public_scheme).map_err(
+        |e| ve(SigV4VerifyErrorKind::SignatureDoesNotMatch, e.to_string()),
+    )?;
+
+    Ok(())
+}
+
 /// Parse SigV4 presign params from the URI query string.
 /// Returns `Ok(None)` if the request is not using presigned URLs.
 pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {

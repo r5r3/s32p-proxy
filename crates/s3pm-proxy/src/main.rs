@@ -366,112 +366,42 @@ async fn validate_sigv4_header_only_or_reject(
     user: &UserDoc,
     public_scheme: &str,
 ) -> PResult<bool> {
-    // Header-style SigV4
-    if req.headers.get("authorization").is_some() {
-        let auth = match s3pm_support::parse_authorization(&req.headers) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(uid = user.uid, error = %e, "failed to parse Authorization");
-                responses::respond_s3_error(
-                    session,
-                    StatusCode::FORBIDDEN,
-                    responses::error_code::ACCESS_DENIED,
-                    &e.to_string(),
-                    Some(req.uri.path()),
-                    None,
-                )
-                .await?;
-                return Ok(true);
-            }
-        };
-
-        if let Err(e) = s3pm_support::verify_sigv4_header_only(
-            req.method.as_str(),
-            &req.uri,
-            &req.headers,
-            &auth,
-            &user.secret_key,
-            public_scheme,
-        ) {
-            tracing::warn!(
-                uid = user.uid,
-                username = user.username.as_str(),
-                error = %e,
-                "sigv4 header-only verification failed"
-            );
-            responses::respond_s3_error(
-                session,
-                StatusCode::FORBIDDEN,
-                responses::error_code::SIGNATURE_DOES_NOT_MATCH,
-                &e.to_string(),
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-            return Ok(true);
-        }
-
-        return Ok(false);
-    }
-
-    // Presigned URL SigV4 (query signature)
-    let auth = match s3pm_support::parse_presigned_query(&req.uri) {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            let e = anyhow::anyhow!("missing Authorization and missing presign params");
-            responses::respond_s3_error(
-                session,
-                StatusCode::FORBIDDEN,
-                responses::error_code::ACCESS_DENIED,
-                &e.to_string(),
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-            return Ok(true);
-        }
-        Err(e) => {
-            tracing::warn!(uid = user.uid, error = %e, "failed to parse presigned params");
-            responses::respond_s3_error(
-                session,
-                StatusCode::FORBIDDEN,
-                responses::error_code::ACCESS_DENIED,
-                &e.to_string(),
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-            return Ok(true);
-        }
-    };
-
-    if let Err(e) = s3pm_support::verify_sigv4_presigned_url(
+    let res = s3pm_support::verify_sigv4_request_any(
         req.method.as_str(),
         &req.uri,
         &req.headers,
-        &auth,
+        None, // proxy already selected `user` based on extracted access key
         &user.secret_key,
         public_scheme,
-    ) {
-        tracing::warn!(
-            uid = user.uid,
-            username = user.username.as_str(),
-            error = %e,
-            "sigv4 presigned-url verification failed"
-        );
-        responses::respond_s3_error(
-            session,
-            StatusCode::FORBIDDEN,
-            responses::error_code::SIGNATURE_DOES_NOT_MATCH,
-            &e.to_string(),
-            Some(req.uri.path()),
-            None,
-        )
-        .await?;
-        return Ok(true);
-    }
+    );
 
-    Ok(false)
+    match res {
+        Ok(()) => Ok(false),
+        Err(e) => {
+            let (status, code) = match e.kind {
+                s3pm_support::SigV4VerifyErrorKind::AccessDenied => (
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::ACCESS_DENIED,
+                ),
+                s3pm_support::SigV4VerifyErrorKind::SignatureDoesNotMatch => (
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::SIGNATURE_DOES_NOT_MATCH,
+                ),
+            };
+
+            responses::respond_s3_error(
+                session,
+                status,
+                code,
+                &e.message,
+                Some(req.uri.path()),
+                None,
+            )
+            .await?;
+
+            Ok(true)
+        }
+    }
 }
 
 fn rustls_prefer_fast_cipher() -> Result<()> {

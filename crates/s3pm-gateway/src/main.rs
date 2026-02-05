@@ -244,69 +244,24 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 }
 
 fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), Resp> {
-    // Header-style SigV4
-    if req.headers().get("authorization").is_some() {
-        let auth = match s3pm_support::parse_authorization(req.headers()) {
-            Ok(a) => a,
-            Err(e) => {
-                return Err(s3pm_support::s3resp::access_denied(
-                    &format!("bad Authorization: {e}"),
-                    None,
-                ))
-            }
-        };
-
-        if auth.access_key != cfg.access_key {
-            return Err(s3pm_support::s3resp::access_denied("unknown access key", None));
-        }
-
-        if let Err(e) = s3pm_support::verify_sigv4_header_only(
-            req.method().as_str(),
-            req.uri(),
-            req.headers(),
-            &auth,
-            &cfg.secret_key,
-            &cfg.public_scheme,
-        ) {
-            return Err(s3pm_support::s3resp::signature_does_not_match(&e.to_string(), None));
-        }
-
-        return Ok(());
-    }
-
-    // Presigned URL SigV4 (query signature)
-    let auth = match s3pm_support::parse_presigned_query(req.uri()) {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            return Err(s3pm_support::s3resp::access_denied(
-                "missing Authorization and missing presign params",
-                None,
-            ))
-        }
-        Err(e) => {
-            return Err(s3pm_support::s3resp::access_denied(
-                &format!("bad presign params: {e}"),
-                None,
-            ))
-        }
-    };
-
-    if auth.access_key != cfg.access_key {
-        return Err(s3pm_support::s3resp::access_denied("unknown access key", None));
-    }
-
-    if let Err(e) = s3pm_support::verify_sigv4_presigned_url(
+    match s3pm_support::verify_sigv4_request_any(
         req.method().as_str(),
         req.uri(),
         req.headers(),
-        &auth,
+        Some(&cfg.access_key),
         &cfg.secret_key,
         &cfg.public_scheme,
     ) {
-        return Err(s3pm_support::s3resp::signature_does_not_match(&e.to_string(), None));
+        Ok(()) => Ok(()),
+        Err(e) => match e.kind {
+            s3pm_support::SigV4VerifyErrorKind::AccessDenied => {
+                Err(s3pm_support::s3resp::access_denied(&e.message, None))
+            }
+            s3pm_support::SigV4VerifyErrorKind::SignatureDoesNotMatch => Err(
+                s3pm_support::s3resp::signature_does_not_match(&e.message, None),
+            ),
+        },
     }
-
-    Ok(())
 }
 
 fn query_is_only_location(req: &Request<Incoming>) -> bool {
