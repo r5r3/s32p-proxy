@@ -177,6 +177,48 @@ impl QueryParams {
     pub fn is_only(&self, key: &str) -> bool {
         self.inner.len() == 1 && self.has(key)
     }
+
+    /// SigV4 presign query keys that should be ignored for routing/classification decisions.
+    /// (We still keep them in `query` for handlers that need them.)
+    fn is_sigv4_presign_key(key_lc: &str) -> bool {
+        matches!(
+            key_lc,
+            "x-amz-algorithm"
+                | "x-amz-credential"
+                | "x-amz-date"
+                | "x-amz-expires"
+                | "x-amz-signedheaders"
+                | "x-amz-signature"
+                | "x-amz-security-token"
+        )
+    }
+
+    /// True if there are no *effective* query params except SigV4-presign params.
+    pub fn is_empty_effective(&self) -> bool {
+        self.inner
+            .keys()
+            .all(|k| Self::is_sigv4_presign_key(k.as_str()))
+    }
+
+    /// True if the only *effective* (non-presign) query param key is `key`.
+    pub fn is_only_effective(&self, key: &str) -> bool {
+        let key_lc = key.to_ascii_lowercase();
+
+        let mut non_presign_keys = 0usize;
+        let mut has_key = false;
+
+        for k in self.inner.keys() {
+            if Self::is_sigv4_presign_key(k.as_str()) {
+                continue;
+            }
+            non_presign_keys += 1;
+            if *k == key_lc {
+                has_key = true;
+            }
+        }
+
+        non_presign_keys == 1 && has_key
+    }
 }
 
 /// Convert a parsed class into a stable routing key used by config/routing.
@@ -241,7 +283,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // GetBucketLocation: GET /{bucket}?location (or /{bucket}/?location), and ONLY that param
-    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only("location") {
+    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only_effective("location") {
         return S3RequestClass {
             bucket,
             key,
@@ -251,7 +293,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params
-    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty() {
+    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty_effective() {
         return S3RequestClass {
             bucket,
             key,
@@ -261,7 +303,11 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // CreateBucket: PUT /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
-    if method == "PUT" && bucket.is_some() && key.is_none() && (query.is_empty() || query.is_only("x-id")) {
+    if method == "PUT"
+        && bucket.is_some()
+        && key.is_none()
+        && (query.is_empty_effective() || query.is_only_effective("x-id"))
+    {
         return S3RequestClass {
             bucket,
             key,
@@ -271,7 +317,11 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // DeleteBucket: DELETE /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
-    if method == "DELETE" && bucket.is_some() && key.is_none() && (query.is_empty() || query.is_only("x-id")) {
+    if method == "DELETE"
+        && bucket.is_some()
+        && key.is_none()
+        && (query.is_empty_effective() || query.is_only_effective("x-id"))
+    {
         return S3RequestClass {
             bucket,
             key,
@@ -282,7 +332,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
 
 
     // GetObject: GET /{bucket}/{key} with *no* query params
-    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty() {
+    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
         return S3RequestClass {
             bucket,
             key,
@@ -292,7 +342,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // HeadObject: HEAD /{bucket}/{key} with *no* query params
-    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty() {
+    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
         return S3RequestClass {
             bucket,
             key,
@@ -319,7 +369,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     if method == "PUT"
         && bucket.is_some()
         && key.is_some()
-        && query.is_empty()
+        && query.is_empty_effective()
         && headers.is_some_and(|h| h.get("x-amz-copy-source").is_some())
     {
         return S3RequestClass {
@@ -331,7 +381,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // PutObject: PUT /{bucket}/{key} with *no* query params
-    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty() {
+    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
         return S3RequestClass {
             bucket,
             key,
@@ -351,7 +401,7 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
     }
 
     // DeleteObject: DELETE /{bucket}/{key} with *no* query params
-    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty() {
+    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
         return S3RequestClass {
             bucket,
             key,

@@ -244,11 +244,48 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 }
 
 fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), Resp> {
-    let auth = match s3pm_support::parse_authorization(req.headers()) {
-        Ok(a) => a,
+    // Header-style SigV4
+    if req.headers().get("authorization").is_some() {
+        let auth = match s3pm_support::parse_authorization(req.headers()) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(s3pm_support::s3resp::access_denied(
+                    &format!("bad Authorization: {e}"),
+                    None,
+                ))
+            }
+        };
+
+        if auth.access_key != cfg.access_key {
+            return Err(s3pm_support::s3resp::access_denied("unknown access key", None));
+        }
+
+        if let Err(e) = s3pm_support::verify_sigv4_header_only(
+            req.method().as_str(),
+            req.uri(),
+            req.headers(),
+            &auth,
+            &cfg.secret_key,
+            &cfg.public_scheme,
+        ) {
+            return Err(s3pm_support::s3resp::signature_does_not_match(&e.to_string(), None));
+        }
+
+        return Ok(());
+    }
+
+    // Presigned URL SigV4 (query signature)
+    let auth = match s3pm_support::parse_presigned_query(req.uri()) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return Err(s3pm_support::s3resp::access_denied(
+                "missing Authorization and missing presign params",
+                None,
+            ))
+        }
         Err(e) => {
             return Err(s3pm_support::s3resp::access_denied(
-                &format!("bad Authorization: {e}"),
+                &format!("bad presign params: {e}"),
                 None,
             ))
         }
@@ -258,7 +295,7 @@ fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), 
         return Err(s3pm_support::s3resp::access_denied("unknown access key", None));
     }
 
-    if let Err(e) = s3pm_support::verify_sigv4_header_only(
+    if let Err(e) = s3pm_support::verify_sigv4_presigned_url(
         req.method().as_str(),
         req.uri(),
         req.headers(),
@@ -274,11 +311,11 @@ fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), 
 
 fn query_is_only_location(req: &Request<Incoming>) -> bool {
     req.method() == http::Method::GET
-        && req.uri().query().is_some_and(|q| {
-            let mut parts = q.split('&').filter(|p| !p.is_empty());
-            let first = parts.next().unwrap_or("");
-            parts.next().is_none() && (first == "location" || first.starts_with("location="))
-        })
+        && s3pm_support::classifier::QueryParams::from_uri(req.uri()).is_only_effective("location")
+}
+
+fn has_effective_query(req: &Request<Incoming>) -> bool {
+    !s3pm_support::classifier::QueryParams::from_uri(req.uri()).is_empty_effective()
 }
 
 // -------------------------
@@ -595,7 +632,7 @@ async fn handle_head_bucket(
     }
 
     // Defensive: HeadBucket should not have query params in our implementation.
-    if req.uri().query().is_some() {
+    if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
@@ -649,8 +686,8 @@ async fn handle_other(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_suppo
 async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_support::classifier::S3RequestClass) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Reject query params (including presigned URLs) for object reads.
-    if req.uri().query().is_some() {
+    // Allow SigV4 presign query params; reject only effective (non-presign) query params.
+    if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
@@ -1492,8 +1529,8 @@ async fn handle_put_object(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Reject query params for PutObject for now (presigned etc.)
-    if req.uri().query().is_some() {
+    // Allow SigV4 presign query params; reject only effective (non-presign) query params.
+    if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
@@ -1603,8 +1640,8 @@ async fn handle_copy_object(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Reject query params for CopyObject for now (copy has no required query params).
-    if req.uri().query().is_some() {
+    // Allow SigV4 presign query params; reject only effective (non-presign) query params.
+    if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
@@ -1774,8 +1811,8 @@ async fn handle_delete_object(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Keep consistent with other object ops: no query params for now.
-    if req.uri().query().is_some() {
+    // Allow SigV4 presign query params; reject only effective (non-presign) query params.
+    if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
