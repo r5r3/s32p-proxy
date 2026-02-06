@@ -124,13 +124,6 @@ pub fn format_s3_time_system(st: SystemTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn format_s3_time_utc_z(dt: OffsetDateTime) -> String {
-    let utc = dt.to_offset(UtcOffset::UTC);
-    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    utc.format(&fmt)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
 /// Build XML body for ListObjectsV2 (GET ?list-type=2).
 pub fn list_objects_v2_body(
     bucket_name: &str,

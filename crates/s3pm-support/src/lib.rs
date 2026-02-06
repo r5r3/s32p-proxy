@@ -46,33 +46,6 @@ pub struct PresignedSigV4Auth {
     pub security_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigV4VerifyErrorKind {
-    AccessDenied,
-    SignatureDoesNotMatch,
-}
-
-#[derive(Debug, Clone)]
-pub struct SigV4VerifyError {
-    pub kind: SigV4VerifyErrorKind,
-    pub message: String,
-}
-
-impl std::fmt::Display for SigV4VerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for SigV4VerifyError {}
-
-fn ve(kind: SigV4VerifyErrorKind, msg: impl Into<String>) -> SigV4VerifyError {
-    SigV4VerifyError {
-        kind,
-        message: msg.into(),
-    }
-}
-
 /// Verify either:
 /// - standard SigV4 header Authorization, or
 /// - SigV4 presigned URL (query params)
@@ -87,61 +60,67 @@ pub fn verify_sigv4_request_any(
     expected_access_key: Option<&str>,
     secret_key: &str,
     public_scheme: &str,
-) -> std::result::Result<(), SigV4VerifyError> {
+    resource: Option<&str>,
+) -> std::result::Result<(), crate::s3resp::HttpResponse> {
     // Header-style SigV4
     if headers.get("authorization").is_some() {
-        let auth = parse_authorization(headers)
-            .map_err(|e| ve(SigV4VerifyErrorKind::AccessDenied, format!("bad Authorization: {e}")))?;
+        let auth = match parse_authorization(headers) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(crate::s3resp::access_denied(
+                    &format!("bad Authorization: {e}"),
+                    resource,
+                ))
+            }
+        };
 
         if let Some(exp) = expected_access_key {
             if auth.access_key != exp {
-                return Err(ve(
-                    SigV4VerifyErrorKind::AccessDenied,
-                    "unknown access key",
-                ));
+                return Err(crate::s3resp::access_denied("unknown access key", resource));
             }
         }
 
-        verify_sigv4_header_only(method, uri, headers, &auth, secret_key, public_scheme).map_err(
-            |e| ve(SigV4VerifyErrorKind::SignatureDoesNotMatch, e.to_string()),
-        )?;
+        if let Err(e) =
+            verify_sigv4_header_only(method, uri, headers, &auth, secret_key, public_scheme)
+        {
+            return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
+        }
 
         return Ok(());
     }
 
-    // Presigned URL SigV4
-    let p = parse_presigned_query(uri).map_err(|e| {
-        ve(
-            SigV4VerifyErrorKind::AccessDenied,
-            format!("bad presign params: {e}"),
-        )
-    })?;
-
-    let auth = match p {
-        Some(a) => a,
-        None => {
-            return Err(ve(
-                SigV4VerifyErrorKind::AccessDenied,
+    // Presigned URL SigV4 (query signature)
+    let auth = match parse_presigned_query(uri) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return Err(crate::s3resp::access_denied(
                 "missing Authorization and missing presign params",
+                resource,
+            ))
+        }
+        Err(e) => {
+            return Err(crate::s3resp::access_denied(
+                &format!("bad presign params: {e}"),
+                resource,
             ))
         }
     };
 
     if let Some(exp) = expected_access_key {
         if auth.access_key != exp {
-            return Err(ve(
-                SigV4VerifyErrorKind::AccessDenied,
-                "unknown access key",
-            ));
+            return Err(crate::s3resp::access_denied("unknown access key", resource));
         }
     }
 
-    verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key, public_scheme).map_err(
-        |e| ve(SigV4VerifyErrorKind::SignatureDoesNotMatch, e.to_string()),
-    )?;
+    if let Err(e) =
+        verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key, public_scheme)
+    {
+        return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
+    }
 
     Ok(())
 }
+
 
 /// Parse SigV4 presign params from the URI query string.
 /// Returns `Ok(None)` if the request is not using presigned URLs.

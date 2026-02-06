@@ -366,39 +366,18 @@ async fn validate_sigv4_header_only_or_reject(
     user: &UserDoc,
     public_scheme: &str,
 ) -> PResult<bool> {
-    let res = s3pm_support::verify_sigv4_request_any(
+    match s3pm_support::verify_sigv4_request_any(
         req.method.as_str(),
         &req.uri,
         &req.headers,
         None, // proxy already selected `user` based on extracted access key
         &user.secret_key,
         public_scheme,
-    );
-
-    match res {
+        Some(req.uri.path()),
+    ) {
         Ok(()) => Ok(false),
-        Err(e) => {
-            let (status, code) = match e.kind {
-                s3pm_support::SigV4VerifyErrorKind::AccessDenied => (
-                    StatusCode::FORBIDDEN,
-                    responses::error_code::ACCESS_DENIED,
-                ),
-                s3pm_support::SigV4VerifyErrorKind::SignatureDoesNotMatch => (
-                    StatusCode::FORBIDDEN,
-                    responses::error_code::SIGNATURE_DOES_NOT_MATCH,
-                ),
-            };
-
-            responses::respond_s3_error(
-                session,
-                status,
-                code,
-                &e.message,
-                Some(req.uri.path()),
-                None,
-            )
-            .await?;
-
+        Err(resp) => {
+            responses::respond_hyper(session, resp, /* close = */ true).await?;
             Ok(true)
         }
     }

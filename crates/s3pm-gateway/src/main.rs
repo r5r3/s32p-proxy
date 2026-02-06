@@ -244,24 +244,15 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 }
 
 fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), Resp> {
-    match s3pm_support::verify_sigv4_request_any(
+    s3pm_support::verify_sigv4_request_any(
         req.method().as_str(),
         req.uri(),
         req.headers(),
         Some(&cfg.access_key),
         &cfg.secret_key,
         &cfg.public_scheme,
-    ) {
-        Ok(()) => Ok(()),
-        Err(e) => match e.kind {
-            s3pm_support::SigV4VerifyErrorKind::AccessDenied => {
-                Err(s3pm_support::s3resp::access_denied(&e.message, None))
-            }
-            s3pm_support::SigV4VerifyErrorKind::SignatureDoesNotMatch => Err(
-                s3pm_support::s3resp::signature_does_not_match(&e.message, None),
-            ),
-        },
-    }
+        Some(req.uri().path()),
+    )
 }
 
 fn query_is_only_location(req: &Request<Incoming>) -> bool {
@@ -399,10 +390,6 @@ async fn handle_list_buckets(
     for ent in rd {
         let ent = match ent {
             Ok(e) => e,
-            Err(_) => continue,
-        };
-        let ft = match ent.file_type() {
-            Ok(t) => t,
             Err(_) => continue,
         };
         let ft = match ent.file_type() {
