@@ -193,14 +193,7 @@ pub fn open_file(
                     s.stripe_count,
                     s.stripe_pattern,
                 ) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            "created lustre-striped file {:?} stripe_size={} stripe_count={}",
-                            path,
-                            s.stripe_size,
-                            s.stripe_count
-                        );
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         let is_eexist = e
                             .downcast_ref::<io::Error>()

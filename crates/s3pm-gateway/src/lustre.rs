@@ -27,6 +27,79 @@ use bindings::{
     lu_ladvise_type::{self, LU_LADVISE_LOCKAHEAD, LU_LADVISE_LOCKNOEXPAND, LU_LADVISE_WILLREAD},
 };
 
+/// Lustre superblock magic used by Linux `statfs(2)` / `fstatfs(2)`.
+///
+/// Lustre defines this as `LL_SUPER_MAGIC`.
+const LL_SUPER_MAGIC: libc::c_long = 0x0BD0_0BD0;
+
+/// Return true if `path` resides on a Lustre filesystem.
+///
+/// Note: for non-existent paths (e.g. a file being created), call this on the
+/// parent directory.
+pub fn is_lustre_path(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        tracing::debug!(?path, "is_lustre_path: invalid path bytes");
+        return false;
+    }
+
+    // SAFETY: `CString` guarantees NUL-termination and no interior NUL.
+    let c_path = match CString::new(bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::debug!(?path, "is_lustre_path: NUL in path");
+            return false;
+        }
+    };
+
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c_path.as_ptr() as *const libc::c_char, &mut s) };
+    if rc != 0 {
+        tracing::debug!(
+            ?path,
+            err = %std::io::Error::last_os_error(),
+            "is_lustre_path: statfs failed"
+        );
+        return false;
+    }
+
+    s.f_type == LL_SUPER_MAGIC
+}
+
+/// Return true if `fd` refers to a file on a Lustre filesystem.
+pub fn is_lustre_fd(fd: RawFd) -> bool {
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatfs(fd as libc::c_int, &mut s) };
+    if rc != 0 {
+        tracing::debug!(
+            fd,
+            err = %std::io::Error::last_os_error(),
+            "is_lustre_fd: fstatfs failed"
+        );
+        return false;
+    }
+    s.f_type == LL_SUPER_MAGIC
+}
+
+fn skip_if_not_lustre_fd(fd: RawFd, what: &str) -> bool {
+    if is_lustre_fd(fd) {
+        true
+    } else {
+        tracing::debug!(fd, "{what}: skipping (fd is not on Lustre)");
+        false
+    }
+}
+
+fn skip_if_not_lustre_parent(path: &Path, what: &str) -> bool {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if is_lustre_path(parent) {
+        true
+    } else {
+        tracing::debug!(?path, ?parent, "{what}: skipping (path is not on Lustre)");
+        false
+    }
+}
+
 /// Create a Lustre file with striping.
 ///
 /// Docs: https://doc.lustre.org/lustre_manual.xhtml#settinglustreproperties
@@ -40,6 +113,10 @@ pub fn file_create(
     stripe_count: i32,
     stripe_pattern: u32,
 ) -> Result<()> {
+    if !skip_if_not_lustre_parent(path, "llapi_file_create") {
+        return Ok(());
+    }
+
     let bytes = path.as_os_str().as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
         return Err(anyhow!("invalid path for llapi_file_create"));
@@ -57,6 +134,12 @@ pub fn file_create(
     };
 
     if rc == 0 {
+        tracing::debug!(
+            "created lustre-striped file {:?} stripe_size={} stripe_count={}",
+            path,
+            stripe_size,
+            stripe_count
+        );
         Ok(())
     } else {
         Err(anyhow::Error::from(std::io::Error::last_os_error()))
@@ -131,6 +214,9 @@ fn ladvise_range(fd: RawFd, advice: lu_ladvise_type, start: u64, len: u64, value
 
 /// Best-effort: prevent Lustre from expanding extent locks beyond [start, start+len).
 pub fn advise_locknoexpand(fd: RawFd, start: u64, len: u64) {
+    if !skip_if_not_lustre_fd(fd, "locknoexpand") {
+        return;
+    }
     if let Err(e) = ladvise_range(fd, LU_LADVISE_LOCKNOEXPAND, start, len, 0) {
         tracing::debug!("locknoexpand failed: {e}");
     } else {
@@ -140,6 +226,9 @@ pub fn advise_locknoexpand(fd: RawFd, start: u64, len: u64) {
 
 /// Best-effort: lockahead for writes over [start, start+len).
 pub fn advise_lockahead_write(fd: RawFd, start: u64, len: u64) {
+    if !skip_if_not_lustre_fd(fd, "lockahead write") {
+        return;
+    }
     if let Err(e) = ladvise_range(
         fd,
         LU_LADVISE_LOCKAHEAD,
@@ -155,6 +244,9 @@ pub fn advise_lockahead_write(fd: RawFd, start: u64, len: u64) {
 
 /// Best-effort: tell Lustre we will read [start, start+len).
 pub fn advise_willread(fd: RawFd, start: u64, len: u64) {
+    if !skip_if_not_lustre_fd(fd, "willread") {
+        return;
+    }
     if let Err(e) = ladvise_range(fd, LU_LADVISE_WILLREAD, start, len, 0) {
         tracing::debug!("willread failed: {e}");
     } else {
@@ -164,6 +256,9 @@ pub fn advise_willread(fd: RawFd, start: u64, len: u64) {
 
 /// Best-effort: submit LOCKNOEXPAND + LOCKAHEAD(WRITE) together in ONE llapi_ladvise() RPC.
 pub fn advise_locknoexpand_and_lockahead_write(fd: RawFd, start: u64, len: u64) {
+    if !skip_if_not_lustre_fd(fd, "locknoexpand+lockahead write") {
+        return;
+    }
     if len == 0 {
         return;
     }
