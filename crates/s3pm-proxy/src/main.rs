@@ -170,7 +170,7 @@ impl ProxyHttp for S3ProxyApp {
         // 2b) If routing says NotImplemented: validate first, then reply NotImplemented.
         if let config::RouteAction::NotImplemented { message } = action {
             // Only send NotImplemented for VALID requests.
-            if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
+            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
                 return Ok(true); // already responded with auth/signature error
             }
 
@@ -203,7 +203,7 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 4) Worker not running: verify header-only before spawn
-        if validate_sigv4_header_only_or_reject(session, &req, &user, &self.public_scheme).await? {
+        if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
             return Ok(true); // already responded with auth/signature error, no spawn
         }
 
@@ -364,7 +364,6 @@ async fn validate_sigv4_header_only_or_reject(
     session: &mut Session,
     req: &RequestHeader,
     user: &UserDoc,
-    public_scheme: &str,
 ) -> PResult<bool> {
     match s3pm_support::verify_sigv4_request_any(
         req.method.as_str(),
@@ -372,7 +371,6 @@ async fn validate_sigv4_header_only_or_reject(
         &req.headers,
         None, // proxy already selected `user` based on extracted access key
         &user.secret_key,
-        public_scheme,
         Some(req.uri.path()),
     ) {
         Ok(()) => Ok(false),

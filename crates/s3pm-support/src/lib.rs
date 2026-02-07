@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningParams, SigningSettings, PayloadChecksumKind};
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
+    SigningSettings, UriPathNormalizationMode,
+};
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use constant_time_eq::constant_time_eq;
@@ -59,7 +62,6 @@ pub fn verify_sigv4_request_any(
     headers: &HeaderMap,
     expected_access_key: Option<&str>,
     secret_key: &str,
-    public_scheme: &str,
     resource: Option<&str>,
 ) -> std::result::Result<(), crate::s3resp::HttpResponse> {
     // Header-style SigV4
@@ -81,7 +83,7 @@ pub fn verify_sigv4_request_any(
         }
 
         if let Err(e) =
-            verify_sigv4_header_only(method, uri, headers, &auth, secret_key, public_scheme)
+            verify_sigv4_header_only(method, uri, headers, &auth, secret_key)
         {
             return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
         }
@@ -113,7 +115,7 @@ pub fn verify_sigv4_request_any(
     }
 
     if let Err(e) =
-        verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key, public_scheme)
+        verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key)
     {
         return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
     }
@@ -227,7 +229,6 @@ pub fn verify_sigv4_presigned_url(
     headers: &HeaderMap,
     auth: &PresignedSigV4Auth,
     secret_key: &str,
-    public_scheme: &str,
 ) -> Result<()> {
     // 1) Parse X-Amz-Date
     let (_dt, date_str, signing_time) = parse_amz_date(auth.amz_date.trim())?;
@@ -250,12 +251,6 @@ pub fn verify_sigv4_presigned_url(
 
     // 3) Build base URI with SigV4-presign params removed, but keep original encoding/order
     // (We remove x-amz-* params so the signer can regenerate them consistently.)
-    let host = headers
-        .get("host")
-        .ok_or_else(|| anyhow!("missing Host"))?
-        .to_str()
-        .map_err(|_| anyhow!("bad Host"))?;
-
     let path = uri.path();
 
     let filtered_query = {
@@ -297,9 +292,9 @@ pub fn verify_sigv4_presigned_url(
     };
 
     let unsigned_uri = if filtered_query.is_empty() {
-        format!("{public_scheme}://{host}{path}")
+        path.to_string()
     } else {
-        format!("{public_scheme}://{host}{path}?{filtered_query}")
+        format!("{path}?{filtered_query}")
     };
 
     // 4) Build lowercased header map (same as header auth path)
@@ -346,6 +341,8 @@ pub fn verify_sigv4_presigned_url(
     let identity: Identity = credentials.into();
 
     let mut signing_settings = SigningSettings::default();
+    signing_settings.percent_encoding_mode = PercentEncodingMode::Single;
+    signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     signing_settings.expires_in = Some(Duration::from_secs(auth.expires));
     signing_settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
     signing_settings.signature_location = aws_sigv4::http_request::SignatureLocation::QueryParams;
@@ -475,7 +472,6 @@ pub fn verify_sigv4_header_only(
     headers: &HeaderMap,
     auth: &SigV4Auth,
     secret_key: &str,
-    public_scheme: &str, // "http" or "https"
 ) -> Result<()> {
     // 1) Parse X-Amz-Date into signing time (SystemTime) and YYYYMMDD
     let x_amz_date = headers
@@ -514,19 +510,11 @@ pub fn verify_sigv4_header_only(
         SignableBody::Precomputed(payload_hash)
     };
 
-    // 3) Build URI for signing
-    let host = headers
-        .get("host")
-        .ok_or_else(|| anyhow!("missing Host"))?
-        .to_str()
-        .map_err(|_| anyhow!("bad Host"))?;
-
+    // 3) Build URI for signing, only path and query are used.
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-
-    let uri = format!("{public_scheme}://{host}{path_and_query}");
 
     // 4) Build header map lowercased
     let mut header_map: HashMap<String, String> = HashMap::new();
@@ -559,7 +547,7 @@ pub fn verify_sigv4_header_only(
     let header_iter = header_storage.iter().map(|(k, v)| (k.as_str(), v.as_str()));
 
     // 6) Build signable request
-    let signable = SignableRequest::new(method, &uri, header_iter, body)
+    let signable = SignableRequest::new(method, path_and_query, header_iter, body)
         .map_err(|e| anyhow!("signable request error: {e}"))?;
 
     // 7) Build signing params
@@ -572,7 +560,13 @@ pub fn verify_sigv4_header_only(
     );
     let identity: Identity = credentials.into();
 
-    let signing_settings = SigningSettings::default();
+    let mut signing_settings = SigningSettings::default();
+    // S3 SigV4 quirks:
+    // - do NOT normalize the URI path
+    // - do NOT double-encode the URI path
+    signing_settings.percent_encoding_mode = PercentEncodingMode::Single;
+    signing_settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+
     let signing_params: SigningParams = v4::SigningParams::builder()
         .identity(&identity)
         .region(&auth.region)

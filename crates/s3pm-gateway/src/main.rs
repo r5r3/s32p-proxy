@@ -250,7 +250,6 @@ fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), 
         req.headers(),
         Some(&cfg.access_key),
         &cfg.secret_key,
-        &cfg.public_scheme,
         Some(req.uri().path()),
     )
 }

@@ -16,6 +16,7 @@ time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 
 # shared classifier parses query params
 url = "2"
+percent-encoding = "2"
 
 # shared S3 REST-XML builders
 serde = { version = "1", features = ["derive"] }
@@ -28,4 +29,3 @@ http-body-util = "0.1"
 
 # for file system helpers
 libc = "0.2"
-

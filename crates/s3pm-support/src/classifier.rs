@@ -1,4 +1,5 @@
 use http::{HeaderMap, Uri};
+use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 
 /// High-level classification for S3 REST requests.
@@ -565,11 +566,27 @@ fn parse_bucket_key_path_style(path: &str) -> (Option<String>, Option<String>) {
     let bucket = it.next().map(|s| s.to_string());
 
     let key = it.next().and_then(|rest| {
-        let rest = rest.trim_start_matches('/');
+        // Important: remove only the single separator slash between bucket and key.
+        // Do NOT trim all leading slashes, because additional slashes are part of the key.
+        let rest = rest.strip_prefix('/').unwrap_or(rest);
         if rest.is_empty() {
             None
         } else {
-            Some(rest.to_string())
+            // Percent-decode each segment but keep '/' as the delimiter.
+            // This makes "/bucket/a%20b.txt" -> key "a b.txt".
+            let mut out = String::with_capacity(rest.len());
+            for (i, seg) in rest.split('/').enumerate() {
+                if i > 0 {
+                    out.push('/');
+                }
+                // If decoding fails (bad % escapes or invalid UTF-8), fall back to raw segment.
+                // If you prefer strict behavior, return None here and have the gateway respond 400.
+                match percent_decode_str(seg).decode_utf8() {
+                    Ok(decoded) => out.push_str(&decoded),
+                    Err(_) => out.push_str(seg),
+                }
+            }
+            Some(out)
         }
     });
 
