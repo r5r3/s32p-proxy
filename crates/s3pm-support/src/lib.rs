@@ -25,6 +25,9 @@ pub mod s3xml;
 /// Each binary (proxy/gateway) wraps this into its own response type (Pingora vs Hyper).
 pub mod s3resp;
 
+// Shared URI and percent-decoding helpers.
+pub mod uri_encoding;
+
 
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {

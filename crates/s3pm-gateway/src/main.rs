@@ -1397,30 +1397,6 @@ fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
         .map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
 }
 
-fn percent_decode_path(s: &str) -> Result<String> {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'%' => {
-                if i + 2 >= b.len() {
-                    return Err(anyhow!("bad percent-encoding in x-amz-copy-source"));
-                }
-                let hi = (b[i + 1] as char).to_digit(16).ok_or_else(|| anyhow!("bad percent-encoding in x-amz-copy-source"))?;
-                let lo = (b[i + 2] as char).to_digit(16).ok_or_else(|| anyhow!("bad percent-encoding in x-amz-copy-source"))?;
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    Ok(String::from_utf8(out).map_err(|_| anyhow!("x-amz-copy-source is not valid utf-8 after decoding"))?)
-}
-
 fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
     let raw = headers
         .get("x-amz-copy-source")
@@ -1436,7 +1412,7 @@ fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
         return Err(anyhow!("invalid x-amz-copy-source"));
     }
 
-    let decoded = percent_decode_path(raw)?;
+    let decoded = s3pm_support::uri_encoding::percent_decode_path_segments_lossy(raw);
     let mut it = decoded.splitn(2, '/');
     let bucket = it.next().unwrap_or("").to_string();
     let key = it.next().unwrap_or("").to_string();
