@@ -226,6 +226,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
         }
+        s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::RenameObject) => {
+            handle_rename_object(req, app, &class).await
+        }
         s3pm_support::classifier::S3Op::Write(s3pm_support::classifier::WriteOp::CopyObject) => {
             handle_copy_object(req, app, &class).await
         }
@@ -1693,6 +1696,190 @@ async fn handle_copy_object(
     s3pm_support::s3resp::copy_object_ok(&etag, &last_modified)
 }
 
+// -------------------------
+// RenameObject
+// -------------------------
+
+fn parse_rename_source(dst_bucket: &str, headers: &HeaderMap) -> Result<(String, String)> {
+    let raw = headers
+        .get("x-amz-rename-source")
+        .ok_or_else(|| anyhow!("missing x-amz-rename-source"))?
+        .to_str()
+        .map_err(|_| anyhow!("invalid x-amz-rename-source"))?
+        .trim();
+
+    // Strip any query component.
+    let raw = raw.split_once('?').map(|(p, _)| p).unwrap_or(raw);
+    let raw = raw.trim_start_matches('/');
+    if raw.is_empty() {
+        return Err(anyhow!("invalid x-amz-rename-source"));
+    }
+
+    // Decode percent-escapes segment-by-segment (same behavior as CopyObject parsing).
+    let decoded: String = s3pm_support::uri_encoding::percent_decode_path_segments_lossy(raw);
+
+    // Accept both:
+    //  - "/key"           (same bucket as destination)
+    //  - "/bucket/key"    (explicit bucket)
+    let mut it = decoded.splitn(2, '/');
+    let first: &str = it.next().unwrap_or("");
+    let second: Option<&str> = it.next();
+
+    if let Some(rest) = second {
+        // "/bucket/key" form
+        let bucket: String = first.to_string();
+        let key: String = rest.to_string();
+        if bucket.is_empty() || key.is_empty() {
+            return Err(anyhow!("invalid x-amz-rename-source (expected /bucket/key or /key)"));
+        }
+        Ok((bucket, key))
+    } else {
+        // "/key" form
+        let key: String = first.to_string();
+        if key.is_empty() {
+            return Err(anyhow!("invalid x-amz-rename-source (expected /bucket/key or /key)"));
+        }
+        Ok((dst_bucket.to_string(), key))
+    }
+}
+
+async fn handle_rename_object(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s3pm_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    // Allow SigV4 presign query params; ignore everything except renameObject.
+    if !(class.query.is_only_effective("renameobject")
+        || (class.query.has("renameobject") && class.query.is_only_effective("x-id")))
+    {
+        return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
+    }
+
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return resp;
+    }
+
+    let dst_bucket = class.bucket.as_deref().unwrap_or("");
+    let dst_key = class.key.as_deref().unwrap_or("");
+    if dst_bucket.is_empty() || dst_key.is_empty() {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // destination bucket must exist
+    match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s3pm_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+        }
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+    }
+
+    let (src_bucket, src_key) = match parse_rename_source(dst_bucket, req.headers()) {
+        Ok(v) => v,
+        Err(e) => {
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            )
+        }
+    };
+
+    // S3 RenameObject is within the same bucket; reject cross-bucket.
+    if src_bucket != dst_bucket {
+        return s3pm_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s3pm_support::s3xml::error_code::INVALID_REQUEST,
+            "cross-bucket rename is not supported",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // Don't allow reserved multipart prefix in either source or destination.
+    if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
+        || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
+    {
+        return s3pm_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    let src_path = match join_object_path(&cfg.posix_root, &src_bucket, &src_key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    let dst_path = match join_object_path(&cfg.posix_root, dst_bucket, dst_key) {
+        Ok(p) => p,
+        Err(e) => return s3pm_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    // Ensure source exists (file or directory).
+    match std::fs::metadata(&src_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s3pm_support::s3resp::no_such_key("not found", None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return s3pm_support::s3resp::access_denied("permission denied", None)
+        }
+        Err(e) => {
+            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+        }
+    };
+
+    // Create destination parent directories.
+    if let Some(parent) = dst_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return s3pm_support::s3resp::access_denied(
+                &format!("failed to create destination directories: {e}"),
+                None,
+            );
+        }
+    }
+
+    match std::fs::rename(&src_path, &dst_path) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            // Required by your spec: error on cross-device rename (EXDEV).
+            return s3pm_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s3pm_support::s3xml::error_code::INVALID_REQUEST,
+                "cross-device rename is not supported",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s3pm_support::s3resp::no_such_key("not found", None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return s3pm_support::s3resp::access_denied("permission denied", None)
+        }
+        Err(e) => {
+            return s3pm_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+        }
+    }
+
+    // Best-effort cleanup of empty parent directories under the bucket root.
+    if let Ok(bucket_root) = bucket_root_path(&cfg.posix_root, dst_bucket) {
+        if let Some(src_parent) = src_path.parent() {
+            prune_empty_parents(&bucket_root, src_parent.to_path_buf());
+        }
+    }
+
+    // Success: 200 with empty body.
+    s3pm_support::s3resp::response_bytes(StatusCode::OK, "application/xml", Vec::new(), [])
+}
 
 // -------------------------
 // DeleteObject / DeleteObjects

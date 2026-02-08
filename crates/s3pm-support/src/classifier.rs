@@ -117,6 +117,8 @@ pub enum WriteOp {
     PutObject,
     /// PUT /{bucket}/{key} with x-amz-copy-source
     CopyObject,
+    /// PUT /{bucket}/{key}?renameObject with x-amz-rename-source
+    RenameObject,
     /// DELETE /{bucket}/{key} (no query params)
     DeleteObject,
     /// POST /{bucket}?delete
@@ -377,6 +379,21 @@ pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap
             key,
             query,
             op: S3Op::Write(WriteOp::CopyObject),
+        };
+    }
+
+    // RenameObject: PUT /{bucket}/{key}?renameObject with x-amz-rename-source
+    if method == "PUT"
+        && bucket.is_some()
+        && key.is_some()
+        && query.has("renameobject")
+        && headers.is_some_and(|h| h.get("x-amz-rename-source").is_some())
+    {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Write(WriteOp::RenameObject),
         };
     }
 
