@@ -24,7 +24,7 @@ pub struct ServerConfig {
     /// Bucket region returned by GetBucketLocation (e.g. "eu-central-1"). Use "us-east-1" for the classic default.
     pub region: String,
     /// e.g. "info", "debug", or "s3_proxy_manager=debug"
-    pub log: Option<String>,
+    pub log_level: Option<String>,
     /// Host suffixes for virtual-hosted-style bucket detection.
     /// If a request's Host header ends with one of these suffixes and has exactly one additional component,
     /// it will be treated as virtual-hosted-style (bucket in host, key in path).

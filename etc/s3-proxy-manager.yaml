@@ -6,7 +6,7 @@ server:
   tls_cert_path: "etc/fullchain.pem"
   tls_key_path: "etc/privkey.pem"
   region: "us-east-1"
-  log: "info"
+  log_level: "s3_proxy_manager=debug,s3pm_gateway=debug,pingora=info,pingora_proxy=info"
   virtual_hosted_suffixes:
     - 127.0.0.1.nip.io
     - localhost
@@ -66,6 +66,7 @@ workers:
         S3PM_INFLIGHT: "32"
         S3PM_POOL_SIZE: "128"
         S3PM_DIRECT_IO: "true"
+        S3PM_LOG_LEVEL: "{{log_level}}"
 
 routing:
   class_map:

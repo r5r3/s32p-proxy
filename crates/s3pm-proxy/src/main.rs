@@ -35,9 +35,7 @@ use worker_manager::{WorkerHandle, WorkerManager, WorkerEndpoint};
 struct S3ProxyApp {
     directory: Arc<dyn Directory>,
     workers: Arc<WorkerManager>,
-    public_scheme: String, // from config.server.public_scheme
     routing: config::RoutingConfig,
-    region: String, // from config.server.region (for GetBucketLocation)
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
 }
 
@@ -422,10 +420,19 @@ fn main() -> Result<()> {
     // aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
     rustls_prefer_fast_cipher().unwrap();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
-        .init();
+    // Load config first to get log level from config file
     let cfg = config::Config::from_path("etc/s3-proxy-manager.yaml")?;
+
+    // Determine log level: config file takes precedence, then RUST_LOG env var, then default
+    let log_filter = if let Some(log_level) = &cfg.server.log_level {
+        log_level.clone()
+    } else {
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
+        .init();
 
     // Build directory backend
     let directory: Arc<dyn Directory> = match cfg.auth.backend {
@@ -464,9 +471,7 @@ fn main() -> Result<()> {
     let app = S3ProxyApp {
         directory,
         workers,
-        public_scheme: cfg.server.public_scheme.clone(),
         routing: cfg.routing.clone(),
-        region: cfg.server.region.clone(),
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
     };
 

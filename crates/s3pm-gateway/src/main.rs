@@ -2176,8 +2176,13 @@ async fn handle_delete_objects(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Check for S3PM_LOG_LEVEL first (from config), then RUST_LOG, then default to info
+    let log_filter = std::env::var("S3PM_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".into());
+    
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .with_env_filter(log_filter)
         .init();
 
     let cfg = Arc::new(load_cfg()?);

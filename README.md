@@ -334,6 +334,7 @@ Primary configuration: `etc/s3-proxy-manager.yaml`
 Key sections:
 
 - `server.listen` / `server.public_scheme`
+- `server.log_level` (logging configuration, supports RUST_LOG format)
 - `server.virtual_hosted_suffixes` (virtual-hosted-style bucket detection)
 - `auth.*` (directory backend selection and credentials)
 - `workers.runtime_root` (base dir for per-worker temp roots)
@@ -654,9 +655,21 @@ cargo build
 
 ## Running (development)
 
+You can set the log level either via environment variable or in the config file:
+
+**Using environment variable (traditional):**
 ```bash
 RUST_LOG=s3_proxy_manager=debug,pingora=info,pingora_proxy=info cargo run --bin s3pm-proxy
 ```
+
+**Using config file (recommended):**
+The log level can be configured in `etc/s3-proxy-manager.yaml`:
+```yaml
+server:
+  log_level: "s3_proxy_manager=debug,s3pm_gateway=debug,pingora=info,pingora_proxy=info"
+```
+
+The config file approach automatically forwards the log level to worker processes.
 
 The proxy binds to the address configured in `etc/s3-proxy-manager.yaml`, default:
 
