@@ -1,4 +1,5 @@
 #![cfg(all(feature = "lustre", target_os = "linux"))]
+#![allow(unused)]
 
 use anyhow::{anyhow, Result};
 use std::ffi::CString;
