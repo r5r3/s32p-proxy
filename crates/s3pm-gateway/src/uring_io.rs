@@ -95,7 +95,6 @@ impl SessionInner {
 
 /// Single shared io_uring instance (one thread) for both reads and writes.
 pub struct UringIO {
-    depth: usize,
     tx: mpsc::Sender<Msg>,
     cancel: CancellationToken, // cancelled on fatal io_uring failure
 }
@@ -143,15 +142,7 @@ impl UringIO {
             .recv()
             .map_err(|_| anyhow!("uring io thread failed to report startup"))??;
 
-        Ok(Self { depth, tx, cancel })
-    }
-
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
-
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel
+        Ok(Self { tx, cancel })
     }
 
     /// Create a per-file sender
