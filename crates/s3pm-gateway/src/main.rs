@@ -77,7 +77,8 @@ struct Cfg {
     direct_io: bool,
     copy_max_size: u64,
     mpu_dir_name: String,
-    lustre_max_stripe_count: u32
+    lustre_max_stripe_count: u32,
+    virtual_hosted_suffixes: Vec<String>,
 }
 
 fn env_bool(k: &str, default: bool) -> bool {
@@ -130,6 +131,11 @@ fn load_cfg() -> Result<Cfg> {
     // Maximum Lustre stripe count (only effective with --features lustre)
     let lustre_max_stripe_count = env_usize("S3PM_LUSTRE_MAX_STRIPE_COUNT", 4).max(1) as u32;
 
+    // Load virtual hosted suffixes from environment variable
+    let virtual_hosted_suffixes = std::env::var("S3PM_VIRTUAL_HOSTED_SUFFIXES")
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -145,6 +151,7 @@ fn load_cfg() -> Result<Cfg> {
         copy_max_size,
         mpu_dir_name,
         lustre_max_stripe_count,
+        virtual_hosted_suffixes,
     })
 }
 
@@ -155,6 +162,7 @@ struct App {
     cfg: Arc<Cfg>,
     pool: Arc<BufPool>,
     uring: Arc<UringIO>,
+    virtual_hosted_suffixes: Vec<String>,
 }
 
 fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
@@ -204,7 +212,12 @@ async fn read_small(
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
-    let class = s3pm_support::classifier::classify_with_headers(req.method().as_str(), req.uri(), Some(req.headers()));
+    let class = s3pm_support::classifier::classify_with_headers(
+        req.method().as_str(), 
+        req.uri(), 
+        Some(req.headers()),
+        &app.virtual_hosted_suffixes
+    );
 
     let resp = match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::ListBuckets) => {
@@ -2158,6 +2171,7 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         pool,
         uring,
+        virtual_hosted_suffixes: cfg.virtual_hosted_suffixes.clone(),
     });
 
     if let Some(sock_path) = cfg.bind_uds.clone() {

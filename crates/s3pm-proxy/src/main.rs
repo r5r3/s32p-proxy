@@ -38,6 +38,7 @@ struct S3ProxyApp {
     public_scheme: String, // from config.server.public_scheme
     routing: config::RoutingConfig,
     region: String, // from config.server.region (for GetBucketLocation)
+    virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
 }
 
 #[derive(Clone, Default)]
@@ -81,7 +82,12 @@ impl ProxyHttp for S3ProxyApp {
         // Classify (no body required).
         // This logic is shared with the gateway now (in s3pm-support),
         // so routing decisions won't drift.
-        let class = s3pm_support::classifier::classify_with_headers(req.method.as_str(), &req.uri, Some(&req.headers));
+        let class = s3pm_support::classifier::classify_with_headers(
+            req.method.as_str(), 
+            &req.uri, 
+            Some(&req.headers),
+            &self.virtual_hosted_suffixes
+        );
         let key = s3pm_support::classifier::class_key(&class);
 
         // Determine route action from config.
@@ -461,6 +467,7 @@ fn main() -> Result<()> {
         public_scheme: cfg.server.public_scheme.clone(),
         routing: cfg.routing.clone(),
         region: cfg.server.region.clone(),
+        virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
     };
 
     let mut server = Server::new(None)?;

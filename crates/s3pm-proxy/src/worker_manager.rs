@@ -306,6 +306,12 @@ impl WorkerManager {
             }
         };
 
+        let virtual_hosted_suffixes_str = if self.server_cfg.virtual_hosted_suffixes.is_empty() {
+            String::new()
+        } else {
+            self.server_cfg.virtual_hosted_suffixes.join(",")
+        };
+        
         let vars = TemplateVars {
             username: &user.username,
             uid: user.uid,
@@ -315,6 +321,7 @@ impl WorkerManager {
             posix_root: &staged_root_str,
             endpoint: &endpoint,
             region: &self.server_cfg.region,
+            virtual_hosted_suffixes: &virtual_hosted_suffixes_str,
         };
 
         let rendered_args = render_args(&profile.args, &vars)
@@ -417,6 +424,7 @@ struct TemplateVars<'a> {
     posix_root: &'a str,
     endpoint: &'a WorkerEndpoint,
     region: &'a str,
+    virtual_hosted_suffixes: &'a str,
 }
 
 fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
@@ -460,6 +468,7 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
             "bind_addr" => vars.endpoint.to_string(),
             "bind_uds" => vars.endpoint.to_string(),
             "region" => vars.region.to_string(),
+            "virtual_hosted_suffixes" => vars.virtual_hosted_suffixes.to_string(),
             other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
         };
 

@@ -323,7 +323,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - When the worker stops, the temp directory is removed
 
 Worker args/env templates support placeholders such as:
-- `{{bind_addr}}`, `{{port}}`, `{{posix_root}}`, `{{access_key}}`, `{{secret_key}}`, etc.
+- `{{bind_addr}}`, `{{port}}`, `{{posix_root}}`, `{{access_key}}`, `{{secret_key}}`, `{{region}}`, `{{virtual_hosted_suffixes}}`, etc.
 
 ---
 
@@ -334,12 +334,45 @@ Primary configuration: `etc/s3-proxy-manager.yaml`
 Key sections:
 
 - `server.listen` / `server.public_scheme`
+- `server.virtual_hosted_suffixes` (virtual-hosted-style bucket detection)
 - `auth.*` (directory backend selection and credentials)
 - `workers.runtime_root` (base dir for per-worker temp roots)
 - `workers.launcher.*`
 - `workers.lifecycle.*`
 - `workers.profiles.*` (worker templates)
 - `routing.class_map.*` (routes classifier classes to actions)
+
+### Virtual-hosted-style bucket support
+
+The proxy automatically detects and supports both **path-style** and **virtual-hosted-style** bucket addressing:
+
+- **Path-style**: `https://s3.example.com/bucket/key` (bucket in path)
+- **Virtual-hosted-style**: `https://bucket.s3.example.com/key` (bucket in host)
+
+Configure domain suffixes for virtual-hosted-style detection via `server.virtual_hosted_suffixes`:
+
+```yaml
+server:
+  virtual_hosted_suffixes:
+    - "127.0.0.1.nip.io"
+    - "s3.example.com"
+    - "s3.localhost"
+```
+
+When a request's `Host` header ends with a configured suffix, the proxy extracts the bucket name from the host and the key from the path. Port numbers are handled correctly (e.g., `bucket.suffix:9000`).
+
+Workers receive the suffixes via the `S3PM_VIRTUAL_HOSTED_SUFFIXES` environment variable or `{{virtual_hosted_suffixes}}` template:
+
+```yaml
+workers:
+  profiles:
+    s3pm-gateway:
+      env:
+        S3PM_VIRTUAL_HOSTED_SUFFIXES: "{{virtual_hosted_suffixes}}"
+      args:
+        - "--virtual-hosted-suffixes"
+        - "{{virtual_hosted_suffixes}}"
+```
 
 ### Directory backend selection
 

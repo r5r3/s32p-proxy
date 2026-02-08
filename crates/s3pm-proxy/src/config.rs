@@ -25,6 +25,12 @@ pub struct ServerConfig {
     pub region: String,
     /// e.g. "info", "debug", or "s3_proxy_manager=debug"
     pub log: Option<String>,
+    /// Host suffixes for virtual-hosted-style bucket detection.
+    /// If a request's Host header ends with one of these suffixes and has exactly one additional component,
+    /// it will be treated as virtual-hosted-style (bucket in host, key in path).
+    /// Example: ["s3.example.com", "s3.internal.example.com"]
+    #[serde(default)]
+    pub virtual_hosted_suffixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

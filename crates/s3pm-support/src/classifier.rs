@@ -239,9 +239,19 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
 
 /// Classify an incoming request into S3 operation buckets, using headers when needed.
 /// (CopyObject is distinguished from PutObject via x-amz-copy-source.)
-pub fn classify_with_headers(method: &str, uri: &Uri, headers: Option<&HeaderMap>) -> S3RequestClass {
-    let (bucket, key) = parse_bucket_key_path_style(uri.path());
+/// 
+/// This function automatically detects virtual-hosted-style vs path-style requests
+/// based on the Host header and virtual_hosted_suffixes configuration.
+pub fn classify_with_headers(
+    method: &str, 
+    uri: &Uri, 
+    headers: Option<&HeaderMap>,
+    virtual_hosted_suffixes: &[String]
+) -> S3RequestClass {
+    let (bucket, key, _is_virtual_hosted) = parse_bucket_key_auto(method, uri, headers, virtual_hosted_suffixes);
     let query = QueryParams::from_uri(uri);
+
+    // Rest of the classification logic...
 
     // ListBuckets: GET / (may include pagination/filter query params)
     if method == "GET" && bucket.is_none() && key.is_none() {
@@ -593,6 +603,57 @@ fn parse_bucket_key_path_style(path: &str) -> (Option<String>, Option<String>) {
     });
 
     (bucket, key)
+}
+
+/// Detect request style and parse bucket/key accordingly
+/// Returns (bucket, key, is_virtual_hosted_style)
+fn parse_bucket_key_auto(
+    method: &str, 
+    uri: &Uri, 
+    headers: Option<&HeaderMap>,
+    virtual_hosted_suffixes: &[String]
+) -> (Option<String>, Option<String>, bool) {
+    // Virtual-hosted-style detection:
+    // - Host header format: bucket.suffix (where suffix is in virtual_hosted_suffixes)
+    // - Path contains only the key (no bucket)
+    // - Not applicable for ListBuckets (GET /)
+    
+    if method == "GET" && uri.path() == "/" {
+        // ListBuckets always uses path-style (no bucket in path)
+        return (None, None, false);
+    }
+
+    // Try to detect virtual-hosted-style using configured suffixes
+    if let Some(host) = headers.and_then(|h| h.get("host").and_then(|v| v.to_str().ok())) {
+        // Remove port number if present (e.g., "bucket.suffix:9000" -> "bucket.suffix")
+        let host_without_port = host.split(':').next().unwrap_or(host);
+        
+        // Check if host ends with any of the configured suffixes
+        for suffix in virtual_hosted_suffixes {
+            if host_without_port.ends_with(suffix) {
+                // Extract the part before the suffix
+                let prefix = host_without_port.trim_end_matches(suffix);
+                // Remove the trailing dot if present
+                let prefix = prefix.trim_end_matches('.');
+                
+                // If there's exactly one component before the suffix, it's likely a bucket name
+                if !prefix.is_empty() {
+                    // This is virtual-hosted-style: bucket in host, key in path
+                    let path = uri.path().trim_start_matches('/');
+                    let key = if path.is_empty() {
+                        None
+                    } else {
+                        Some(crate::uri_encoding::percent_decode_path_segments_lossy(path))
+                    };
+                    return (Some(prefix.to_string()), key, true);
+                }
+            }
+        }
+    }
+
+    // Default to path-style parsing
+    let (bucket, key) = parse_bucket_key_path_style(uri.path());
+    (bucket, key, false)
 }
 
 fn parse_u32(s: &str) -> Option<u32> {

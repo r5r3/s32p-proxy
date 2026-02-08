@@ -7,6 +7,9 @@ server:
   tls_key_path: "etc/privkey.pem"
   region: "us-east-1"
   log: "info"
+  virtual_hosted_suffixes:
+    - 127.0.0.1.nip.io
+    - localhost
 
 auth:
   backend: "yaml"
@@ -58,6 +61,7 @@ workers:
         AWS_SECRET_ACCESS_KEY: "{{secret_key}}"
         S3PM_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
         S3PM_REGION: "{{region}}"
+        S3PM_VIRTUAL_HOSTED_SUFFIXES: "{{virtual_hosted_suffixes}}"
         S3PM_CHUNK_SIZE_MB: "16" 
         S3PM_INFLIGHT: "32"
         S3PM_POOL_SIZE: "128"
