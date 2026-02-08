@@ -986,11 +986,9 @@ struct DirItem {
 
 struct RuntimeFrame {
     dir_key: String,     // key prefix for this directory ("" or ends_with "/")
-    dir_fs: PathBuf,     // filesystem path of this directory
     after: String,       // cursor sort_key
-    entries: Vec<DirItem>,
+    entries: Option<Vec<DirItem>>, // None = not loaded yet, Some = loaded (possibly empty)
     idx: usize,
-    is_root: bool,
 }
 
 fn read_dir_sorted(dir_fs: &Path) -> Result<Vec<DirItem>> {
@@ -1044,6 +1042,39 @@ fn first_index_after(entries: &[DirItem], after: &str) -> usize {
         }
     }
     entries.len()
+}
+
+/// Load directory entries for a frame if not already loaded
+fn ensure_frame_loaded(
+    frame: &mut RuntimeFrame,
+    cfg: &Cfg,
+    bucket: &str,
+    leaf_filter: Option<&str>,
+    is_root: bool,
+) -> Result<()> {
+    if frame.entries.is_some() {
+        return Ok(()); // Already loaded
+    }
+
+    let dir_fs = match join_object_path(&cfg.posix_root, bucket, &frame.dir_key) {
+        Ok(p) => p,
+        Err(e) => return Err(anyhow!("failed to compute dir path: {e}")),
+    };
+
+    let mut entries = read_dir_sorted(&dir_fs)?;
+
+    // Apply leaf_filter only at root frame (the directory where prefix "starts").
+    if is_root {
+        if let Some(lf) = leaf_filter {
+            entries.retain(|it| it.sort_key.starts_with(lf));
+        }
+    }
+
+    // Find starting index
+    frame.idx = first_index_after(&entries, &frame.after);
+    frame.entries = Some(entries);
+
+    Ok(())
 }
 
 fn lookup_username(uid: u32) -> Option<String> {
@@ -1250,30 +1281,12 @@ async fn handle_list_objects_v2(
 
     // Build runtime frames from token stack
     let mut stack: Vec<RuntimeFrame> = Vec::new();
-    for (i, fr) in token_stack.iter().enumerate() {
-        let dir_fs = match join_object_path(&cfg.posix_root, bucket, &fr.dir) {
-            Ok(p) => p,
-            Err(_) => start_dir_fs.clone(),
-        };
-        let mut entries = read_dir_sorted(&dir_fs).unwrap_or_default();
-
-        // Apply leaf_filter only at root frame (the directory where prefix “starts”).
-        let is_root = i == 0;
-        if is_root {
-            if let Some(lf) = leaf_filter.as_deref() {
-                entries.retain(|it| it.sort_key.starts_with(lf));
-            }
-        }
-
-        let idx = first_index_after(&entries, &fr.after);
-
+    for fr in token_stack {
         stack.push(RuntimeFrame {
             dir_key: fr.dir.clone(),
-            dir_fs,
             after: fr.after.clone(),
-            entries,
-            idx,
-            is_root,
+            entries: None, // Will be loaded lazily
+            idx: 0,
         });
     }
 
@@ -1282,14 +1295,27 @@ async fn handle_list_objects_v2(
 
     // Produce up to max_keys “results”; in delimiter mode keycount includes common prefixes
     while (contents.len() as u32 + common_prefixes.len() as u32) < max_keys {
+        let stack_len = stack.len();
         let Some(top) = stack.last_mut() else { break; };
 
-        if top.idx >= top.entries.len() {
+        // Lazy load entries if not already loaded
+        if top.entries.is_none() {
+            let is_root_frame = stack_len == 1;
+            if let Err(e) = ensure_frame_loaded(top, &cfg, bucket, leaf_filter.as_deref(), is_root_frame) {
+                tracing::warn!("Failed to load directory {}: {}", top.dir_key, e);
+                stack.pop();
+                continue;
+            }
+        }
+
+        let entries = top.entries.as_ref().unwrap(); // Safe because we just ensured it's loaded
+        
+        if top.idx >= entries.len() {
             stack.pop();
             continue;
         }
 
-        let it = top.entries[top.idx].clone();
+        let it = entries[top.idx].clone();
         top.idx += 1;
         top.after = it.sort_key.clone();
 
@@ -1308,16 +1334,11 @@ async fn handle_list_objects_v2(
 
             // recursive: descend
             let child_key = format!("{}{}{}", top.dir_key, it.name, "/");
-            let child_fs = it.path.clone();
-
-            let child_entries = read_dir_sorted(&child_fs).unwrap_or_default();
             stack.push(RuntimeFrame {
                 dir_key: child_key,
-                dir_fs: child_fs,
                 after: "".to_string(),
-                entries: child_entries,
+                entries: None, // Will be loaded lazily
                 idx: 0,
-                is_root: false,
             });
             continue;
         }
