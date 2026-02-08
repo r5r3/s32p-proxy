@@ -108,6 +108,12 @@ impl WorkerHandle {
     }
 
     pub async fn terminate(&self) {
+        tracing::debug!(
+            "terminating worker process (unix_user={}, access_key={}) ...",
+            self.username,
+            self.key.access_key
+        );
+        
         let mut child = self.child.lock().await;
         let _ = child.kill().await; // SIGKILL on Unix
         let _ = child.wait().await;
@@ -118,6 +124,12 @@ impl WorkerHandle {
         if let Some(dir) = td.take() {
             let _ = dir.close(); // ignore error; best-effort cleanup
         }
+        
+        tracing::debug!(
+            "worker process terminated and resources cleaned up (unix_user={}, access_key={})",
+            self.username,
+            self.key.access_key
+        );
     }
 }
 
@@ -322,6 +334,7 @@ impl WorkerManager {
             endpoint: &endpoint,
             region: &self.server_cfg.region,
             virtual_hosted_suffixes: &virtual_hosted_suffixes_str,
+            log_level: &self.server_cfg.log_level.as_deref().unwrap_or("info"),
         };
 
         let rendered_args = render_args(&profile.args, &vars)
@@ -401,16 +414,6 @@ impl WorkerManager {
             }
         }
     }
-
-    /// Optional helper: expose the configured posix root for other modules.
-    pub fn posix_root(&self) -> &str {
-        &self.cfg.posix_root
-    }
-
-    /// Optional helper: check if a profile exists (useful for routing validation at runtime).
-    pub fn has_profile(&self, profile: &str) -> bool {
-        self.cfg.profiles.contains_key(profile)
-    }
 }
 
 /* ---------------- templating ---------------- */
@@ -425,6 +428,7 @@ struct TemplateVars<'a> {
     endpoint: &'a WorkerEndpoint,
     region: &'a str,
     virtual_hosted_suffixes: &'a str,
+    log_level: &'a str,
 }
 
 fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
@@ -441,7 +445,7 @@ fn render_env(env: &std::collections::BTreeMap<String, String>, vars: &TemplateV
 
 /// Strict, safe placeholder replacement.
 /// Supports tokens like: {{username}}, {{uid}}, {{gid}}, {{access_key}}, {{secret_key}},
-/// {{posix_root}}, {{bind_addr}}, {{bind_uds}}, {{region}}.
+/// {{posix_root}}, {{bind_addr}}, {{bind_uds}}, {{region}}, {{log_level}}.
 /// Unknown tokens cause an error.
 fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
     let mut out = String::with_capacity(input.len());
@@ -469,6 +473,7 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
             "bind_uds" => vars.endpoint.to_string(),
             "region" => vars.region.to_string(),
             "virtual_hosted_suffixes" => vars.virtual_hosted_suffixes.to_string(),
+            "log_level" => vars.log_level.to_string(),
             other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
         };
 
