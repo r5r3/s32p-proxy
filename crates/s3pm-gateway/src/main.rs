@@ -219,6 +219,12 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         &app.virtual_hosted_suffixes
     );
 
+    // All actions require authentication
+    let cfg = app.cfg.clone();
+    if let Err(resp) = require_sigv4(&req, &cfg) {
+        return Ok(resp);
+    }
+
     let resp = match &class.op {
         s3pm_support::classifier::S3Op::Read(s3pm_support::classifier::ReadOp::ListBuckets) => {
             handle_list_buckets(req, app, &class).await
@@ -311,10 +317,6 @@ async fn handle_list_buckets(
     class: &s3pm_support::classifier::S3RequestClass,
 ) -> Resp {
     let cfg = app.cfg.clone();
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
 
     // Optional params
     let bucket_region_q = if class.query.has("bucket-region") {
@@ -554,11 +556,6 @@ async fn handle_get_bucket_location(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Require SigV4 even for local responses
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     // Only allow ?location (classifier should already ensure this, but keep it defensive)
     if req.uri().query().is_some() && !query_is_only_location(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
@@ -583,11 +580,6 @@ async fn handle_head_bucket(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    // Require SigV4 even for local responses
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     // Defensive: HeadBucket should not have query params in our implementation.
     if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
@@ -610,32 +602,14 @@ async fn handle_multipart(
     app: Arc<App>,
     class: &s3pm_support::classifier::S3RequestClass,
 ) -> Resp {
-    let cfg = app.cfg.clone();
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     crate::multipart::handle(req, app, class).await
 }
 
-async fn handle_versioning(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
-    let cfg = app.cfg.clone();
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
+async fn handle_versioning(_req: Request<Incoming>, _app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
     s3pm_support::s3resp::not_implemented("versioning is not implemented", None)
 }
 
-async fn handle_other(req: Request<Incoming>, app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
-    let cfg = app.cfg.clone();
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
+async fn handle_other(_req: Request<Incoming>, _app: Arc<App>, _class: &s3pm_support::classifier::S3RequestClass) -> Resp {
     // Preserve the previous general message
     s3pm_support::s3resp::not_implemented("only GET/HEAD /{bucket}/{key} is implemented", None)
 }
@@ -646,11 +620,6 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s3pm_s
     // Allow SigV4 presign query params; reject only effective (non-presign) query params.
     if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
-    }
-
-    // SigV4: parse + verify (every request)
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
     }
 
     let is_head_object = matches!(
@@ -1118,10 +1087,6 @@ async fn handle_list_objects_v2(
 ) -> Resp {
     let cfg = app.cfg.clone();
 
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     let bucket = class.bucket.as_deref().unwrap_or("");
     if bucket.is_empty() {
         return s3pm_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
@@ -1488,11 +1453,6 @@ async fn handle_put_object(
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
-    // SigV4: parse + verify (every request)
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
 
@@ -1597,10 +1557,6 @@ async fn handle_copy_object(
     // Allow SigV4 presign query params; reject only effective (non-presign) query params.
     if has_effective_query(&req) {
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
-    }
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
     }
 
     let dst_bucket = class.bucket.as_deref().unwrap_or("");
@@ -1791,10 +1747,6 @@ async fn handle_rename_object(
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     let dst_bucket = class.bucket.as_deref().unwrap_or("");
     let dst_key = class.key.as_deref().unwrap_or("");
     if dst_bucket.is_empty() || dst_key.is_empty() {
@@ -1954,10 +1906,6 @@ async fn handle_delete_object(
         return s3pm_support::s3resp::not_implemented("query parameters are not implemented", None);
     }
 
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
-    }
-
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
 
@@ -2029,10 +1977,6 @@ async fn handle_delete_objects(
     // Must be ?delete (classifier already checked), keep defensive.
     if !class.query.has("delete") {
         return s3pm_support::s3resp::not_implemented("missing ?delete", None);
-    }
-
-    if let Err(resp) = require_sigv4(&req, &cfg) {
-        return resp;
     }
 
     let bucket = class.bucket.as_deref().unwrap_or("");
