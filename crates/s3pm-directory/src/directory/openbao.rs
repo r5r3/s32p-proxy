@@ -2,6 +2,7 @@ use crate::directory::layout::{DirectoryLayout, IndexDoc};
 use crate::directory::posix_groups::groups_for_user;
 use crate::directory::{AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc};
 use crate::openbao_client::OpenBaoClient;
+use s3pm_support::utils::trim_slashes;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -130,7 +131,5 @@ impl Directory for OpenBaoDirectory {
     }
 }
 
-fn trim_slashes(s: &str) -> String {
-    s.trim().trim_matches('/').to_string()
-}
+
 

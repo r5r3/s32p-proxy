@@ -3,6 +3,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use s3pm_support::utils::trim_slashes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -396,7 +397,5 @@ impl OpenBaoClient {
     }
 }
 
-fn trim_slashes(s: &str) -> String {
-    s.trim().trim_matches('/').to_string()
-}
+
 

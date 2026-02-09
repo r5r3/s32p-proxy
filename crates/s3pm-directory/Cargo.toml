@@ -10,6 +10,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"] }
 libc = "0.2"
+s3pm-support = { path = "../s3pm-support" }
 
 # OpenBao/Vault HTTP API
 reqwest = { workspace = true }

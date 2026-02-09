@@ -28,6 +28,8 @@ pub mod s3resp;
 // Shared URI and percent-decoding helpers.
 pub mod uri_encoding;
 
+// Utility functions for string manipulation
+pub mod utils;
 
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use s3pm_support::utils::trim_slashes;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -28,10 +29,6 @@ pub struct OpenBaoAdmin {
     kv_mount: String,
     layout: DirectoryLayout,
     client: OpenBaoClient,
-}
-
-fn trim_slashes(s: &str) -> String {
-    s.trim().trim_matches('/').to_string()
 }
 
 impl OpenBaoAdmin {
