@@ -1,5 +1,6 @@
 use http::{HeaderMap, Uri};
 use std::collections::HashMap;
+use super::utils::parse_u32;
 
 /// High-level classification for S3 REST requests.
 /// Shared by proxy and gateway to avoid duplicated request parsing logic.
@@ -654,9 +655,5 @@ fn parse_bucket_key_auto(
     // Default to path-style parsing
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     (bucket, key, false)
-}
-
-fn parse_u32(s: &str) -> Option<u32> {
-    s.parse::<u32>().ok()
 }
 

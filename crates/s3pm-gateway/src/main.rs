@@ -38,10 +38,8 @@ use crate::buffer::{BufPool, PooledBuf, SliceOwner};
 use crate::uring_io::UringIO;
 use crate::streaming::{
     copy_file_to_file,
-    parse_range_header,
     stream_range_body,
     write_object_body,
-    ByteRange,
     StreamCfg,
     WriteObjectDest,
 };
@@ -57,6 +55,7 @@ use crate::fs_helpers::{
     OpenDirect,
 };
 use s3pm_support;
+use s3pm_support::utils::{ByteRange, parse_range_header};
 
 type Resp = s3pm_support::s3resp::HttpResponse;
 

@@ -25,64 +25,13 @@ use crate::fs_helpers::{
     LustreStriping,
     try_preallocate_range,
 };
-
-#[derive(Debug, Clone, Copy)]
-pub struct ByteRange {
-    pub start: u64,
-    pub end_excl: u64, // [start, end_excl)
-}
+use s3pm_support::utils::ByteRange;
 
 #[derive(Clone)]
 pub struct StreamCfg {
     pub chunk_size: usize,
     pub inflight: usize,
     pub direct_io: bool,
-}
-
-pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
-    let h = h.trim();
-    if h.is_empty() {
-        return Ok(None);
-    }
-    if !h.starts_with("bytes=") {
-        return Err(anyhow!("unsupported Range unit"));
-    }
-    let spec = &h["bytes=".len()..];
-
-    if spec.contains(',') {
-        return Err(anyhow!("multiple ranges not supported"));
-    }
-
-    let (a, b) = spec.split_once('-').ok_or_else(|| anyhow!("bad Range syntax"))?;
-    if a.is_empty() {
-        let suffix: u64 = b.parse().map_err(|_| anyhow!("bad Range suffix"))?;
-        if suffix == 0 {
-            return Err(anyhow!("bad Range suffix"));
-        }
-        let start = size.saturating_sub(suffix);
-        return Ok(Some(ByteRange { start, end_excl: size }));
-    }
-
-    let start: u64 = a.parse().map_err(|_| anyhow!("bad Range start"))?;
-    if start >= size {
-        return Err(anyhow!("Range start beyond EOF"));
-    }
-
-    let end_incl = if b.is_empty() {
-        size - 1
-    } else {
-        let mut e: u64 = b.parse().map_err(|_| anyhow!("bad Range end"))?;
-        if e >= size {
-            e = size - 1;
-        }
-        e
-    };
-
-    if end_incl < start {
-        return Err(anyhow!("Range end < start"));
-    }
-
-    Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
 }
 
 /// Stream a range from file as a Hyper body using the shared UringIO.
