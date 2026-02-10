@@ -163,4 +163,18 @@ fn test_non_effective_attributes() {
     assert!(matches!(class.op, s3pm_support::classifier::S3Op::Read(
         s3pm_support::classifier::ReadOp::GetObject
     )));
+    
+    // Test with x-amz-storage-class
+    let uri = Uri::from_str("/bucket/key?x-amz-storage-class=STANDARD").unwrap();
+    let class = classify_with_headers("PUT", &uri, None, &[]);
+    assert!(matches!(class.op, s3pm_support::classifier::S3Op::Write(
+        s3pm_support::classifier::WriteOp::PutObject
+    )));
+    
+    // Test with x-amz-storage-class and other non-effective attributes
+    let uri = Uri::from_str("/bucket/key?x-amz-storage-class=REDUCED_REDUNDANCY&content-type=application/json&cache-control=public").unwrap();
+    let class = classify_with_headers("PUT", &uri, None, &[]);
+    assert!(matches!(class.op, s3pm_support::classifier::S3Op::Write(
+        s3pm_support::classifier::WriteOp::PutObject
+    )));
 }

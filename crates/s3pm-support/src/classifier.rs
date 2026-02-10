@@ -207,6 +207,7 @@ impl QueryParams {
                 | "content-encoding"
                 | "content-disposition"
                 | "expires"
+                | "x-amz-storage-class"
         )
     }
 
