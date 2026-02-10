@@ -196,31 +196,53 @@ impl QueryParams {
         )
     }
 
-    /// True if there are no *effective* query params except SigV4-presign params.
+    /// Non-effective query keys that should be ignored for routing/classification decisions
+    /// but are not SigV4 presign parameters. These can be validated but don't affect operation routing.
+    fn is_non_effective_key(key_lc: &str) -> bool {
+        matches!(
+            key_lc,
+            "x-id"
+                | "content-type"
+                | "cache-control"
+                | "content-encoding"
+                | "content-disposition"
+                | "expires"
+        )
+    }
+
+    /// Validate x-id if present - returns true if x-id is absent or matches the expected operation name
+    pub fn validate_xid(&self, expected_op_name: &str) -> bool {
+        match self.first("x-id") {
+            Some(xid_value) => xid_value == expected_op_name,
+            None => true, // x-id not present is always valid
+        }
+    }
+
+    /// True if there are no *effective* query params except SigV4-presign params and non-effective keys.
     pub fn is_empty_effective(&self) -> bool {
         self.inner
             .keys()
-            .all(|k| Self::is_sigv4_presign_key(k.as_str()))
+            .all(|k| Self::is_sigv4_presign_key(k.as_str()) || Self::is_non_effective_key(k.as_str()))
     }
 
-    /// True if the only *effective* (non-presign) query param key is `key`.
+    /// True if the only *effective* (non-presign, non-non-effective) query param key is `key`.
     pub fn is_only_effective(&self, key: &str) -> bool {
         let key_lc = key.to_ascii_lowercase();
 
-        let mut non_presign_keys = 0usize;
+        let mut non_effective_keys = 0usize;
         let mut has_key = false;
 
         for k in self.inner.keys() {
-            if Self::is_sigv4_presign_key(k.as_str()) {
+            if Self::is_sigv4_presign_key(k.as_str()) || Self::is_non_effective_key(k.as_str()) {
                 continue;
             }
-            non_presign_keys += 1;
+            non_effective_keys += 1;
             if *k == key_lc {
                 has_key = true;
             }
         }
 
-        non_presign_keys == 1 && has_key
+        non_effective_keys == 1 && has_key
     }
 }
 
@@ -254,8 +276,8 @@ pub fn classify_with_headers(
 
     // Rest of the classification logic...
 
-    // ListBuckets: GET / (may include pagination/filter query params)
-    if method == "GET" && bucket.is_none() && key.is_none() {
+    // ListBuckets: GET / (may include pagination/filter query params, allow x-id)
+    if method == "GET" && bucket.is_none() && key.is_none() && query.validate_xid("ListBuckets") {
         return S3RequestClass {
             bucket,
             key,
@@ -295,8 +317,8 @@ pub fn classify_with_headers(
         };
     }
 
-    // GetBucketLocation: GET /{bucket}?location (or /{bucket}/?location), and ONLY that param
-    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only_effective("location") {
+    // GetBucketLocation: GET /{bucket}?location (or /{bucket}/?location), and ONLY that param (allow x-id)
+    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only_effective("location") && query.validate_xid("GetBucketLocation") {
         return S3RequestClass {
             bucket,
             key,
@@ -305,8 +327,8 @@ pub fn classify_with_headers(
         };
     }
 
-    // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params
-    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty_effective() {
+    // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
+    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty_effective() && query.validate_xid("HeadBucket") {
         return S3RequestClass {
             bucket,
             key,
@@ -319,7 +341,8 @@ pub fn classify_with_headers(
     if method == "PUT"
         && bucket.is_some()
         && key.is_none()
-        && (query.is_empty_effective() || query.is_only_effective("x-id"))
+        && query.is_empty_effective()
+        && query.validate_xid("CreateBucket")
     {
         return S3RequestClass {
             bucket,
@@ -333,7 +356,8 @@ pub fn classify_with_headers(
     if method == "DELETE"
         && bucket.is_some()
         && key.is_none()
-        && (query.is_empty_effective() || query.is_only_effective("x-id"))
+        && query.is_empty_effective()
+        && query.validate_xid("DeleteBucket")
     {
         return S3RequestClass {
             bucket,
@@ -344,8 +368,8 @@ pub fn classify_with_headers(
     }
 
 
-    // GetObject: GET /{bucket}/{key} with *no* query params
-    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
+    // GetObject: GET /{bucket}/{key} with *no* query params (allow x-id)
+    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("GetObject") {
         return S3RequestClass {
             bucket,
             key,
@@ -354,8 +378,8 @@ pub fn classify_with_headers(
         };
     }
 
-    // HeadObject: HEAD /{bucket}/{key} with *no* query params
-    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
+    // HeadObject: HEAD /{bucket}/{key} with *no* query params (allow x-id)
+    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("HeadObject") {
         return S3RequestClass {
             bucket,
             key,
@@ -364,11 +388,12 @@ pub fn classify_with_headers(
         };
     }
 
-    // ListObjectsV2: GET /{bucket}?list-type=2 (may have other params)
+    // ListObjectsV2: GET /{bucket}?list-type=2 (may have other params, allow x-id)
     if method == "GET"
         && bucket.is_some()
         && key.is_none()
         && query.first("list-type") == Some("2")
+        && query.validate_xid("ListObjectsV2")
     {
         return S3RequestClass {
             bucket,
@@ -378,12 +403,13 @@ pub fn classify_with_headers(
         };
     }
 
-    // CopyObject: PUT /{bucket}/{key} with *no* query params and x-amz-copy-source
+    // CopyObject: PUT /{bucket}/{key} with *no* query params and x-amz-copy-source (allow x-id)
     if method == "PUT"
         && bucket.is_some()
         && key.is_some()
         && query.is_empty_effective()
         && headers.is_some_and(|h| h.get("x-amz-copy-source").is_some())
+        && query.validate_xid("CopyObject")
     {
         return S3RequestClass {
             bucket,
@@ -393,12 +419,13 @@ pub fn classify_with_headers(
         };
     }
 
-    // RenameObject: PUT /{bucket}/{key}?renameObject with x-amz-rename-source
+    // RenameObject: PUT /{bucket}/{key}?renameObject with x-amz-rename-source (allow x-id)
     if method == "PUT"
         && bucket.is_some()
         && key.is_some()
         && query.has("renameobject")
         && headers.is_some_and(|h| h.get("x-amz-rename-source").is_some())
+        && query.validate_xid("RenameObject")
     {
         return S3RequestClass {
             bucket,
@@ -408,8 +435,8 @@ pub fn classify_with_headers(
         };
     }
 
-    // PutObject: PUT /{bucket}/{key} with *no* query params
-    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
+    // PutObject: PUT /{bucket}/{key} with *no* query params (allow x-id)
+    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("PutObject") {
         return S3RequestClass {
             bucket,
             key,
@@ -419,7 +446,7 @@ pub fn classify_with_headers(
     }
 
     // DeleteObjects (multi-delete): POST /{bucket}?delete (may also include x-id=DeleteObjects etc.)
-    if method == "POST" && bucket.is_some() && key.is_none() && query.has("delete") {
+    if method == "POST" && bucket.is_some() && key.is_none() && query.has("delete") && query.validate_xid("DeleteObjects") {
         return S3RequestClass {
             bucket,
             key,
@@ -428,8 +455,8 @@ pub fn classify_with_headers(
         };
     }
 
-    // DeleteObject: DELETE /{bucket}/{key} with *no* query params
-    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty_effective() {
+    // DeleteObject: DELETE /{bucket}/{key} with *no* query params (allow x-id)
+    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("DeleteObject") {
         return S3RequestClass {
             bucket,
             key,
@@ -466,20 +493,20 @@ fn classify_multipart(
     key: &Option<String>,
     query: &QueryParams,
 ) -> Option<MultipartOp> {
-    // ListMultipartUploads: GET /{bucket}?uploads
-    if method == "GET" && bucket.is_some() && key.is_none() && query.has("uploads") {
+    // ListMultipartUploads: GET /{bucket}?uploads (allow x-id)
+    if method == "GET" && bucket.is_some() && key.is_none() && query.has("uploads") && query.validate_xid("ListMultipartUploads") {
         return Some(MultipartOp::ListMultipartUploads);
     }
 
-    // CreateMultipartUpload: POST /{bucket}/{key}?uploads
-    if method == "POST" && bucket.is_some() && key.is_some() && query.has("uploads") {
+    // CreateMultipartUpload: POST /{bucket}/{key}?uploads (allow x-id)
+    if method == "POST" && bucket.is_some() && key.is_some() && query.has("uploads") && query.validate_xid("CreateMultipartUpload") {
         return Some(MultipartOp::CreateMultipartUpload);
     }
 
-    // uploadId is the strong signal for object multipart sub-resources
+    // uploadId is the strong signal for object multipart sub-resources (allow x-id)
     if let Some(upload_id) = query.first("uploadid").map(|s| s.to_string()) {
         // UploadPart: PUT ?partNumber=N&uploadId=...
-        if method == "PUT" {
+        if method == "PUT" && query.validate_xid("UploadPart") {
             if let Some(pn) = query.first("partnumber").and_then(parse_u32) {
                 return Some(MultipartOp::UploadPart {
                     upload_id,
@@ -490,17 +517,17 @@ fn classify_multipart(
         }
 
         // ListParts: GET ?uploadId=...
-        if method == "GET" {
+        if method == "GET" && query.validate_xid("ListParts") {
             return Some(MultipartOp::ListParts { upload_id });
         }
 
         // CompleteMultipartUpload: POST ?uploadId=...
-        if method == "POST" {
+        if method == "POST" && query.validate_xid("CompleteMultipartUpload") {
             return Some(MultipartOp::CompleteMultipartUpload { upload_id });
         }
 
         // AbortMultipartUpload: DELETE ?uploadId=...
-        if method == "DELETE" {
+        if method == "DELETE" && query.validate_xid("AbortMultipartUpload") {
             return Some(MultipartOp::AbortMultipartUpload { upload_id });
         }
 
@@ -516,26 +543,28 @@ fn classify_versioning(
     key: &Option<String>,
     query: &QueryParams,
 ) -> Option<VersioningOp> {
-    // Bucket versioning configuration: GET/PUT /{bucket}?versioning
+    // Bucket versioning configuration: GET/PUT /{bucket}?versioning (allow x-id)
     if bucket.is_some() && key.is_none() && query.has("versioning") {
         return match method {
-            "GET" => Some(VersioningOp::GetBucketVersioning),
-            "PUT" => Some(VersioningOp::PutBucketVersioning),
+            "GET" if query.validate_xid("GetBucketVersioning") => Some(VersioningOp::GetBucketVersioning),
+            "PUT" if query.validate_xid("PutBucketVersioning") => Some(VersioningOp::PutBucketVersioning),
             _ => Some(VersioningOp::Unknown),
         };
     }
 
-    // List object versions: GET /{bucket}?versions
-    if method == "GET" && bucket.is_some() && key.is_none() && query.has("versions") {
+    // List object versions: GET /{bucket}?versions (allow x-id)
+    if method == "GET" && bucket.is_some() && key.is_none() && query.has("versions") && query.validate_xid("ListObjectVersions") {
         return Some(VersioningOp::ListObjectVersions);
     }
 
-    // Any object request that specifies versionId
+    // Any object request that specifies versionId (allow x-id)
     if key.is_some() {
         if let Some(vid) = query.first("versionid") {
-            return Some(VersioningOp::ObjectWithVersionId {
-                version_id: vid.to_string(),
-            });
+            if query.validate_xid("ObjectWithVersionId") {
+                return Some(VersioningOp::ObjectWithVersionId {
+                    version_id: vid.to_string(),
+                });
+            }
         }
     }
 
@@ -548,29 +577,29 @@ fn classify_object_lock(
     key: &Option<String>,
     query: &QueryParams,
 ) -> Option<ObjectLockOp> {
-    // Bucket Object Lock configuration: GET/PUT /{bucket}?object-lock
+    // Bucket Object Lock configuration: GET/PUT /{bucket}?object-lock (allow x-id)
     if bucket.is_some() && key.is_none() && query.has("object-lock") {
         return match method {
-            "GET" => Some(ObjectLockOp::GetBucketObjectLockConfiguration),
-            "PUT" => Some(ObjectLockOp::PutBucketObjectLockConfiguration),
+            "GET" if query.validate_xid("GetBucketObjectLockConfiguration") => Some(ObjectLockOp::GetBucketObjectLockConfiguration),
+            "PUT" if query.validate_xid("PutBucketObjectLockConfiguration") => Some(ObjectLockOp::PutBucketObjectLockConfiguration),
             _ => Some(ObjectLockOp::Unknown),
         };
     }
 
-    // Object retention: GET/PUT /{bucket}/{key}?retention
+    // Object retention: GET/PUT /{bucket}/{key}?retention (allow x-id)
     if bucket.is_some() && key.is_some() && query.has("retention") {
         return match method {
-            "GET" => Some(ObjectLockOp::GetObjectRetention),
-            "PUT" => Some(ObjectLockOp::PutObjectRetention),
+            "GET" if query.validate_xid("GetObjectRetention") => Some(ObjectLockOp::GetObjectRetention),
+            "PUT" if query.validate_xid("PutObjectRetention") => Some(ObjectLockOp::PutObjectRetention),
             _ => Some(ObjectLockOp::Unknown),
         };
     }
 
-    // Object legal hold: GET/PUT /{bucket}/{key}?legal-hold
+    // Object legal hold: GET/PUT /{bucket}/{key}?legal-hold (allow x-id)
     if bucket.is_some() && key.is_some() && query.has("legal-hold") {
         return match method {
-            "GET" => Some(ObjectLockOp::GetObjectLegalHold),
-            "PUT" => Some(ObjectLockOp::PutObjectLegalHold),
+            "GET" if query.validate_xid("GetObjectLegalHold") => Some(ObjectLockOp::GetObjectLegalHold),
+            "PUT" if query.validate_xid("PutObjectLegalHold") => Some(ObjectLockOp::PutObjectLegalHold),
             _ => Some(ObjectLockOp::Unknown),
         };
     }
