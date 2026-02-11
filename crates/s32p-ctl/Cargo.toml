@@ -1,0 +1,17 @@
+[package]
+name = "s32p-ctl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+s32p-admin = { path = "../s32p-admin" }
+s32p-directory = { path = "../s32p-directory" }
+

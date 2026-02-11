@@ -3,12 +3,12 @@ cargo-features = ["profile-rustflags"]
 [workspace]
 resolver = "2"
 members = [
-  "crates/s3pm-directory",
-  "crates/s3pm-proxy",
-  "crates/s3pm-support",
-  "crates/s3pm-admin",
-  "crates/s3pm-ctl",
-  "crates/s3pm-gateway",
+  "crates/s32p-directory",
+  "crates/s32p-proxy",
+  "crates/s32p-support",
+  "crates/s32p-admin",
+  "crates/s32p-ctl",
+  "crates/s32p-gateway",
 ]
 
 [workspace.dependencies]

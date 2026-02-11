@@ -1,6 +1,6 @@
-# s3-proxy-manager
+# s32p: S3 to POSIX proxy and gateway
 
-`s3-proxy-manager` is a **Rust-based S3-compatible proxy + worker manager** built on **Cloudflare Pingora**.
+`s32p-proxy` is a **Rust-based S3-compatible proxy + worker manager** built on **Cloudflare Pingora**.
 
 It accepts S3 client requests, maps S3 identities (SigV4 access keys) to **Unix users**, and routes traffic to **per-access-key worker processes** (currently: **VersityGW**) that expose a **shared POSIX filesystem** with kernel-enforced permissions.
 
@@ -27,12 +27,12 @@ The proxy itself does not perform filesystem I/O.
 
 This repository is a Rust workspace with multiple crates:
 
-- `s3pm-proxy`: the Pingora-based proxy binary
-- `s3pm-directory`: shared Directory API + YAML/OpenBao backends + shared YAML file format
-- `s3pm-admin`: management library (OpenBao write access, import/export, etc.)
-- `s3pm-ctl`: CLI wrapper around `s3pm-admin` (operator tooling)
-- `s3pm-support`: shared support library (common config/types/errors/helpers used across crates)
-- `s3pm-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as alternative to VersityGW)
+- `s32p-proxy`: the Pingora-based proxy binary
+- `s32p-directory`: shared Directory API + YAML/OpenBao backends + shared YAML file format
+- `s32p-admin`: management library (OpenBao write access, import/export, etc.)
+- `s32p-ctl`: CLI wrapper around `s32p-admin` (operator tooling)
+- `s32p-support`: shared support library (common config/types/errors/helpers used across crates)
+- `s32p-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as alternative to VersityGW)
 
 ---
 
@@ -44,50 +44,51 @@ This repository is a Rust workspace with multiple crates:
     └──────┬───────┘
            │  HTTP(S)
            ▼
-┌──────────────────────────────────────────┐
-│              s3-proxy-manager            │
-│            (Pingora HTTP proxy)          │
-│                                          │
-│  • parses Authorization → access key     │
-│  • maps access key → unix user           │
-│  • looks up user + ACLs via Directory    │
-│    (YAML file or OpenBao)                │
-│  • classifies requests (query+path)      │
-│  • routes by "request class" via YAML    │
-│    (proxy to profile or local response)  │
-│  • gates worker spawn with SigV4         │
-│    verification (auth header or presign) │
-│  • reverse proxies to per-user worker    │
-│  • optional response header rewriting    │
-└───────────────────┬──────────────────────┘
+┌───────────────────────────────────────────┐
+│                 s32p-proxy                │
+│            (Pingora HTTP proxy)           │
+│                                           │
+│  • parses Authorization → access key      │
+│  • maps access key → unix user            │
+│  • looks up user + ACLs via Directory     │
+│    (YAML file or OpenBao)                 │
+│  • classifies requests (query+path)       │
+│  • routes by "request class" via YAML     │
+│    (proxy to profile or local response)   │
+│  • gates worker spawn with SigV4          │
+│    verification (auth header or presign)  │
+│  • reverse proxies to per-user worker     │
+│  • optional response header rewriting     │
+└───────────────────┬───────────────────────┘
                     │ internal HTTP (loopback) or
                     │ HTTP over Unix domain sockets (UDS)
                     ▼
-┌────────────────────────────────┐
-│      Per-access-key workers    │
-│ (e.g. VersityGW, unmodified)   │
-│                                │
-│  • runs as unix user           │
-│  • validates SigV4 again       │
-│  • uses a staged posix_root    │
-└───────────────┬────────────────┘
-                │ POSIX syscalls
-                ▼
-┌──────────────────────────────────────────┐
-│   Shared POSIX FS (real bucket data)     │
-│                                          │
-│  Each worker starts with a fresh temp    │
-│  directory as its posix_root.            │
-│  Symlinks to all accessible buckets      │
-│  are created in that temp root before    │
-│  the worker starts. The worker follows   │
-│  those links.                            │
-└──────────────────────────────────────────┘
+      ┌────────────────────────────────┐
+      │      Per-access-key workers    │
+      │        (e.g. s32p-gateway      │
+      │           or VersityGW)        │
+      │                                │
+      │  • runs as unix user           │
+      │  • validates SigV4 again       │
+      │  • uses a staged posix_root    │
+      └───────────────┬────────────────┘
+                      │ POSIX syscalls
+                      ▼
+┌───────────────────────────────────────────┐
+│   Shared POSIX FS (real bucket data)      │
+│                                           │
+│  Each worker starts with a fresh temp     │
+│  directory as its posix_root.             │
+│  Symlinks to all accessible buckets       │ 
+│  are created in that temp root before     │ 
+│  the worker starts. The worker follows    │
+│  those links.                             │
+└───────────────────────────────────────────┘
 ```
 
 ---
 
-## Current Status (January 2026)
+## Current Status (February 2026)
 
 ### Implemented
 
@@ -98,7 +99,7 @@ This repository is a Rust workspace with multiple crates:
   - Preserves SigV4-critical headers (notably the original `Host`)
   - Has a `response_filter` hook for response header rewriting
 
-- **Request classification** (`crates/s3pm-support/src/classifier.rs`)
+- **Request classification** (`crates/s32p-support/src/classifier.rs`)
   - Shared by proxy + gateway (single source of truth for routing decisions)
   - Parses path + query parameters (and selected headers where needed, e.g. `x-amz-copy-source`)
   - Produces a high-level operation class key:
@@ -107,21 +108,21 @@ This repository is a Rust workspace with multiple crates:
     - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
     - `versioning` (detected, but not implemented yet)
     - `object_lock` (detected, but not implemented yet)
-    - `bucket_admin` (CreateBucket/DeleteBucket; detected, but not implemented yet)
+    - `bucket_admin` (`CreateBucket`/`DeleteBucket`; detected, but not implemented yet)
     - `other`
 
-- **Config-driven routing** (`etc/s3-proxy-manager.yaml`)
+- **Config-driven routing** (`etc/s32p-proxy.yaml`)
   - Routes based on the classifier class keys above.
   - Each class maps to one action:
     - `proxy` (selects a worker profile)
     - `not_implemented` (local S3 NotImplemented response, but only after SigV4 validation)
   - If a specific class key is not configured, the proxy falls back to the `other` route.
 
-#### Gateway (`s3pm-gateway`)
+#### Gateway (`s32p-gateway`)
 
 Experimental alternative to `versitygw`. Implements a growing subset of the S3 REST API directly on top of a POSIX filesystem.
 
-Implemented operations:
+##### Implemented operations:
 
 - **Read**
   - `GetObject`
@@ -143,7 +144,7 @@ Implemented operations:
   - `CompleteMultipartUpload` (`POST ?uploadId=...`)
   - `AbortMultipartUpload` (`DELETE ?uploadId=...`)
 
-Notes / behavior:
+##### Notes / behavior:
 
 - Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
 - Rejects most query parameters for now, except those required for:
@@ -151,37 +152,37 @@ Notes / behavior:
 - **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as “effective” query parameters for routing/handling.
 - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
 - When built with `--features lustre`, the gateway creates new files with Lustre striping via `llapi_file_create()`.
-  - Config: `S3PM_LUSTRE_MAX_STRIPE_COUNT` (default: `4`) caps the stripe count.
+  - Config: `S32P_LUSTRE_MAX_STRIPE_COUNT` (default: `4`) caps the stripe count.
   - **Serial uploads** (`PutObject`, `CopyObject`, and any temp/staging files):
-    - `stripe_size = S3PM_CHUNK_SIZE_MB`
-    - `stripe_count = ceil(file_size / stripe_size)`, capped by `S3PM_LUSTRE_MAX_STRIPE_COUNT`
+    - `stripe_size = S32P_CHUNK_SIZE_MB`
+    - `stripe_count = ceil(file_size / stripe_size)`, capped by `S32P_LUSTRE_MAX_STRIPE_COUNT`
   - **Multipart uploads**:
-    - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S3PM_LUSTRE_MAX_STRIPE_COUNT`
+    - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S32P_LUSTRE_MAX_STRIPE_COUNT`
     - individual part files are striped like serial uploads.
 - `ETag` for final objects is generated from the inode number.
 
-#### Multipart upload (`s3pm-gateway`) — server-side assembly algorithm
+### Multipart upload (`s32p-gateway`) — server-side assembly algorithm
 
-Multipart uploads are implemented in `crates/s3pm-gateway/src/multipart.rs`.
+Multipart uploads are implemented in `crates/s32p-gateway/src/multipart.rs`.
 
 The design goal is to **avoid creating a full extra copy of the object on the server** during completion. The gateway does this by writing parts into an **assembly file** that can be **renamed into place** as the final object.
 
-### On-disk layout (per bucket)
+#### On-disk layout (per bucket)
 
-For a bucket with root `<bucket_root>`, the gateway reserves a hidden directory (default name: `.s3pm-mpu`):
+For a bucket with root `<bucket_root>`, the gateway reserves a hidden directory (default name: `.s32p-mpu`):
 
-- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/meta.json`  
+- `<bucket_root>/.s32p-mpu/uploads/<upload_id>/meta.json`  
   JSON metadata for the upload (bucket/key, state, and a map of uploaded parts).
-- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/lock`  
+- `<bucket_root>/.s32p-mpu/uploads/<upload_id>/lock`  
   A file used with `flock(LOCK_EX)` to serialize metadata updates and completion.
-- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/direct.bin`  
+- `<bucket_root>/.s32p-mpu/uploads/<upload_id>/direct.bin`  
   The **assembly file** (random-access writes at part offsets).
-- `<bucket_root>/.s3pm-mpu/uploads/<upload_id>/parts/part-00001.bin` (etc.)  
+- `<bucket_root>/.s32p-mpu/uploads/<upload_id>/parts/part-00001.bin` (etc.)  
   Fallback storage for parts that cannot safely be placed into `direct.bin`.
 
 The gateway also prevents clients from reading/writing/deleting objects *inside* the reserved multipart directory by treating that first path segment as “reserved”.
 
-### Part upload placement
+#### Part upload placement
 
 When a part arrives (`PUT ?partNumber=N&uploadId=...`), the gateway decides where to store it:
 
@@ -202,7 +203,7 @@ Metadata records, per part:
 - timestamp
 - storage kind: `{ direct: off }` or `{ file: name }`
 
-### Completion: assembling without a full server-side copy
+#### Completion: assembling without a full server-side copy
 
 On `CompleteMultipartUpload` (`POST ?uploadId=...`), the gateway:
 
@@ -214,7 +215,7 @@ On `CompleteMultipartUpload` (`POST ?uploadId=...`), the gateway:
 
 Then it chooses one of two assembly paths:
 
-#### Fast path (rename `direct.bin` into place)
+##### Fast path (rename `direct.bin` into place)
 
 This path is taken when the upload matches the classic “fixed-size parts + last part shorter or equal” layout:
 
@@ -236,7 +237,7 @@ If the rename fails with cross-device (`EXDEV`), the gateway performs a **single
 
 ✅ **Why this avoids a full copy:** in the common case (same filesystem), completion becomes a metadata operation (`rename`) after assembling into `direct.bin`. There is no “write whole object into a second file” step.
 
-#### Fallback path (sequential staging file)
+##### Fallback path (sequential staging file)
 
 If the fixed-size/offset conditions don’t hold, the gateway assembles sequentially:
 
@@ -249,14 +250,14 @@ If the fixed-size/offset conditions don’t hold, the gateway assembles sequenti
 
 Finally, on success the gateway marks the upload as completed, returns the completion XML + ETag, and removes the upload directory.
 
-### Practical highlights
+#### Practical highlights
 
 - The gateway’s “happy path” is optimized for **large objects**: parts are placed directly into their final offsets, and completion is typically a truncate + rename.
 - The implementation is careful to avoid data corruption:
   - Direct placement is only used when offsets can be computed safely (no overlap risk).
   - Metadata updates are protected by `flock` and written atomically (`meta.json.tmp` → rename).
 
-#### Directory backends (users, buckets, ACLs)
+### Directory backends (users, buckets, ACLs)
 
 A “Directory” provides:
 
@@ -290,7 +291,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - S3 REST-XML errors (e.g. `AccessDenied`, `SignatureDoesNotMatch`, `NotImplemented`)
   - General `respond_bytes()` helper for header/body responses
 
-#### SigV4 validation behavior
+### SigV4 validation behavior
 
 - **DoS mitigation via “spawn gating”**
   - If a worker is **not running**, the proxy performs **SigV4 verification without reading the body**:
@@ -300,9 +301,9 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - Once a worker is already running, the proxy does **not** fully validate SigV4;
     it only extracts the access key for routing and forwards the request to the worker
 
-- Workers (VersityGW or s3pm-gateway) still validate SigV4 again (cannot be disabled).
+- Workers (VersityGW or s32p-gateway) still validate SigV4 again (cannot be disabled).
 
-#### Worker lifecycle management (`src/worker_manager.rs`)
+### Worker lifecycle management (`src/worker_manager.rs`)
 
 - Workers are keyed by **(access_key, worker_profile)**
   - supports multiple access keys mapped to the same unix user but different bucket ACLs
@@ -311,7 +312,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - If running as root and `pass_user_flag_if_root=true`, the proxy passes `--user <username>`
 - Upstream bind (per worker):
   - TCP loopback: `127.0.0.1:<port>`
-  - Unix domain socket: `/run/s3pm/<uid>/worker.sock` (example; configurable)
+  - Unix domain socket: `/run/s32p/<uid>/worker.sock` (example; configurable)
 - Readiness probing: connect loop until port is reachable
 - Idle shutdown after `idle_timeout_secs`
 - Sweeper removes dead/idle workers periodically (`sweep_interval_secs`)
@@ -329,7 +330,7 @@ Worker args/env templates support placeholders such as:
 
 ## Configuration
 
-Primary configuration: `etc/s3-proxy-manager.yaml`
+Primary configuration: `etc/s32p-proxy.yaml`
 
 Key sections:
 
@@ -362,17 +363,14 @@ server:
 
 When a request's `Host` header ends with a configured suffix, the proxy extracts the bucket name from the host and the key from the path. Port numbers are handled correctly (e.g., `bucket.suffix:9000`).
 
-Workers receive the suffixes via the `S3PM_VIRTUAL_HOSTED_SUFFIXES` environment variable or `{{virtual_hosted_suffixes}}` template:
+Workers receive the suffixes via the `S32P_VIRTUAL_HOSTED_SUFFIXES` environment variable or `{{virtual_hosted_suffixes}}` template:
 
 ```yaml
 workers:
   profiles:
-    s3pm-gateway:
+    s32p-gateway:
       env:
-        S3PM_VIRTUAL_HOSTED_SUFFIXES: "{{virtual_hosted_suffixes}}"
-      args:
-        - "--virtual-hosted-suffixes"
-        - "{{virtual_hosted_suffixes}}"
+        S32P_VIRTUAL_HOSTED_SUFFIXES: "{{virtual_hosted_suffixes}}"
 ```
 
 ### Directory backend selection
@@ -388,7 +386,7 @@ Choose a directory backend via `auth.backend`:
 auth:
   backend: "yaml"
   yaml:
-    path: "/etc/s3pm/directory.yaml"
+    path: "/etc/s32p/directory.yaml"
 ```
 
 #### OpenBao backend config (AppRole)
@@ -399,15 +397,15 @@ auth:
   openbao:
     address: "http://127.0.0.1:8200"
     approle_mount: "approle"
-    role_id_file: "/etc/s3pm/role_id"
-    secret_id_file: "/etc/s3pm/secret_id"
+    role_id_file: "/etc/s32p/role_id"
+    secret_id_file: "/etc/s32p/secret_id"
     kv_mount: "secret"
-    prefix: "s3pm"
+    prefix: "s32p"
 ```
 
 ### YAML directory file format
 
-Example `/etc/s3pm/directory.yaml`:
+Example `/etc/s32p/directory.yaml`:
 
 ```yaml
 version: 1
@@ -463,9 +461,9 @@ The indices make `buckets_for_access_key()` efficient:
 
 ---
 
-## Administration CLI (`s3pm-ctl`)
+## Administration CLI (`s32p-ctl`)
 
-`s3pm-ctl` manages the Directory state (users, buckets, ACLs) for both supported backends:
+`s32p-ctl` manages the Directory state (users, buckets, ACLs) for both supported backends:
 - `--backend openbao` (default): OpenBao/Vault KV v2 + indices
 - `--backend yaml`: local directory.yaml file
 
@@ -477,7 +475,7 @@ All commands work with both backends. The backend is selected via `--backend`.
 For YAML, you must provide the directory file path:
 
 ```bash
-s3pm-ctl --backend yaml --yaml-path /etc/s3pm/directory.yaml <COMMAND...>
+s32p-ctl --backend yaml --yaml-path /etc/s32p/directory.yaml <COMMAND...>
 ```
 
 #### OpenBao backend
@@ -488,7 +486,7 @@ For OpenBao, provide `--address` (or `VAULT_ADDR`) plus authentication:
 Common OpenBao flags:
 - `--address http://127.0.0.1:8200` (or `VAULT_ADDR`)
 - `--kv-mount secret` (default: `secret`)
-- `--prefix s3pm` (default: `s3pm`)
+- `--prefix s32p` (default: `s32p`)
 - `--approle-mount approle` (default: `approle`)
 - `--token ...` (or `VAULT_TOKEN`)
 - `--role-id ...` / `--role-id-file ...`
@@ -497,13 +495,13 @@ Common OpenBao flags:
 Example:
 
 ```bash
-s3pm-ctl --backend openbao \
+s32p-ctl --backend openbao \
   --address http://127.0.0.1:8200 \
   --kv-mount secret \
-  --prefix s3pm \
+  --prefix s32p \
   --approle-mount approle \
-  --role-id-file /etc/s3pm/admin_role_id \
-  --secret-id-file /etc/s3pm/admin_secret_id \
+  --role-id-file /etc/s32p/admin_role_id \
+  --secret-id-file /etc/s32p/admin_secret_id \
   <COMMAND...>
 ```
 
@@ -513,8 +511,8 @@ s3pm-ctl --backend openbao \
 Creates/updates:
 - enables AppRole auth method at `--approle-mount` (default: `approle`)
 - creates policies + roles:
-  - `s3pm-proxy` (read-only)
-  - `s3pm-admin` (read-write)
+  - `s32p-proxy` (read-only)
+  - `s32p-admin` (read-write)
 
 You must provide a bootstrap token (`--token` or `VAULT_TOKEN`):
 
@@ -522,11 +520,11 @@ You must provide a bootstrap token (`--token` or `VAULT_TOKEN`):
 export VAULT_ADDR=http://127.0.0.1:8200
 export VAULT_TOKEN=... # root/admin token for setup only
 
-s3pm-ctl --backend openbao setup \
-  --proxy-role-id-file  /etc/s3pm/proxy_role_id \
-  --proxy-secret-id-file /etc/s3pm/proxy_secret_id \
-  --admin-role-id-file  /etc/s3pm/admin_role_id \
-  --admin-secret-id-file /etc/s3pm/admin_secret_id
+s32p-ctl --backend openbao setup \
+  --proxy-role-id-file  /etc/s32p/proxy_role_id \
+  --proxy-secret-id-file /etc/s32p/proxy_secret_id \
+  --admin-role-id-file  /etc/s32p/admin_role_id \
+  --admin-secret-id-file /etc/s32p/admin_secret_id
 ```
 
 The secret files are written with permissions 0600 on Unix.
@@ -535,7 +533,7 @@ The secret files are written with permissions 0600 on Unix.
 Creates an empty directory file skeleton:
 
 ```bash
-s3pm-ctl --backend yaml --yaml-path /etc/s3pm/directory.yaml setup
+s32p-ctl --backend yaml --yaml-path /etc/s32p/directory.yaml setup
 ```
 
 ### Users
@@ -548,7 +546,7 @@ Commands:
 Add a user:
 
 ```bash
-s3pm-ctl ... user add \
+s32p-ctl ... user add \
   --access-key AKIA_ALICE_1 \
   --secret-key alice_secret \
   --username alice \
@@ -559,13 +557,13 @@ s3pm-ctl ... user add \
 Remove a user (optionally scrubs their `access_key` from bucket ACLs):
 
 ```bash
-s3pm-ctl ... user rm --access-key AKIA_ALICE_1 --cleanup-acls true
+s32p-ctl ... user rm --access-key AKIA_ALICE_1 --cleanup-acls true
 ```
 
 List users:
 
 ```bash
-s3pm-ctl ... user ls
+s32p-ctl ... user ls
 ```
 
 ### Buckets
@@ -579,7 +577,7 @@ Commands:
 Add a bucket:
 
 ```bash
-s3pm-ctl ... bucket add \
+s32p-ctl ... bucket add \
   --name photos \
   --data-path /srv/s3/alice/photos \
   --grant ak:AKIA_ALICE_1:read_write
@@ -592,7 +590,7 @@ s3pm-ctl ... bucket add \
 Optional: provide a stable bucket id (otherwise a UUID is generated):
 
 ```bash
-s3pm-ctl ... bucket add \
+s32p-ctl ... bucket add \
   --bucket-id bkt-alice-photos \
   --name photos \
   --data-path /srv/s3/alice/photos \
@@ -602,19 +600,19 @@ s3pm-ctl ... bucket add \
 Remove a bucket:
 
 ```bash
-s3pm-ctl ... bucket rm --bucket-id bkt-alice-photos
+s32p-ctl ... bucket rm --bucket-id bkt-alice-photos
 ```
 
 List buckets:
 
 ```bash
-s3pm-ctl ... bucket ls
+s32p-ctl ... bucket ls
 ```
 
 Replace a bucket ACL:
 
 ```bash
-s3pm-ctl ... bucket acl-set \
+s32p-ctl ... bucket acl-set \
   --bucket-id bkt-team \
   --grant group:s3-team:read_write \
   --grant ak:AKIA_ALICE_1:read_only
@@ -622,18 +620,10 @@ s3pm-ctl ... bucket acl-set \
 
 ### Import / Export
 
-Due to the usage of [`io_uring`](https://developers.redhat.com/articles/2023/04/12/why-you-should-use-iouring-network-io), 
-you need RHEL 9.3, or another Linux distribution with a compatible kernel. 
-On RHEL, it is necessary to enable the `io_uring` kernel module:
-
-```bash
-sysctl -w kernel.io_uring_disabled=0
-```
-
 Import a directory YAML into the selected backend:
 
 ```bash
-s3pm-ctl ... import-yaml --yaml /path/to/directory.yaml --replace true
+s32p-ctl ... import-yaml --yaml /path/to/directory.yaml --replace true
 ```
 
 - openbao: `--replace` purges the directory subtrees under the configured prefix before import.
@@ -642,7 +632,7 @@ s3pm-ctl ... import-yaml --yaml /path/to/directory.yaml --replace true
 Export backend state to a directory YAML:
 
 ```bash
-s3pm-ctl ... export-yaml --yaml /path/to/directory.yaml
+s32p-ctl ... export-yaml --yaml /path/to/directory.yaml
 ```
 
 ## Building
@@ -655,23 +645,31 @@ cargo build
 
 ## Running (development)
 
+Due to the usage of [`io_uring`](https://developers.redhat.com/articles/2023/04/12/why-you-should-use-iouring-network-io), 
+you need RHEL 9.3, or another Linux distribution with a compatible kernel. 
+On RHEL, it is necessary to enable the `io_uring` kernel module:
+
+```bash
+sysctl -w kernel.io_uring_disabled=0
+```
+
 You can set the log level either via environment variable or in the config file:
 
 **Using environment variable (traditional):**
 ```bash
-RUST_LOG=s3_proxy_manager=debug,pingora=info,pingora_proxy=info cargo run --bin s3pm-proxy
+RUST_LOG=s32p_proxy=debug,pingora=info,pingora_proxy=info cargo run --bin s32p-proxy
 ```
 
 **Using config file (recommended):**
-The log level can be configured in `etc/s3-proxy-manager.yaml`:
+The log level can be configured in `etc/s32p-proxy.yaml`:
 ```yaml
 server:
-  log_level: "s3_proxy_manager=debug,s3pm_gateway=debug,pingora=info,pingora_proxy=info"
+  log_level: "s32p_proxy=debug,s32p_gateway=debug,pingora=info,pingora_proxy=info"
 ```
 
 The config file approach automatically forwards the log level to worker processes.
 
-The proxy binds to the address configured in `etc/s3-proxy-manager.yaml`, default:
+The proxy binds to the address configured in `etc/s32p-proxy.yaml`, default:
 
 ```
 http://localhost:9000
@@ -684,8 +682,8 @@ Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`) or a pe
 ## Testing with MinIO Client (`mcli`)
 
 ```bash
-mcli alias set S3PM http://localhost:9000 TESTACCESSKEY123 TESTSECRETKEY456
-mcli ls --debug S3PM
+mcli alias set S32P http://localhost:9000 TESTACCESSKEY123 TESTSECRETKEY456
+mcli ls --debug S32P
 ```
 
 Notes:
@@ -727,22 +725,22 @@ ACL notes:
 
 ## License
 
-TBD
+Apache 2.0
 
 ---
 
 ## Acknowledgements
 
 - Cloudflare Pingora
-- AWS SigV4 specification
-- MinIO client ecosystem
+- AWS SigV4 specification and S3 documentation
+- MinIO client ecosystem for testing
 - VersityGW
 
 ---
 
 ## Project Direction
 
-`s3-proxy-manager` is the **control plane**:
+`s32p-proxy` is the **control plane**:
 authentication/routing/worker lifecycle for per-access-key S3 access to a shared filesystem.
 
-VersityGW or `s3pm-gateway` are the storage-facing components and performs the authoritative SigV4 validation.
+VersityGW or `s32p-gateway` are the storage-facing components and performs the authoritative SigV4 validation.

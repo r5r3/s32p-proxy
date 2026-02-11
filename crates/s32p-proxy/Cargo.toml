@@ -1,0 +1,43 @@
+[package]
+name = "s32p-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mimalloc = "*"
+
+# Local crates
+s32p-directory = { path = "../s32p-directory" }
+s32p-support = { path = "../s32p-support" }
+
+# Pingora stack
+pingora = { version = "0.6.0", features = ["proxy", "rustls"] }
+rustls = { workspace = true }
+bytes = "1"
+
+# HTTP types
+http = "1"
+http-body-util = "0.1"
+
+# Time and parsing
+time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
+
+# Error handling, async traits
+anyhow = "1"
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# worker management
+dashmap = "6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "sync"] }
+libc = "0.2"
+tempfile = "3"
+
+# responses and config
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+quick-xml = { version = "0.39", features = ["serialize"] }
+url = "2"
