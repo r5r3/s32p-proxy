@@ -1,8 +1,8 @@
 # s32p: S3 to POSIX proxy and gateway
 
-`s32p-proxy` is a **Rust-based S3-compatible proxy + worker manager** built on **Cloudflare Pingora**.
+`s32p-proxy` is a **Rust-based S3-compatible proxy + gateway manager** built on **Cloudflare Pingora**.
 
-It accepts S3 client requests, maps S3 identities (SigV4 access keys) to **Unix users**, and routes traffic to **per-access-key worker processes** (currently: **VersityGW**) that expose a **shared POSIX filesystem** with kernel-enforced permissions.
+It accepts S3 client requests, maps S3 identities (SigV4 access keys) to **Unix users**, and routes traffic to **per-access-key worker processes** (currently: **VersityGW**, or experimental alternative **s32p-gateway**) that expose a **shared POSIX filesystem** with kernel-enforced permissions.
 
 A central design goal is to preserve Unix security semantics:
 
@@ -90,9 +90,7 @@ This repository is a Rust workspace with multiple crates:
 
 ## Current Status (February 2026)
 
-### Implemented
-
-#### Proxy / request flow
+### Proxy / request flow
 
 - **Pingora proxy-mode HTTP server**
   - Reverse proxies to locally spawned workers over loopback or Unix domain sockets (UDS)
@@ -118,11 +116,11 @@ This repository is a Rust workspace with multiple crates:
     - `not_implemented` (local S3 NotImplemented response, but only after SigV4 validation)
   - If a specific class key is not configured, the proxy falls back to the `other` route.
 
-#### Gateway (`s32p-gateway`)
+### Gateway (`s32p-gateway`)
 
 Experimental alternative to `versitygw`. Implements a growing subset of the S3 REST API directly on top of a POSIX filesystem.
 
-##### Implemented operations:
+#### Implemented operations:
 
 - **Read**
   - `GetObject`
@@ -144,7 +142,7 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
   - `CompleteMultipartUpload` (`POST ?uploadId=...`)
   - `AbortMultipartUpload` (`DELETE ?uploadId=...`)
 
-##### Notes / behavior:
+#### Notes / behavior:
 
 - Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
 - Rejects most query parameters for now, except those required for:
@@ -411,14 +409,14 @@ Example `/etc/s32p/directory.yaml`:
 version: 1
 
 users:
-  - access_key: "AKIA_ALICE_1"
+  - access_key: "alice_key_1"
     secret_key: "alice_secret"
     username: "alice"
     uid: 1001
     gid: 1001
 
   # Second access key mapping to the same unix user:
-  - access_key: "AKIA_ALICE_2"
+  - access_key: "alice_key_2"
     secret_key: "alice_secret_2"
     username: "alice"
     uid: 1001
@@ -429,9 +427,9 @@ buckets:
     name: "photos"
     data_path: "/srv/s3/alice/photos"
     acl:
-      - principal: { type: "access_key", access_key: "AKIA_ALICE_1" }
+      - principal: { type: "access_key", access_key: "alice_key_1" }
         access: "read_write"
-      - principal: { type: "access_key", access_key: "AKIA_ALICE_2" }
+      - principal: { type: "access_key", access_key: "alice_key_2" }
         access: "read_write"
 
   - id: "bkt-team"
@@ -440,7 +438,7 @@ buckets:
     acl:
       - principal: { type: "group_name", name: "s3-team" }
         access: "read_write"
-      - principal: { type: "access_key", access_key: "AKIA_ALICE_1" }
+      - principal: { type: "access_key", access_key: "alice_key_1" }
         access: "read_only"
 ```
 
@@ -547,7 +545,7 @@ Add a user:
 
 ```bash
 s32p-ctl ... user add \
-  --access-key AKIA_ALICE_1 \
+  --access-key alice_key_1 \
   --secret-key alice_secret \
   --username alice \
   --uid 1001 \
@@ -557,7 +555,7 @@ s32p-ctl ... user add \
 Remove a user (optionally scrubs their `access_key` from bucket ACLs):
 
 ```bash
-s32p-ctl ... user rm --access-key AKIA_ALICE_1 --cleanup-acls true
+s32p-ctl ... user rm --access-key alice_key_1 --cleanup-acls true
 ```
 
 List users:
@@ -580,7 +578,7 @@ Add a bucket:
 s32p-ctl ... bucket add \
   --name photos \
   --data-path /srv/s3/alice/photos \
-  --grant ak:AKIA_ALICE_1:read_write
+  --grant ak:alice_key_1:read_write
 ```
 
 `--grant` is repeatable and supports:
@@ -594,7 +592,7 @@ s32p-ctl ... bucket add \
   --bucket-id bkt-alice-photos \
   --name photos \
   --data-path /srv/s3/alice/photos \
-  --grant ak:AKIA_ALICE_1:read_write
+  --grant ak:alice_key_1:read_write
 ```
 
 Remove a bucket:
@@ -615,7 +613,7 @@ Replace a bucket ACL:
 s32p-ctl ... bucket acl-set \
   --bucket-id bkt-team \
   --grant group:s3-team:read_write \
-  --grant ak:AKIA_ALICE_1:read_only
+  --grant ak:alice_key_1:read_only
 ```
 
 ### Import / Export
@@ -735,12 +733,3 @@ Apache 2.0
 - AWS SigV4 specification and S3 documentation
 - MinIO client ecosystem for testing
 - VersityGW
-
----
-
-## Project Direction
-
-`s32p-proxy` is the **control plane**:
-authentication/routing/worker lifecycle for per-access-key S3 access to a shared filesystem.
-
-VersityGW or `s32p-gateway` are the storage-facing components and performs the authoritative SigV4 validation.
