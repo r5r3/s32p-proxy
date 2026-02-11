@@ -11,6 +11,13 @@ members = [
   "crates/s32p-gateway",
 ]
 
+[workspace.package]
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+authors = ["Robert Redl"]
+description = "S3 to POSIX proxy and gateway"
+
 [workspace.dependencies]
 rustls = { version = "0.23", features = ["aws_lc_rs", "read_buf"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
