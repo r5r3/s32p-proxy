@@ -2,6 +2,14 @@
 
 `s32p-proxy` is a **Rust-based S3-compatible proxy + gateway manager** built on **Cloudflare Pingora**.
 
+---
+
+⚠️ **EARLY DEVELOPMENT WARNING** ⚠️
+
+This project is in an **early development stage** and is **not ready for production use**. All aspects of the implementation may change significantly in future versions. Use only for testing and development purposes.
+
+---
+
 It accepts S3 client requests, maps S3 identities (SigV4 access keys) to **Unix users**, and routes traffic to **per-access-key worker processes** (currently: **VersityGW**, or experimental alternative **s32p-gateway**) that expose a **shared POSIX filesystem** with kernel-enforced permissions.
 
 A central design goal is to preserve Unix security semantics:
@@ -730,6 +738,6 @@ Apache 2.0
 ## Acknowledgements
 
 - Cloudflare Pingora
-- AWS SigV4 specification and S3 documentation
-- MinIO client ecosystem for testing
+- AWS SDK for Rust and S3 documentation
+- MinIO client for testing
 - VersityGW
