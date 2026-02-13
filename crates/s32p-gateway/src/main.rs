@@ -3,8 +3,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-mod buffer;
-mod streaming;
+pub mod buffer;
+pub mod streaming;
 mod uring_io;
 mod multipart;
 mod fs_helpers;
@@ -39,8 +39,8 @@ use crate::uring_io::UringIO;
 use crate::streaming::{
     copy_file_to_file,
     stream_range_body,
-    write_object_body,
     StreamCfg,
+    write_object_body,
     WriteObjectDest,
 };
 use crate::fs_helpers::{
@@ -56,6 +56,7 @@ use crate::fs_helpers::{
 };
 use s32p_support;
 use s32p_support::utils::{ByteRange, parse_range_header};
+use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, PreconditionOutcome};
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -692,6 +693,21 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
 
     // inode-based ETag
     let etag = format!("\"{}\"", meta.ino());
+
+    // are preconditions matched?
+    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+
+    match evaluate_read_preconditions(&cond, &etag, meta.modified().ok().unwrap_or_else(|| SystemTime::UNIX_EPOCH)) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => return s32p_support::s3resp::not_modified(Some(&etag), Some(&last_modified)),
+        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("GET/HEAD precondition failed", Some(req.uri().path()),),
+    }
 
     // Empty object: 200 + Content-Length: 0 (+ common headers)
     if size == 0 {
@@ -1496,6 +1512,34 @@ async fn handle_put_object(
         }
     };
 
+    // check preconditions
+    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+
+    // Determine existing object state (etag + last_modified) if present
+    let existing = match fs::metadata(&obj_path) {
+        Ok(m) => {
+            // reuse your existing etag computation logic; if it's inode-based, compute it here too.
+            let etag_existing = format!("{}", m.ino()); // adapt to your actual etag logic
+            let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((etag_existing, lm))
+        }
+        Err(_) => None,
+    };
+
+    let existing_ref = existing.as_ref().map(|(e, lm)| (e.as_str(), *lm));
+    match evaluate_write_preconditions(&cond, existing_ref) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => {} // not used for PUT
+        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("PUT precondition failed", Some(req.uri().path())),
+    }
+
+
     // Still require Content-Length at HTTP layer
     if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
         return s32p_support::s3resp::s3_error(
@@ -1629,6 +1673,44 @@ async fn handle_copy_object(
 
     if src_meta.is_dir() {
         return s32p_support::s3resp::no_such_key("not found", None);
+    }
+
+    // check preconditions for copy source
+    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+
+    // Source preconditions
+    let src_etag_unquoted = format!("{}", src_meta.ino()); // adapt to your etag logic
+    let src_last_modified = src_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    match evaluate_copy_source_preconditions(&cond, &src_etag_unquoted, src_last_modified) {
+        PreconditionOutcome::Proceed => {}
+        _ => return s32p_support::s3resp::precondition_failed("Copy source precondition failed", Some(req.uri().path())),
+    }
+
+    // Destination preconditions - check if destination already exists and evaluate write conditions
+    let dst_exists = match std::fs::metadata(&dst_path) {
+        Ok(m) => {
+            if m.is_dir() {
+                None // treat directories as non-existent for object operations
+            } else {
+                let etag_existing = format!("{}", m.ino());
+                let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((etag_existing, lm))
+            }
+        }
+        Err(_) => None,
+    };
+
+    let dst_exists_ref = dst_exists.as_ref().map(|(e, lm)| (e.as_str(), *lm));
+    match evaluate_write_preconditions(&cond, dst_exists_ref) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => {} // not used for copy
+        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("Copy destination precondition failed", Some(req.uri().path())),
     }
 
     let size = src_meta.len();
@@ -1936,6 +2018,50 @@ async fn handle_delete_object(
         Ok(p) => p,
         Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
     };
+
+    // check preconditions
+    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+
+    let existing = match fs::metadata(&obj_path) {
+        Ok(m) => {
+            let etag_existing = format!("{}", m.ino()); // adapt to your etag logic
+            let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((etag_existing, lm, m.len()))
+        }
+        Err(_) => None,
+    };
+
+    if let Some((etag_existing, lm, size)) = existing.as_ref() {
+        // Enforce If-Match / If-None-Match / If-(Un)Modified-Since like a “write”
+        let existing_ref = Some((etag_existing.as_str(), *lm));
+        if evaluate_write_preconditions(&cond, existing_ref) == PreconditionOutcome::PreconditionFailed {
+            return s32p_support::s3resp::precondition_failed("DELETE precondition failed", Some(req.uri().path()));
+        }
+
+        // Optional extra checks (x-amz-if-match-size / last-modified-time)
+        if let Some(want_size) = cond.amz_if_match_size {
+            if want_size != *size {
+                return s32p_support::s3resp::precondition_failed("x-amz-if-match-size mismatch", Some(req.uri().path()));
+            }
+        }
+        if let Some(want_lm) = cond.amz_if_match_last_modified_time {
+            if *lm != want_lm {
+                return s32p_support::s3resp::precondition_failed("x-amz-if-match-last-modified-time mismatch", Some(req.uri().path()));
+            }
+        }
+    } else {
+        // If object missing and caller supplied If-Match => fail (common behavior)
+        if cond.if_match.is_some() {
+            return s32p_support::s3resp::precondition_failed("DELETE If-Match but object does not exist", Some(req.uri().path()));
+        }
+    }
+
 
     // DeleteObject is idempotent: NotFound is still success.
     match std::fs::remove_file(&obj_path) {

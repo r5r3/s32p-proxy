@@ -31,6 +31,9 @@ pub mod uri_encoding;
 // Utility functions for string manipulation
 pub mod utils;
 
+/// Precondition evaluation functions for S3 operations
+pub mod preconditions;
+
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {
     pub access_key: String,

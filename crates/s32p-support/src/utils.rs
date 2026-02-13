@@ -1,6 +1,7 @@
 //! Utility functions for string manipulation and other common operations.
 
 use anyhow::{anyhow, Result};
+use std::time::SystemTime;
 
 /// A byte range for HTTP range requests.
 /// Represents a range [start, end_excl) where end_excl is exclusive.
@@ -35,7 +36,7 @@ impl ByteRange {
 /// # Examples
 /// ```
 /// use s32p_support::utils::trim_slashes;
-/// 
+///
 /// assert_eq!(trim_slashes("/hello/"), "hello");
 /// assert_eq!(trim_slashes("hello"), "hello");
 /// assert_eq!(trim_slashes("/hello"), "hello");
@@ -51,13 +52,105 @@ pub fn trim_slashes(s: &str) -> String {
 /// # Examples
 /// ```
 /// use s32p_support::utils::parse_u32;
-/// 
+///
 /// assert_eq!(parse_u32("42"), Some(42));
 /// assert_eq!(parse_u32("not_a_number"), None);
 /// assert_eq!(parse_u32("1234567890"), Some(1234567890));
 /// ```
 pub fn parse_u32(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
+}
+
+/// Parse a string into a u64, returning an error if parsing fails or the string is empty.
+pub fn parse_u64_strict(s: &str, what: &str) -> Result<u64> {
+    let v = s.trim();
+    if v.is_empty() {
+        return Err(anyhow!("empty {what}"));
+    }
+    v.parse::<u64>()
+        .map_err(|_| anyhow!("invalid {what}: {s:?}"))
+}
+
+/// Parse an HTTP date (IMF-fixdate, RFC 7231) into SystemTime.
+pub fn parse_http_date(s: &str) -> Result<SystemTime> {
+    httpdate::parse_http_date(s.trim())
+        .map_err(|_| anyhow!("invalid HTTP-date value: {s:?}"))
+}
+
+/// ETag condition parsed from If-Match / If-None-Match style headers.
+#[derive(Debug, Clone)]
+pub enum ETagCondition {
+    Any,                // "*"
+    OneOf(Vec<String>), // normalized, unquoted tags
+}
+
+impl ETagCondition {
+    pub fn matches(&self, current_etag_unquoted: &str) -> bool {
+        match self {
+            ETagCondition::Any => true,
+            ETagCondition::OneOf(list) => list.iter().any(|t| t == current_etag_unquoted),
+        }
+    }
+}
+
+/// Normalize a single ETag token: strip whitespace, optional weak prefix, optional quotes.
+/// Returns None if empty/unusable.
+pub fn normalize_etag_token(tok: &str) -> Option<String> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t == "*" {
+        return Some("*".to_string());
+    }
+
+    // allow weak: W/"abc" or W/abc
+    let t = t.strip_prefix("W/").unwrap_or(t).trim();
+
+    // strip surrounding quotes if present
+    let t = t.strip_prefix('"').unwrap_or(t);
+    let t = t.strip_suffix('"').unwrap_or(t);
+
+    let t = t.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Parse If-Match / If-None-Match value (comma-separated).
+/// Returns Err if header is present but contains no usable tokens.
+pub fn parse_etag_condition(value: &str) -> Result<ETagCondition> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("empty ETag precondition value"));
+    }
+
+    // Accept "*" (optionally quoted)
+    if raw == "*" || raw == "\"*\"" {
+        return Ok(ETagCondition::Any);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        if let Some(tok) = normalize_etag_token(part) {
+            if tok == "*" {
+                return Ok(ETagCondition::Any);
+            }
+            out.push(tok);
+        }
+    }
+
+    if out.is_empty() {
+        return Err(anyhow!(
+            "ETag precondition header present but contains no usable ETag tokens"
+        ));
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(ETagCondition::OneOf(out))
 }
 
 /// Parse an HTTP Range header according to RFC 7233.
@@ -75,13 +168,13 @@ pub fn parse_u32(s: &str) -> Option<u32> {
 /// # Examples
 /// ```
 /// use s32p_support::utils::{parse_range_header, ByteRange};
-/// 
+///
 /// let range = parse_range_header("bytes=0-99", 200).unwrap();
 /// assert_eq!(range, Some(ByteRange { start: 0, end_excl: 100 }));
-/// 
+///
 /// let range = parse_range_header("bytes=-50", 200).unwrap();
 /// assert_eq!(range, Some(ByteRange { start: 150, end_excl: 200 }));
-/// 
+///
 /// let range = parse_range_header("bytes=100-", 200).unwrap();
 /// assert_eq!(range, Some(ByteRange { start: 100, end_excl: 200 }));
 /// ```
@@ -107,7 +200,10 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
             return Err(anyhow!("bad Range suffix"));
         }
         let start = size.saturating_sub(suffix);
-        return Ok(Some(ByteRange { start, end_excl: size }));
+        return Ok(Some(ByteRange {
+            start,
+            end_excl: size,
+        }));
     }
 
     let start: u64 = a.parse().map_err(|_| anyhow!("bad Range start"))?;
@@ -131,7 +227,10 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
         return Err(anyhow!("Range end < start"));
     }
 
-    Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
+    Ok(Some(ByteRange {
+        start,
+        end_excl: end_incl + 1,
+    }))
 }
 
 #[cfg(test)]

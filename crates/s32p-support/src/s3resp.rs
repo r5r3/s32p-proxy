@@ -75,11 +75,48 @@ pub fn s3_error(
     response_bytes(status, "application/xml", body, headers)
 }
 
+/// Convenience: Not Modified (304).
+///
+/// Used for GET/HEAD when If-None-Match / If-Modified-Since indicate the cached value is still valid.
+/// We keep the body empty; optionally include ETag/Last-Modified so clients can keep metadata in sync.
+pub fn not_modified(etag: Option<&str>, last_modified: Option<&str>) -> HttpResponse {
+    let mut resp = Response::new(empty_body());
+    *resp.status_mut() = StatusCode::NOT_MODIFIED;
+
+    // Many clients are fine either way; setting 0 is safe and consistent.
+    resp.headers_mut()
+        .insert(CONTENT_LENGTH, "0".parse().unwrap());
+
+    if let Some(etag) = etag {
+        resp.headers_mut().insert(ETAG, etag.parse().unwrap());
+    }
+    if let Some(lm) = last_modified {
+        resp.headers_mut()
+            .insert(LAST_MODIFIED, lm.parse().unwrap());
+    }
+
+    resp.headers_mut()
+        .insert("server", "s32p-gateway".parse().unwrap());
+
+    resp
+}
+
 /// Convenience: NotImplemented (501).
 pub fn not_implemented(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::NOT_IMPLEMENTED,
         s3xml::error_code::NOT_IMPLEMENTED,
+        message,
+        resource,
+        None,
+    )
+}
+
+/// Convenience: InvalidRequest (400).
+pub fn invalid_request(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::BAD_REQUEST,
+        s3xml::error_code::INVALID_REQUEST,
         message,
         resource,
         None,
@@ -135,6 +172,17 @@ pub fn no_such_key(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
         StatusCode::NOT_FOUND,
         s3xml::error_code::NO_SUCH_KEY,
+        message,
+        resource,
+        None,
+    )
+}
+
+/// Convenience: PreconditionFailed (412).
+pub fn precondition_failed(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::PRECONDITION_FAILED,
+        s3xml::error_code::PRECONDITION_FAILED,
         message,
         resource,
         None,

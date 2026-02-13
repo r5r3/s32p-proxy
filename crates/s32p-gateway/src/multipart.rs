@@ -21,10 +21,11 @@ use crate::uring_io::UringIO;
 use crate::streaming::{
     copy_file_to_file,
     direct_io_ok_for_aligned_range,
-    write_object_body,
     StreamCfg,
+    write_object_body,
     WriteObjectDest,
 };
+use s32p_support::preconditions::{evaluate_write_preconditions, PreconditionOutcome};
 use crate::fs_helpers::{
     bucket_exists_dir,
     bucket_root_path,
@@ -36,6 +37,7 @@ use crate::fs_helpers::{
     OpenDirect,
     OpenMode
 };
+use s32p_support::classifier::parse_conditional_headers;
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -951,6 +953,9 @@ async fn handle_complete(
         return no_such_upload(Some(req.uri().path()));
     }
 
+    // Extract headers before moving req
+    let headers = req.headers().clone();
+    
     // Read and parse complete body
     let (parts, body) = req.into_parts();
     let collected = match body.collect().await {
@@ -1093,6 +1098,39 @@ async fn handle_complete(
         Ok(p) => p,
         Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(parts.uri.path())),
     };
+
+
+    // check preconditions
+    let cond = match parse_conditional_headers(&headers) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(parts.uri.path()));
+        }
+    };
+
+    // actual precondition check
+    let existing = match fs::metadata(&dst_path) {
+        Ok(m) => {
+            let etag_existing = format!("{}", m.ino()); // adapt to your etag logic
+            let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((etag_existing, lm))
+        }
+        Err(_) => None,
+    };
+
+    let existing_ref = existing.as_ref().map(|(e, lm)| (e.as_str(), *lm));
+    match evaluate_write_preconditions(&cond, existing_ref) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => {}
+        PreconditionOutcome::PreconditionFailed => {
+            return s32p_support::s3resp::precondition_failed(
+                "CompleteMultipartUpload precondition failed",
+                Some(parts.uri.path()),
+            );
+        }
+    }
+
 
     if let Some(parent) = dst_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {

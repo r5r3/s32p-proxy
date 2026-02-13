@@ -24,10 +24,11 @@ percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 quick-xml = { version = "0.39", features = ["serialize"] }
 
-# build ready-to-use http::Response bodies (works directly with hyper)
+# for http response bodyies and parsing
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
+httpdate = "1"
 
 # for file system helpers
 libc = "0.2"

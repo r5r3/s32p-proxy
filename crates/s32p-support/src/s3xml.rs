@@ -28,6 +28,9 @@ pub mod error_code {
 
     // Used for multipart uploads
     pub const NO_SUCH_UPLOAD: &str = "NoSuchUpload";
+
+    // for precondition checks
+    pub const PRECONDITION_FAILED: &str = "PreconditionFailed";
 }
 
 /// Minimal bucket info used by ListBuckets.
