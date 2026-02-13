@@ -685,14 +685,12 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
 
     // IMPORTANT: real mtime in RFC1123 / HTTP-date format (required by many S3 clients).
     // If metadata.modified() fails, fall back to UNIX_EPOCH (still a valid HTTP date).
-    let last_modified = meta
-        .modified()
-        .ok()
-        .map(fmt_http_date)
-        .unwrap_or_else(|| fmt_http_date(SystemTime::UNIX_EPOCH));
+    let lm_st = meta.modified().unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+    let last_modified = fmt_http_date(lm_st);
 
     // inode-based ETag
-    let etag = format!("\"{}\"", meta.ino());
+    let etag_unquoted = meta.ino().to_string();
+    let etag = format!("\"{}\"", etag_unquoted);
 
     // are preconditions matched?
     let cond = match parse_conditional_headers(req.headers()) {
@@ -703,7 +701,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
         }
     };
 
-    match evaluate_read_preconditions(&cond, &etag, meta.modified().ok().unwrap_or_else(|| SystemTime::UNIX_EPOCH)) {
+    match evaluate_read_preconditions(&cond, &etag_unquoted, lm_st) {
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {
             tracing::debug!("Read preconditions: NotModified (304) for {}", obj_path.display());
@@ -711,7 +709,10 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
         }
         PreconditionOutcome::PreconditionFailed => {
             tracing::debug!("Read preconditions failed (412) for {}", obj_path.display());
-            return s32p_support::s3resp::precondition_failed("GET/HEAD precondition failed", Some(req.uri().path()));
+            return s32p_support::s3resp::precondition_failed(
+                "GET/HEAD precondition failed",
+                Some(req.uri().path()),
+            );
         }
     }
 

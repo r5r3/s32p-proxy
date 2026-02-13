@@ -1,7 +1,7 @@
 //! Utility functions for string manipulation and other common operations.
 
 use anyhow::{anyhow, Result};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A byte range for HTTP range requests.
 /// Represents a range [start, end_excl) where end_excl is exclusive.
@@ -75,6 +75,16 @@ pub fn parse_u64_strict(s: &str, what: &str) -> Result<u64> {
 pub fn parse_http_date(s: &str) -> Result<SystemTime> {
     httpdate::parse_http_date(s.trim())
         .map_err(|_| anyhow!("invalid HTTP-date value: {s:?}"))
+}
+
+/// Parse x-amz-if-match-last-modified-time value.
+/// Tries to parse as epoch timestamp first, falls back to HTTP-date.
+pub fn parse_amz_last_modified_match(v: &str) -> Result<SystemTime> {
+    let s = v.trim();
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(UNIX_EPOCH + Duration::from_secs(secs));
+    }
+    parse_http_date(s)
 }
 
 /// ETag condition parsed from If-Match / If-None-Match style headers.

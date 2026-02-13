@@ -1,6 +1,13 @@
 use anyhow::{anyhow, Result};
 use http::HeaderMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn trunc_to_seconds(t: SystemTime) -> SystemTime {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => UNIX_EPOCH + Duration::from_secs(d.as_secs()),
+        Err(_) => t,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ConditionalHeaders {
@@ -110,7 +117,7 @@ pub fn parse_conditional_headers(headers: &HeaderMap) -> Result<ConditionalHeade
 
     // We treat this as HTTP-date for consistency & usefulness.
     let amz_if_match_last_modified_time = match header_to_str(headers, &h_if_match_lmt)? {
-        Some(v) => Some(crate::utils::parse_http_date(v)?),
+        Some(v) => Some(crate::utils::parse_amz_last_modified_match(v)?),
         None => None,
     };
 
@@ -136,6 +143,8 @@ pub fn evaluate_read_preconditions(
     last_modified: SystemTime,
 ) -> PreconditionOutcome {
     // Order loosely follows RFC 7232 precedence: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.
+    
+    let last_modified = trunc_to_seconds(last_modified);
 
     if let Some(ifm) = &cond.if_match {
         if !ifm.matches(current_etag_unquoted) {
@@ -144,6 +153,7 @@ pub fn evaluate_read_preconditions(
     }
 
     if let Some(ius) = cond.if_unmodified_since {
+        let ius = trunc_to_seconds(ius);
         // If resource has been modified after ius => fail
         if last_modified > ius {
             return PreconditionOutcome::PreconditionFailed;
@@ -157,6 +167,7 @@ pub fn evaluate_read_preconditions(
     }
 
     if let Some(ims) = cond.if_modified_since {
+        let ims = trunc_to_seconds(ims);
         // If not modified since ims => not modified
         if last_modified <= ims {
             return PreconditionOutcome::NotModified;
@@ -193,7 +204,9 @@ pub fn evaluate_write_preconditions(
     }
 
     if let Some(ius) = cond.if_unmodified_since {
+        let ius = trunc_to_seconds(ius);
         if let Some((_etag, lm)) = existing {
+            let lm = trunc_to_seconds(lm);
             if lm > ius {
                 return PreconditionOutcome::PreconditionFailed;
             }
@@ -201,7 +214,9 @@ pub fn evaluate_write_preconditions(
     }
 
     if let Some(ims) = cond.if_modified_since {
+        let ims = trunc_to_seconds(ims);
         if let Some((_etag, lm)) = existing {
+            let lm = trunc_to_seconds(lm);
             if lm <= ims {
                 return PreconditionOutcome::PreconditionFailed;
             }
@@ -220,6 +235,8 @@ pub fn evaluate_copy_source_preconditions(
     current_etag_unquoted: &str,
     last_modified: SystemTime,
 ) -> PreconditionOutcome {
+    let last_modified = trunc_to_seconds(last_modified);
+
     if let Some(ifm) = &cond.copy_source_if_match {
         if !ifm.matches(current_etag_unquoted) {
             return PreconditionOutcome::PreconditionFailed;
@@ -227,6 +244,7 @@ pub fn evaluate_copy_source_preconditions(
     }
 
     if let Some(ius) = cond.copy_source_if_unmodified_since {
+        let ius = trunc_to_seconds(ius);
         if last_modified > ius {
             return PreconditionOutcome::PreconditionFailed;
         }
@@ -239,6 +257,7 @@ pub fn evaluate_copy_source_preconditions(
     }
 
     if let Some(ims) = cond.copy_source_if_modified_since {
+        let ims = trunc_to_seconds(ims);
         if last_modified <= ims {
             return PreconditionOutcome::PreconditionFailed;
         }
