@@ -37,7 +37,7 @@ use crate::fs_helpers::{
     OpenDirect,
     OpenMode
 };
-use s32p_support::classifier::parse_conditional_headers;
+use s32p_support::preconditions::parse_conditional_headers;
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -1124,9 +1124,10 @@ async fn handle_complete(
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {}
         PreconditionOutcome::PreconditionFailed => {
+            tracing::debug!("Write preconditions failed (412) for CompleteMultipartUpload on {}", dst_path.display());
             return s32p_support::s3resp::precondition_failed(
                 "CompleteMultipartUpload precondition failed",
-                Some(parts.uri.path()),
+                Some(parts.uri.path())
             );
         }
     }

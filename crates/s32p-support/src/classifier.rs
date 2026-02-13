@@ -1,11 +1,7 @@
-use anyhow::{anyhow, Result};
-use http::{header::HeaderName, HeaderMap, Uri};
+use http::{HeaderMap, Uri};
 use std::collections::HashMap;
-use std::time::SystemTime;
 
-use super::utils::{
-    parse_etag_condition, parse_http_date, parse_u32, parse_u64_strict, ETagCondition,
-};
+use super::utils::{parse_u32};
 
 /// High-level classification for S3 REST requests.
 /// Shared by proxy and gateway to avoid duplicated request parsing logic.
@@ -139,124 +135,10 @@ pub enum BucketAdminOp {
     DeleteBucket,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ConditionalHeaders {
-    pub if_match: Option<ETagCondition>,
-    pub if_none_match: Option<ETagCondition>,
-    pub if_modified_since: Option<SystemTime>,
-    pub if_unmodified_since: Option<SystemTime>,
 
-    // CopyObject source preconditions
-    pub copy_source_if_match: Option<ETagCondition>,
-    pub copy_source_if_none_match: Option<ETagCondition>,
-    pub copy_source_if_modified_since: Option<SystemTime>,
-    pub copy_source_if_unmodified_since: Option<SystemTime>,
-
-    // DeleteObject “directory bucket” extras (safe to parse even if you don’t enforce everywhere)
-    pub amz_if_match_size: Option<u64>,
-    pub amz_if_match_last_modified_time: Option<SystemTime>,
-}
 
 /// Parse/validate conditional headers.
-///
-/// “useful” checks:
-/// - Empty values are rejected
-/// - ETag headers must contain "*" or at least one token
-/// - Date headers must parse as HTTP-date
-pub fn parse_conditional_headers(headers: &HeaderMap) -> Result<ConditionalHeaders> {
-    fn header_to_str<'a>(headers: &'a HeaderMap, name: &http::header::HeaderName) -> Result<Option<&'a str>> {
-        match headers.get(name) {
-            None => Ok(None),
-            Some(v) => {
-                let s = v
-                    .to_str()
-                    .map_err(|_| anyhow!("header {} is not valid ASCII", name))?;
-                let s = s.trim();
-                if s.is_empty() {
-                    return Err(anyhow!("empty header value for {}", name));
-                }
-                Ok(Some(s))
-            }
-        }
-    }
 
-    // Standard If-* headers
-    let if_match = match header_to_str(headers, &http::header::IF_MATCH)? {
-        Some(v) => Some(parse_etag_condition(v)?),
-        None => None,
-    };
-
-    let if_none_match = match header_to_str(headers, &http::header::IF_NONE_MATCH)? {
-        Some(v) => Some(parse_etag_condition(v)?),
-        None => None,
-    };
-
-    let if_modified_since = match header_to_str(headers, &http::header::IF_MODIFIED_SINCE)? {
-        Some(v) => Some(parse_http_date(v)?),
-        None => None,
-    };
-
-    let if_unmodified_since = match header_to_str(headers, &http::header::IF_UNMODIFIED_SINCE)? {
-        Some(v) => Some(parse_http_date(v)?),
-        None => None,
-    };
-
-    // CopyObject source conditionals
-    let h_copy_if_match: HeaderName = HeaderName::from_static("x-amz-copy-source-if-match");
-    let h_copy_if_none_match: HeaderName = HeaderName::from_static("x-amz-copy-source-if-none-match");
-    let h_copy_if_modified_since: HeaderName =
-        HeaderName::from_static("x-amz-copy-source-if-modified-since");
-    let h_copy_if_unmodified_since: HeaderName =
-        HeaderName::from_static("x-amz-copy-source-if-unmodified-since");
-
-    let copy_source_if_match = match header_to_str(headers, &h_copy_if_match)? {
-        Some(v) => Some(parse_etag_condition(v)?),
-        None => None,
-    };
-
-    let copy_source_if_none_match = match header_to_str(headers, &h_copy_if_none_match)? {
-        Some(v) => Some(parse_etag_condition(v)?),
-        None => None,
-    };
-
-    let copy_source_if_modified_since = match header_to_str(headers, &h_copy_if_modified_since)? {
-        Some(v) => Some(parse_http_date(v)?),
-        None => None,
-    };
-
-    let copy_source_if_unmodified_since = match header_to_str(headers, &h_copy_if_unmodified_since)? {
-        Some(v) => Some(parse_http_date(v)?),
-        None => None,
-    };
-
-    // DeleteObject extras
-    let h_if_match_size: HeaderName = HeaderName::from_static("x-amz-if-match-size");
-    let h_if_match_lmt: HeaderName = HeaderName::from_static("x-amz-if-match-last-modified-time");
-
-    let amz_if_match_size = match header_to_str(headers, &h_if_match_size)? {
-        Some(v) => Some(parse_u64_strict(v, "x-amz-if-match-size")?),
-        None => None,
-    };
-
-    // We treat this as HTTP-date for consistency & usefulness.
-    let amz_if_match_last_modified_time = match header_to_str(headers, &h_if_match_lmt)? {
-        Some(v) => Some(parse_http_date(v)?),
-        None => None,
-    };
-
-    Ok(ConditionalHeaders {
-        if_match,
-        if_none_match,
-        if_modified_since,
-        if_unmodified_since,
-        copy_source_if_match,
-        copy_source_if_none_match,
-        copy_source_if_modified_since,
-        copy_source_if_unmodified_since,
-        amz_if_match_size,
-        amz_if_match_last_modified_time,
-    })
-}
 
 
 /// Parsed query params with lowercased keys.

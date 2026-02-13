@@ -56,7 +56,7 @@ use crate::fs_helpers::{
 };
 use s32p_support;
 use s32p_support::utils::{ByteRange, parse_range_header};
-use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, PreconditionOutcome};
+use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, parse_conditional_headers, PreconditionOutcome};
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -695,7 +695,7 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
     let etag = format!("\"{}\"", meta.ino());
 
     // are preconditions matched?
-    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+    let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid conditional headers: {e}");
@@ -705,8 +705,14 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
 
     match evaluate_read_preconditions(&cond, &etag, meta.modified().ok().unwrap_or_else(|| SystemTime::UNIX_EPOCH)) {
         PreconditionOutcome::Proceed => {}
-        PreconditionOutcome::NotModified => return s32p_support::s3resp::not_modified(Some(&etag), Some(&last_modified)),
-        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("GET/HEAD precondition failed", Some(req.uri().path()),),
+        PreconditionOutcome::NotModified => {
+            tracing::debug!("Read preconditions: NotModified (304) for {}", obj_path.display());
+            return s32p_support::s3resp::not_modified(Some(&etag), Some(&last_modified));
+        }
+        PreconditionOutcome::PreconditionFailed => {
+            tracing::debug!("Read preconditions failed (412) for {}", obj_path.display());
+            return s32p_support::s3resp::precondition_failed("GET/HEAD precondition failed", Some(req.uri().path()));
+        }
     }
 
     // Empty object: 200 + Content-Length: 0 (+ common headers)
@@ -1513,7 +1519,7 @@ async fn handle_put_object(
     };
 
     // check preconditions
-    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+    let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid conditional headers: {e}");
@@ -1536,7 +1542,10 @@ async fn handle_put_object(
     match evaluate_write_preconditions(&cond, existing_ref) {
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {} // not used for PUT
-        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("PUT precondition failed", Some(req.uri().path())),
+        PreconditionOutcome::PreconditionFailed => {
+            tracing::debug!("Write preconditions failed (412) for PUT operation on {}", obj_path.display());
+            return s32p_support::s3resp::precondition_failed("PUT precondition failed", Some(req.uri().path()));
+        }
     }
 
 
@@ -1676,7 +1685,7 @@ async fn handle_copy_object(
     }
 
     // check preconditions for copy source
-    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+    let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid conditional headers: {e}");
@@ -1689,7 +1698,10 @@ async fn handle_copy_object(
     let src_last_modified = src_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     match evaluate_copy_source_preconditions(&cond, &src_etag_unquoted, src_last_modified) {
         PreconditionOutcome::Proceed => {}
-        _ => return s32p_support::s3resp::precondition_failed("Copy source precondition failed", Some(req.uri().path())),
+        _ => {
+            tracing::debug!("Copy source preconditions failed (412) for source {}", src_path.display());
+            return s32p_support::s3resp::precondition_failed("Copy source precondition failed", Some(req.uri().path()));
+        }
     }
 
     // Destination preconditions - check if destination already exists and evaluate write conditions
@@ -1710,7 +1722,10 @@ async fn handle_copy_object(
     match evaluate_write_preconditions(&cond, dst_exists_ref) {
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {} // not used for copy
-        PreconditionOutcome::PreconditionFailed => return s32p_support::s3resp::precondition_failed("Copy destination precondition failed", Some(req.uri().path())),
+        PreconditionOutcome::PreconditionFailed => {
+            tracing::debug!("Copy destination preconditions failed (412) for destination {}", dst_path.display());
+            return s32p_support::s3resp::precondition_failed("Copy destination precondition failed", Some(req.uri().path()));
+        }
     }
 
     let size = src_meta.len();
@@ -2020,7 +2035,7 @@ async fn handle_delete_object(
     };
 
     // check preconditions
-    let cond = match s32p_support::classifier::parse_conditional_headers(req.headers()) {
+    let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid conditional headers: {e}");
@@ -2041,23 +2056,27 @@ async fn handle_delete_object(
         // Enforce If-Match / If-None-Match / If-(Un)Modified-Since like a “write”
         let existing_ref = Some((etag_existing.as_str(), *lm));
         if evaluate_write_preconditions(&cond, existing_ref) == PreconditionOutcome::PreconditionFailed {
+            tracing::debug!("Write preconditions failed (412) for DELETE operation on {}", obj_path.display());
             return s32p_support::s3resp::precondition_failed("DELETE precondition failed", Some(req.uri().path()));
         }
 
         // Optional extra checks (x-amz-if-match-size / last-modified-time)
         if let Some(want_size) = cond.amz_if_match_size {
             if want_size != *size {
+                tracing::debug!("DELETE x-amz-if-match-size mismatch for {} (want: {}, got: {})", obj_path.display(), want_size, size);
                 return s32p_support::s3resp::precondition_failed("x-amz-if-match-size mismatch", Some(req.uri().path()));
             }
         }
         if let Some(want_lm) = cond.amz_if_match_last_modified_time {
             if *lm != want_lm {
+                tracing::debug!("DELETE x-amz-if-match-last-modified-time mismatch for {}", obj_path.display());
                 return s32p_support::s3resp::precondition_failed("x-amz-if-match-last-modified-time mismatch", Some(req.uri().path()));
             }
         }
     } else {
         // If object missing and caller supplied If-Match => fail (common behavior)
         if cond.if_match.is_some() {
+            tracing::debug!("DELETE If-Match precondition failed - object does not exist: {}", obj_path.display());
             return s32p_support::s3resp::precondition_failed("DELETE If-Match but object does not exist", Some(req.uri().path()));
         }
     }
