@@ -3,54 +3,47 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+use std::{fs, sync::Arc, time::Instant};
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use pingora::{
+    Error, ErrorType, Result as PResult,
+    http::{RequestHeader, ResponseHeader, StatusCode},
+    listeners::tls::TlsSettings,
+    proxy::{ProxyHttp, Session, http_proxy_service},
+    server::Server,
+    upstreams::peer::{HttpPeer, PeerOptions},
+};
+use rustls::crypto::{CryptoProvider, aws_lc_rs};
 
-use pingora::http::{RequestHeader, ResponseHeader, StatusCode};
-use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
-use pingora::{Error, ErrorType, Result as PResult};
-use pingora::server::Server;
-use pingora::upstreams::peer::{HttpPeer, PeerOptions};
-use pingora::listeners::tls::TlsSettings;
-use rustls::crypto::{aws_lc_rs, CryptoProvider};
-
-use std::sync::Arc;
-use std::time::Instant;
-use std::fs;
-
+mod config;
 mod responses;
 mod worker_manager;
-mod config;
 
-use s32p_directory::Directory;
-use s32p_directory::UserDoc;
-use s32p_directory::yaml::YamlDirectory;
-use s32p_directory::openbao::OpenBaoDirectory;
-
+use s32p_directory::{Directory, UserDoc, openbao::OpenBaoDirectory, yaml::YamlDirectory};
 use s32p_support;
-
-use worker_manager::{WorkerHandle, WorkerManager, WorkerEndpoint};
-
+use worker_manager::{WorkerEndpoint, WorkerHandle, WorkerManager};
 
 struct S3ProxyApp {
-    directory: Arc<dyn Directory>,
-    workers: Arc<WorkerManager>,
-    routing: config::RoutingConfig,
+    directory:               Arc<dyn Directory>,
+    workers:                 Arc<WorkerManager>,
+    routing:                 config::RoutingConfig,
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
 }
 
 #[derive(Clone, Default)]
 struct ProxyCtx {
-    uid: Option<u32>,
-    username: Option<String>,
+    uid:            Option<u32>,
+    username:       Option<String>,
     // Preserve original host EXACTLY (important for SigV4 verification in worker)
-    orig_host: Option<String>,
+    orig_host:      Option<String>,
     // Selected worker profile (used as part of worker key)
     worker_profile: Option<String>,
     // Selected upstream (per-user worker)
-    upstream: Option<WorkerEndpoint>,
+    upstream:       Option<WorkerEndpoint>,
     // Optional handle (for touch/logging)
-    worker: Option<Arc<WorkerHandle>>,
+    worker:         Option<Arc<WorkerHandle>>,
 }
 
 impl ProxyCtx {
@@ -81,10 +74,10 @@ impl ProxyHttp for S3ProxyApp {
         // This logic is shared with the gateway now (in s32p-support),
         // so routing decisions won't drift.
         let class = s32p_support::classifier::classify_with_headers(
-            req.method.as_str(), 
-            &req.uri, 
+            req.method.as_str(),
+            &req.uri,
             Some(&req.headers),
-            &self.virtual_hosted_suffixes
+            &self.virtual_hosted_suffixes,
         );
         let key = s32p_support::classifier::class_key(&class);
 
@@ -105,23 +98,26 @@ impl ProxyHttp for S3ProxyApp {
                 None => {
                     return Err(Error::explain(
                         ErrorType::InternalError,
-                        format!("no routing configured for class '{key}' and no fallback 'other' route"),
+                        format!(
+                            "no routing configured for class '{key}' and no fallback 'other' route"
+                        ),
                     ));
                 }
             },
         };
 
-        tracing::debug!(?class, class_key = key, ?action, "classified request and selected route action");
+        tracing::debug!(
+            ?class,
+            class_key = key,
+            ?action,
+            "classified request and selected route action"
+        );
 
         let method = req.method.as_str();
         let path = req.uri.path();
         let query = req.uri.query().unwrap_or("");
 
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let host = req.headers.get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
         ctx.orig_host = host.clone();
 
@@ -134,7 +130,8 @@ impl ProxyHttp for S3ProxyApp {
         );
 
         // 1) Extract access key cheaply (no SigV4 check yet)
-        let access_key = match s32p_support::extract_access_key_from_request(&req.uri, &req.headers) {
+        let access_key = match s32p_support::extract_access_key_from_request(&req.uri, &req.headers)
+        {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to extract access key");
@@ -165,7 +162,8 @@ impl ProxyHttp for S3ProxyApp {
                     "unknown access key",
                     Some(req.uri.path()),
                     None,
-                ).await?;
+                )
+                .await?;
                 return Ok(true);
             }
         };
@@ -178,7 +176,8 @@ impl ProxyHttp for S3ProxyApp {
                 return Ok(true); // already responded with auth/signature error
             }
 
-            responses::respond_not_implemented(session, message, Some(req.uri.path()), None).await?;
+            responses::respond_not_implemented(session, message, Some(req.uri.path()), None)
+                .await?;
             return Ok(true);
         }
 
@@ -212,8 +211,9 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 5) Start worker on demand (profile-specific)
-        let buckets = self.directory.buckets_for_access_key(&access_key).await
-            .map_err(|e| Error::explain(ErrorType::InternalError, format!("directory buckets error: {e:#}")))?;
+        let buckets = self.directory.buckets_for_access_key(&access_key).await.map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("directory buckets error: {e:#}"))
+        })?;
 
         // Start worker with staged root
         let h = match self.workers.ensure_running(&user, &buckets, profile).await {
@@ -262,9 +262,10 @@ impl ProxyHttp for S3ProxyApp {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> PResult<Box<HttpPeer>> {
-        let ep = ctx.upstream.clone().ok_or_else(|| {
-            Error::explain(ErrorType::InternalError, "no upstream selected")
-        })?;
+        let ep = ctx
+            .upstream
+            .clone()
+            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no upstream selected"))?;
 
         let peer = match ep {
             WorkerEndpoint::Tcp(addr) => {
@@ -278,8 +279,14 @@ impl ProxyHttp for S3ProxyApp {
             }
             WorkerEndpoint::Uds(path) => {
                 // HttpPeer::new_uds returns Result<...> so map it into Pingora's error type.
-                let peer = HttpPeer::new_uds(path.to_string_lossy().as_ref(), false, "localhost".to_string())
-                    .map_err(|e| Error::explain(ErrorType::InternalError, format!("new_uds failed: {e}")))?;
+                let peer = HttpPeer::new_uds(
+                    path.to_string_lossy().as_ref(),
+                    false,
+                    "localhost".to_string(),
+                )
+                .map_err(|e| {
+                    Error::explain(ErrorType::InternalError, format!("new_uds failed: {e}"))
+                })?;
 
                 // TCP-only socket options don't apply to UDS; leave options default.
                 peer
@@ -335,11 +342,13 @@ impl ProxyHttp for S3ProxyApp {
         Ok(())
     }
 
-    async fn logging(&self, session: &mut Session, e: Option<&pingora::Error>, ctx: &mut Self::CTX) {
-        let status = session
-            .response_written()
-            .map(|r| r.status.as_u16())
-            .unwrap_or(0);
+    async fn logging(
+        &self,
+        session: &mut Session,
+        e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
 
         if let Some(err) = e {
             tracing::warn!(
@@ -410,10 +419,10 @@ fn rustls_prefer_fast_cipher() -> Result<()> {
         //TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     ];
 
-    CryptoProvider::install_default(provider).expect("Failed to install aws-lc-rs as default TLS provider");
+    CryptoProvider::install_default(provider)
+        .expect("Failed to install aws-lc-rs as default TLS provider");
     Ok(())
 }
-
 
 fn main() -> Result<()> {
     // ensure, that aws-lc-rs is our crypto provider
@@ -430,9 +439,7 @@ fn main() -> Result<()> {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     // Build directory backend
     let directory: Arc<dyn Directory> = match cfg.auth.backend {
@@ -484,7 +491,8 @@ fn main() -> Result<()> {
         let mut tls_settings = TlsSettings::intermediate(
             cfg.server.tls_cert_path.as_ref().unwrap(),
             cfg.server.tls_key_path.as_ref().unwrap(),
-        ).context("failed to load TLS settings (check certificate/key paths and format)")?;
+        )
+        .context("failed to load TLS settings (check certificate/key paths and format)")?;
         tls_settings.enable_h2();
         proxy.add_tls_with_settings(&cfg.server.listen, None, tls_settings);
         tracing::info!("TLS enabled, listening on {}", listen);

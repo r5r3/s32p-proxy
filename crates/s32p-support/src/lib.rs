@@ -1,19 +1,22 @@
-use anyhow::{anyhow, Result};
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{
-    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
-    SigningSettings, UriPathNormalizationMode,
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use aws_sigv4::sign::v4;
+
+use anyhow::{Result, anyhow};
+use aws_credential_types::Credentials;
+use aws_sigv4::{
+    http_request::{
+        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
+        SigningSettings, UriPathNormalizationMode,
+    },
+    sign::v4,
+};
 use aws_smithy_runtime_api::client::identity::Identity;
 use constant_time_eq::constant_time_eq;
 use http::{HeaderMap, Uri};
+use time::{OffsetDateTime, PrimitiveDateTime, macros::format_description};
 use url::form_urlencoded;
-
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use time::{macros::format_description, OffsetDateTime, PrimitiveDateTime};
 
 /// Shared S3 request classification (used by proxy and gateway).
 pub mod classifier;
@@ -36,24 +39,24 @@ pub mod preconditions;
 
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {
-    pub access_key: String,
-    pub scope_date: String, // YYYYMMDD from Credential scope
-    pub region: String,
-    pub service: String,
+    pub access_key:     String,
+    pub scope_date:     String, // YYYYMMDD from Credential scope
+    pub region:         String,
+    pub service:        String,
     pub signed_headers: String, // "host;x-amz-content-sha256;x-amz-date"
-    pub signature: String,      // hex
+    pub signature:      String, // hex
 }
 
 #[derive(Debug, Clone)]
 pub struct PresignedSigV4Auth {
-    pub access_key: String,
-    pub scope_date: String, // YYYYMMDD from Credential scope
-    pub region: String,
-    pub service: String,
+    pub access_key:     String,
+    pub scope_date:     String, // YYYYMMDD from Credential scope
+    pub region:         String,
+    pub service:        String,
     pub signed_headers: String, // "host;..."
-    pub signature: String,      // hex
-    pub amz_date: String,       // original X-Amz-Date (for error messages)
-    pub expires: u64,           // seconds
+    pub signature:      String, // hex
+    pub amz_date:       String, // original X-Amz-Date (for error messages)
+    pub expires:        u64,    // seconds
     pub security_token: Option<String>,
 }
 
@@ -80,7 +83,7 @@ pub fn verify_sigv4_request_any(
                 return Err(crate::s3resp::access_denied(
                     &format!("bad Authorization: {e}"),
                     resource,
-                ))
+                ));
             }
         };
 
@@ -90,9 +93,7 @@ pub fn verify_sigv4_request_any(
             }
         }
 
-        if let Err(e) =
-            verify_sigv4_header_only(method, uri, headers, &auth, secret_key)
-        {
+        if let Err(e) = verify_sigv4_header_only(method, uri, headers, &auth, secret_key) {
             return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
         }
 
@@ -106,13 +107,10 @@ pub fn verify_sigv4_request_any(
             return Err(crate::s3resp::access_denied(
                 "missing Authorization and missing presign params",
                 resource,
-            ))
+            ));
         }
         Err(e) => {
-            return Err(crate::s3resp::access_denied(
-                &format!("bad presign params: {e}"),
-                resource,
-            ))
+            return Err(crate::s3resp::access_denied(&format!("bad presign params: {e}"), resource));
         }
     };
 
@@ -122,15 +120,12 @@ pub fn verify_sigv4_request_any(
         }
     }
 
-    if let Err(e) =
-        verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key)
-    {
+    if let Err(e) = verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key) {
         return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
     }
 
     Ok(())
 }
-
 
 /// Parse SigV4 presign params from the URI query string.
 /// Returns `Ok(None)` if the request is not using presigned URLs.
@@ -185,22 +180,10 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
 
     // Credential = access_key/YYYYMMDD/region/service/aws4_request
     let mut it = credential.split('/');
-    let access_key = it
-        .next()
-        .ok_or_else(|| anyhow!("bad X-Amz-Credential"))?
-        .to_string();
-    let scope_date = it
-        .next()
-        .ok_or_else(|| anyhow!("bad X-Amz-Credential date"))?
-        .to_string();
-    let region = it
-        .next()
-        .ok_or_else(|| anyhow!("bad X-Amz-Credential region"))?
-        .to_string();
-    let service = it
-        .next()
-        .ok_or_else(|| anyhow!("bad X-Amz-Credential service"))?
-        .to_string();
+    let access_key = it.next().ok_or_else(|| anyhow!("bad X-Amz-Credential"))?.to_string();
+    let scope_date = it.next().ok_or_else(|| anyhow!("bad X-Amz-Credential date"))?.to_string();
+    let region = it.next().ok_or_else(|| anyhow!("bad X-Amz-Credential region"))?.to_string();
+    let service = it.next().ok_or_else(|| anyhow!("bad X-Amz-Credential service"))?.to_string();
 
     Ok(Some(PresignedSigV4Auth {
         access_key,
@@ -243,11 +226,7 @@ pub fn verify_sigv4_presigned_url(
 
     // date in credential scope must match x-amz-date date
     if date_str != auth.scope_date {
-        return Err(anyhow!(
-            "date mismatch: scope={} x-amz-date={}",
-            auth.scope_date,
-            date_str
-        ));
+        return Err(anyhow!("date mismatch: scope={} x-amz-date={}", auth.scope_date, date_str));
     }
 
     // 2) Basic expiry check (reject if already expired)
@@ -385,9 +364,7 @@ pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
         .map_err(|_| anyhow!("bad Authorization"))?;
 
     // AWS4-HMAC-SHA256 Credential=... SignedHeaders=... Signature=...
-    let (algo, rest) = auth
-        .split_once(' ')
-        .ok_or_else(|| anyhow!("bad Authorization format"))?;
+    let (algo, rest) = auth.split_once(' ').ok_or_else(|| anyhow!("bad Authorization format"))?;
     if algo.trim() != "AWS4-HMAC-SHA256" {
         return Err(anyhow!("unsupported auth algo: {algo}"));
     }
@@ -415,27 +392,11 @@ pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
     // Credential = access_key/YYYYMMDD/region/service/aws4_request
     let mut it = credential.split('/');
     let access_key = it.next().ok_or_else(|| anyhow!("bad Credential"))?.to_string();
-    let scope_date = it
-        .next()
-        .ok_or_else(|| anyhow!("bad Credential date"))?
-        .to_string();
-    let region = it
-        .next()
-        .ok_or_else(|| anyhow!("bad Credential region"))?
-        .to_string();
-    let service = it
-        .next()
-        .ok_or_else(|| anyhow!("bad Credential service"))?
-        .to_string();
+    let scope_date = it.next().ok_or_else(|| anyhow!("bad Credential date"))?.to_string();
+    let region = it.next().ok_or_else(|| anyhow!("bad Credential region"))?.to_string();
+    let service = it.next().ok_or_else(|| anyhow!("bad Credential service"))?.to_string();
 
-    Ok(SigV4Auth {
-        access_key,
-        scope_date,
-        region,
-        service,
-        signed_headers,
-        signature,
-    })
+    Ok(SigV4Auth { access_key, scope_date, region, service, signed_headers, signature })
 }
 
 /// Cheap routing helper: extract only the access key from Authorization header.
@@ -454,16 +415,11 @@ pub fn extract_access_key(headers: &HeaderMap) -> Result<String> {
     let after = &auth[cred_pos + "Credential=".len()..];
 
     // Credential value ends at ',' or whitespace
-    let end = after
-        .find(|c: char| c == ',' || c.is_whitespace())
-        .unwrap_or(after.len());
+    let end = after.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(after.len());
     let cred_val = &after[..end];
 
     // Access key is the first segment before '/'
-    let access_key = cred_val
-        .split('/')
-        .next()
-        .ok_or_else(|| anyhow!("bad Credential value"))?;
+    let access_key = cred_val.split('/').next().ok_or_else(|| anyhow!("bad Credential value"))?;
 
     if access_key.is_empty() {
         return Err(anyhow!("empty access key in Credential"));
@@ -493,11 +449,7 @@ pub fn verify_sigv4_header_only(
 
     // date in credential scope must match x-amz-date date
     if date_str != auth.scope_date {
-        return Err(anyhow!(
-            "date mismatch: scope={} x-amz-date={}",
-            auth.scope_date,
-            date_str
-        ));
+        return Err(anyhow!("date mismatch: scope={} x-amz-date={}", auth.scope_date, date_str));
     }
 
     // 2) Determine payload hash mode from x-amz-content-sha256
@@ -519,10 +471,7 @@ pub fn verify_sigv4_header_only(
     };
 
     // 3) Build URI for signing, only path and query are used.
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     // 4) Build header map lowercased
     let mut header_map: HashMap<String, String> = HashMap::new();
@@ -559,13 +508,8 @@ pub fn verify_sigv4_header_only(
         .map_err(|e| anyhow!("signable request error: {e}"))?;
 
     // 7) Build signing params
-    let credentials = Credentials::new(
-        auth.access_key.clone(),
-        secret_key.to_string(),
-        None,
-        None,
-        "static",
-    );
+    let credentials =
+        Credentials::new(auth.access_key.clone(), secret_key.to_string(), None, None, "static");
     let identity: Identity = credentials.into();
 
     let mut signing_settings = SigningSettings::default();
@@ -625,4 +569,3 @@ fn offset_to_system_time(dt: OffsetDateTime) -> SystemTime {
         UNIX_EPOCH - Duration::from_secs((-ts) as u64)
     }
 }
-

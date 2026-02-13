@@ -1,20 +1,22 @@
-use anyhow::{anyhow, Context, Result};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use s32p_support::utils::trim_slashes;
 use std::collections::HashSet;
-use uuid::Uuid;
 
-use s32p_directory::directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
-use s32p_directory::openbao_client::OpenBaoClient;
+use anyhow::{Context, Result, anyhow};
 pub use s32p_directory::openbao_client::OpenBaoAuth;
-use s32p_directory::types::{AclEntry, BucketDoc, Principal, UserDoc};
-use s32p_directory::{DirectoryFileV1, parse_directory_yaml_str, render_directory_yaml_string};
+use s32p_directory::{
+    DirectoryFileV1,
+    directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key},
+    openbao_client::OpenBaoClient,
+    parse_directory_yaml_str, render_directory_yaml_string,
+    types::{AclEntry, BucketDoc, Principal, UserDoc},
+};
+use s32p_support::utils::trim_slashes;
+use serde::{Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct AppRoleCredentials {
     pub role_name: String,
-    pub role_id: String,
+    pub role_id:   String,
     pub secret_id: String,
 }
 
@@ -27,8 +29,8 @@ pub struct SetupResult {
 #[derive(Clone)]
 pub struct OpenBaoAdmin {
     kv_mount: String,
-    layout: DirectoryLayout,
-    client: OpenBaoClient,
+    layout:   DirectoryLayout,
+    client:   OpenBaoClient,
 }
 
 impl OpenBaoAdmin {
@@ -40,8 +42,8 @@ impl OpenBaoAdmin {
     ) -> Self {
         Self {
             kv_mount: trim_slashes(&kv_mount.into()),
-            layout: DirectoryLayout::new(prefix.into()),
-            client: OpenBaoClient::new_token(address, token),
+            layout:   DirectoryLayout::new(prefix.into()),
+            client:   OpenBaoClient::new_token(address, token),
         }
     }
 
@@ -55,8 +57,8 @@ impl OpenBaoAdmin {
     ) -> Self {
         Self {
             kv_mount: trim_slashes(&kv_mount.into()),
-            layout: DirectoryLayout::new(prefix.into()),
-            client: OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
+            layout:   DirectoryLayout::new(prefix.into()),
+            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
         }
     }
 
@@ -130,12 +132,12 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         Ok(SetupResult {
             proxy: AppRoleCredentials {
                 role_name: proxy_role.to_string(),
-                role_id: proxy_role_id,
+                role_id:   proxy_role_id,
                 secret_id: proxy_secret_id,
             },
             admin: AppRoleCredentials {
                 role_name: admin_role.to_string(),
-                role_id: admin_role_id,
+                role_id:   admin_role_id,
                 secret_id: admin_secret_id,
             },
         })
@@ -199,7 +201,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         for e in acl {
             match &e.principal {
                 Principal::AccessKey { access_key } => {
-                    self.index_add_bucket(&self.layout.idx_access_key(access_key), bucket_id).await?;
+                    self.index_add_bucket(&self.layout.idx_access_key(access_key), bucket_id)
+                        .await?;
                 }
                 Principal::GroupName { name } => {
                     self.index_add_bucket(&self.layout.idx_group(name), bucket_id).await?;
@@ -213,7 +216,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         for e in acl {
             match &e.principal {
                 Principal::AccessKey { access_key } => {
-                    self.index_remove_bucket(&self.layout.idx_access_key(access_key), bucket_id).await?;
+                    self.index_remove_bucket(&self.layout.idx_access_key(access_key), bucket_id)
+                        .await?;
                 }
                 Principal::GroupName { name } => {
                     self.index_remove_bucket(&self.layout.idx_group(name), bucket_id).await?;
@@ -253,7 +257,9 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         if cleanup_acls {
             let idx = self.index_read(&self.layout.idx_access_key(ak)).await?;
             for bucket_id in idx.bucket_ids {
-                if let Some(mut b) = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket_id)).await? {
+                if let Some(mut b) =
+                    self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket_id)).await?
+                {
                     let before = b.acl.len();
                     b.acl.retain(|e| match &e.principal {
                         Principal::AccessKey { access_key } => access_key != ak,
@@ -294,7 +300,12 @@ path "{kv_mount}/metadata/{prefix}/*" {{
 
     /* ----------------------------- Buckets ----------------------------- */
 
-    pub async fn create_bucket(&self, name: &str, data_path: &str, acl: Vec<AclEntry>) -> Result<String> {
+    pub async fn create_bucket(
+        &self,
+        name: &str,
+        data_path: &str,
+        acl: Vec<AclEntry>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let bucket = BucketDoc {
             id: id.clone(),
@@ -327,14 +338,22 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             let old_acl = normalize_acl(old.acl);
             let new_acl = bucket.acl.clone();
 
-            let old_set: HashSet<String> = old_acl.iter().map(|e| principal_key(&e.principal)).collect();
-            let new_set: HashSet<String> = new_acl.iter().map(|e| principal_key(&e.principal)).collect();
+            let old_set: HashSet<String> =
+                old_acl.iter().map(|e| principal_key(&e.principal)).collect();
+            let new_set: HashSet<String> =
+                new_acl.iter().map(|e| principal_key(&e.principal)).collect();
 
             for pk in old_set.difference(&new_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
-                        "ak" => self.index_remove_bucket(&self.layout.idx_access_key(value), &bucket.id).await?,
-                        "group" => self.index_remove_bucket(&self.layout.idx_group(value), &bucket.id).await?,
+                        "ak" => {
+                            self.index_remove_bucket(&self.layout.idx_access_key(value), &bucket.id)
+                                .await?
+                        }
+                        "group" => {
+                            self.index_remove_bucket(&self.layout.idx_group(value), &bucket.id)
+                                .await?
+                        }
                         _ => {}
                     }
                 }
@@ -342,8 +361,13 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             for pk in new_set.difference(&old_set) {
                 if let Some((kind, value)) = pk.split_once(':') {
                     match kind {
-                        "ak" => self.index_add_bucket(&self.layout.idx_access_key(value), &bucket.id).await?,
-                        "group" => self.index_add_bucket(&self.layout.idx_group(value), &bucket.id).await?,
+                        "ak" => {
+                            self.index_add_bucket(&self.layout.idx_access_key(value), &bucket.id)
+                                .await?
+                        }
+                        "group" => {
+                            self.index_add_bucket(&self.layout.idx_group(value), &bucket.id).await?
+                        }
                         _ => {}
                     }
                 }
@@ -413,11 +437,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         let users = self.list_users().await?;
         let buckets = self.list_buckets().await?;
 
-        let root = DirectoryFileV1 {
-            version: 1,
-            users,
-            buckets,
-        };
+        let root = DirectoryFileV1 { version: 1, users, buckets };
 
         render_directory_yaml_string(&root)
     }
@@ -448,11 +468,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
                     };
                     stack.push(next_rel);
                 } else {
-                    let leaf_rel = if cur_rel.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{}/{}", cur_rel, k)
-                    };
+                    let leaf_rel =
+                        if cur_rel.is_empty() { k.clone() } else { format!("{}/{}", cur_rel, k) };
                     let leaf_full = self.layout.join(&leaf_rel);
                     self.kv_delete_metadata(&leaf_full).await?;
                 }
@@ -484,8 +501,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     pub async fn import_yaml_file(&self, path: &str, replace: bool) -> Result<()> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read yaml file {path}"))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read yaml file {path}"))?;
         self.import_yaml_string(&text, replace).await
     }
 }
-

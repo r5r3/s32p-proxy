@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
-use quick_xml::{events::Event, se::to_string as to_xml_string, Reader};
-use serde::Serialize;
 use std::time::SystemTime;
-use time::{macros::format_description, OffsetDateTime, UtcOffset};
+
+use anyhow::{Result, anyhow};
+use quick_xml::{Reader, events::Event, se::to_string as to_xml_string};
+use serde::Serialize;
+use time::{OffsetDateTime, UtcOffset, macros::format_description};
 
 /// XML namespace used by S3 REST-XML error + list bucket responses.
 pub const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -36,11 +37,11 @@ pub mod error_code {
 /// Minimal bucket info used by ListBuckets.
 #[derive(Clone, Debug)]
 pub struct BucketInfo {
-    pub name: String,
+    pub name:          String,
     /// Optional bucket region (used by paginated ListBuckets responses).
     pub bucket_region: Option<String>,
     /// Optional bucket ARN.
-    pub bucket_arn: Option<String>,
+    pub bucket_arn:    Option<String>,
     pub creation_date: SystemTime,
 }
 
@@ -56,18 +57,22 @@ pub fn s3_error_body(
     host_id: Option<&str>,
 ) -> Result<Vec<u8>> {
     let doc = ErrorDocument {
-        code: code.to_string(),
-        message: message.to_string(),
-        resource: resource.map(|s| s.to_string()),
+        code:       code.to_string(),
+        message:    message.to_string(),
+        resource:   resource.map(|s| s.to_string()),
         request_id: request_id.map(|s| s.to_string()),
-        host_id: host_id.map(|s| s.to_string()),
+        host_id:    host_id.map(|s| s.to_string()),
     };
 
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
 
-pub fn list_buckets_body(owner_id: &str, owner_display_name: &str, buckets: &[BucketInfo]) -> Result<Vec<u8>> {
+pub fn list_buckets_body(
+    owner_id: &str,
+    owner_display_name: &str,
+    buckets: &[BucketInfo],
+) -> Result<Vec<u8>> {
     list_buckets_body_paginated(owner_id, owner_display_name, buckets, None, None)
 }
 
@@ -83,24 +88,24 @@ pub fn list_buckets_body_paginated(
     next_continuation_token: Option<&str>,
 ) -> Result<Vec<u8>> {
     let doc = ListAllMyBucketsResult {
-        xmlns: S3_XMLNS,
-        buckets: Buckets {
+        xmlns:              S3_XMLNS,
+        buckets:            Buckets {
             bucket: buckets
                 .iter()
                 .map(|b| Bucket {
-                    bucket_arn: b.bucket_arn.clone(),
+                    bucket_arn:    b.bucket_arn.clone(),
                     bucket_region: b.bucket_region.clone(),
                     creation_date: format_s3_time_system(b.creation_date),
-                    name: b.name.clone(),
+                    name:          b.name.clone(),
                 })
                 .collect(),
         },
-        owner: Owner {
-            id: owner_id.to_string(),
+        owner:              Owner {
+            id:           owner_id.to_string(),
             display_name: owner_display_name.to_string(),
         },
         continuation_token: next_continuation_token.map(|s| s.to_string()),
-        prefix: prefix.map(|s| s.to_string()),
+        prefix:             prefix.map(|s| s.to_string()),
     };
 
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
@@ -123,8 +128,7 @@ pub fn format_s3_time_system(st: SystemTime) -> String {
         dt => dt.to_offset(UtcOffset::UTC),
     };
     let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    dt.format(&fmt)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    dt.format(&fmt).unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// Build XML body for ListObjectsV2 (GET ?list-type=2).
@@ -155,13 +159,13 @@ pub fn list_objects_v2_body(
         contents: contents
             .iter()
             .map(|o| ContentsV2 {
-                key: o.key.clone(),
+                key:           o.key.clone(),
                 last_modified: o.last_modified.clone(),
-                etag: o.etag.clone(),
-                size: o.size,
+                etag:          o.etag.clone(),
+                size:          o.size,
                 storage_class: "STANDARD".to_string(),
-                owner: o.owner.as_ref().map(|ow| OwnerV2 {
-                    id: ow.id.clone(),
+                owner:         o.owner.as_ref().map(|ow| OwnerV2 {
+                    id:           ow.id.clone(),
                     display_name: ow.display_name.clone(),
                 }),
             })
@@ -184,12 +188,12 @@ pub fn list_objects_v2_body(
 /// Includes all optional checksum fields as empty tags (we don't compute checksums during copy).
 pub fn copy_object_result_body(last_modified: &str, etag: &str) -> Result<Vec<u8>> {
     let doc = CopyObjectResultDoc {
-        xmlns: S3_XMLNS,
-        last_modified: last_modified.to_string(),
-        etag: etag.to_string(),
-        checksum_crc32: Some(String::new()),
+        xmlns:           S3_XMLNS,
+        last_modified:   last_modified.to_string(),
+        etag:            etag.to_string(),
+        checksum_crc32:  Some(String::new()),
         checksum_crc32c: Some(String::new()),
-        checksum_sha1: Some(String::new()),
+        checksum_sha1:   Some(String::new()),
         checksum_sha256: Some(String::new()),
     };
 
@@ -203,24 +207,24 @@ pub fn copy_object_result_body(last_modified: &str, etag: &str) -> Result<Vec<u8
 
 #[derive(Clone, Debug)]
 pub struct DeleteErrorInfo {
-    pub key: String,
-    pub code: String,
+    pub key:     String,
+    pub code:    String,
     pub message: String,
 }
 
 /// Build XML body for DeleteObjects (POST ?delete).
-pub fn delete_objects_result_body(deleted_keys: &[String], errors: &[DeleteErrorInfo]) -> Result<Vec<u8>> {
+pub fn delete_objects_result_body(
+    deleted_keys: &[String],
+    errors: &[DeleteErrorInfo],
+) -> Result<Vec<u8>> {
     let doc = DeleteResultDoc {
-        xmlns: S3_XMLNS,
-        deleted: deleted_keys
-            .iter()
-            .map(|k| DeletedEntry { key: k.clone() })
-            .collect(),
-        errors: errors
+        xmlns:   S3_XMLNS,
+        deleted: deleted_keys.iter().map(|k| DeletedEntry { key: k.clone() }).collect(),
+        errors:  errors
             .iter()
             .map(|e| DeleteErrorEntry {
-                key: e.key.clone(),
-                code: e.code.clone(),
+                key:     e.key.clone(),
+                code:    e.code.clone(),
                 message: e.message.clone(),
             })
             .collect(),
@@ -236,68 +240,91 @@ pub fn delete_objects_result_body(deleted_keys: &[String], errors: &[DeleteError
 
 #[derive(Clone, Debug)]
 pub struct MultipartUploadInfo {
-    pub key: String,
+    pub key:       String,
     pub upload_id: String,
     pub initiated: String, // ISO8601 Z
 }
 
 #[derive(Clone, Debug)]
 pub struct MultipartPartInfo {
-    pub part_number: u32,
+    pub part_number:   u32,
     pub last_modified: String, // ISO8601 Z
-    pub etag: String,          // include quotes
-    pub size: u64,
+    pub etag:          String, // include quotes
+    pub size:          u64,
 }
 
-pub fn initiate_multipart_upload_result_body(bucket: &str, key: &str, upload_id: &str) -> Result<Vec<u8>> {
+pub fn initiate_multipart_upload_result_body(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<Vec<u8>> {
     let doc = InitiateMultipartUploadResultDoc {
-        xmlns: S3_XMLNS,
-        bucket: bucket.to_string(),
-        key: key.to_string(),
+        xmlns:     S3_XMLNS,
+        bucket:    bucket.to_string(),
+        key:       key.to_string(),
         upload_id: upload_id.to_string(),
     };
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
 
-pub fn list_multipart_uploads_body(bucket: &str, uploads: &[MultipartUploadInfo]) -> Result<Vec<u8>> {
+pub fn list_multipart_uploads_body(
+    bucket: &str,
+    uploads: &[MultipartUploadInfo],
+) -> Result<Vec<u8>> {
     let doc = ListMultipartUploadsResultDoc {
-        xmlns: S3_XMLNS,
-        bucket: bucket.to_string(),
-        uploads: uploads.iter().map(|u| UploadEntry {
-            key: u.key.clone(),
-            upload_id: u.upload_id.clone(),
-            initiated: u.initiated.clone(),
-        }).collect(),
+        xmlns:   S3_XMLNS,
+        bucket:  bucket.to_string(),
+        uploads: uploads
+            .iter()
+            .map(|u| UploadEntry {
+                key:       u.key.clone(),
+                upload_id: u.upload_id.clone(),
+                initiated: u.initiated.clone(),
+            })
+            .collect(),
     };
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
 
-pub fn list_parts_body(bucket: &str, key: &str, upload_id: &str, parts: &[MultipartPartInfo]) -> Result<Vec<u8>> {
+pub fn list_parts_body(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[MultipartPartInfo],
+) -> Result<Vec<u8>> {
     let doc = ListPartsResultDoc {
-        xmlns: S3_XMLNS,
-        bucket: bucket.to_string(),
-        key: key.to_string(),
+        xmlns:     S3_XMLNS,
+        bucket:    bucket.to_string(),
+        key:       key.to_string(),
         upload_id: upload_id.to_string(),
-        parts: parts.iter().map(|p| PartEntry {
-            part_number: p.part_number,
-            last_modified: p.last_modified.clone(),
-            etag: p.etag.clone(),
-            size: p.size,
-        }).collect(),
+        parts:     parts
+            .iter()
+            .map(|p| PartEntry {
+                part_number:   p.part_number,
+                last_modified: p.last_modified.clone(),
+                etag:          p.etag.clone(),
+                size:          p.size,
+            })
+            .collect(),
     };
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
 
-pub fn complete_multipart_upload_result_body(location: &str, bucket: &str, key: &str, etag: &str) -> Result<Vec<u8>> {
+pub fn complete_multipart_upload_result_body(
+    location: &str,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> Result<Vec<u8>> {
     let doc = CompleteMultipartUploadResultDoc {
-        xmlns: S3_XMLNS,
+        xmlns:    S3_XMLNS,
         location: location.to_string(),
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        etag: etag.to_string(),
+        bucket:   bucket.to_string(),
+        key:      key.to_string(),
+        etag:     etag.to_string(),
     };
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
@@ -310,9 +337,9 @@ struct InitiateMultipartUploadResultDoc {
     xmlns: &'static str,
 
     #[serde(rename = "Bucket")]
-    bucket: String,
+    bucket:    String,
     #[serde(rename = "Key")]
-    key: String,
+    key:       String,
     #[serde(rename = "UploadId")]
     upload_id: String,
 }
@@ -333,7 +360,7 @@ struct ListMultipartUploadsResultDoc {
 #[derive(Debug, Serialize)]
 struct UploadEntry {
     #[serde(rename = "Key")]
-    key: String,
+    key:       String,
     #[serde(rename = "UploadId")]
     upload_id: String,
     #[serde(rename = "Initiated")]
@@ -347,9 +374,9 @@ struct ListPartsResultDoc {
     xmlns: &'static str,
 
     #[serde(rename = "Bucket")]
-    bucket: String,
+    bucket:    String,
     #[serde(rename = "Key")]
-    key: String,
+    key:       String,
     #[serde(rename = "UploadId")]
     upload_id: String,
 
@@ -360,13 +387,13 @@ struct ListPartsResultDoc {
 #[derive(Debug, Serialize)]
 struct PartEntry {
     #[serde(rename = "PartNumber")]
-    part_number: u32,
+    part_number:   u32,
     #[serde(rename = "LastModified")]
     last_modified: String,
     #[serde(rename = "ETag")]
-    etag: String,
+    etag:          String,
     #[serde(rename = "Size")]
-    size: u64,
+    size:          u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,11 +405,11 @@ struct CompleteMultipartUploadResultDoc {
     #[serde(rename = "Location")]
     location: String,
     #[serde(rename = "Bucket")]
-    bucket: String,
+    bucket:   String,
     #[serde(rename = "Key")]
-    key: String,
+    key:      String,
     #[serde(rename = "ETag")]
-    etag: String,
+    etag:     String,
 }
 
 /* -------------------------
@@ -393,16 +420,16 @@ struct CompleteMultipartUploadResultDoc {
 #[serde(rename = "Error")]
 struct ErrorDocument {
     #[serde(rename = "Code")]
-    code: String,
+    code:    String,
     #[serde(rename = "Message")]
     message: String,
 
     #[serde(rename = "Resource", skip_serializing_if = "Option::is_none")]
-    resource: Option<String>,
+    resource:   Option<String>,
     #[serde(rename = "RequestId", skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     #[serde(rename = "HostId", skip_serializing_if = "Option::is_none")]
-    host_id: Option<String>,
+    host_id:    Option<String>,
 }
 
 // --- public DTOs for ListBuckets ---
@@ -429,7 +456,7 @@ struct ListAllMyBucketsResult {
 #[derive(Debug, Serialize)]
 struct Owner {
     #[serde(rename = "ID")]
-    id: String,
+    id:           String,
     #[serde(rename = "DisplayName")]
     display_name: String,
 }
@@ -449,7 +476,7 @@ struct Bucket {
     bucket_region: Option<String>,
 
     #[serde(rename = "Name")]
-    name: String,
+    name:          String,
     #[serde(rename = "CreationDate")]
     creation_date: String,
 }
@@ -469,17 +496,17 @@ struct LocationConstraintDoc {
 
 #[derive(Clone, Debug)]
 pub struct ListOwnerInfo {
-    pub id: String,
+    pub id:           String,
     pub display_name: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct ListObjectInfo {
-    pub key: String,
+    pub key:           String,
     pub last_modified: String, // ISO8601 UTC "YYYY-MM-DDTHH:MM:SSZ"
-    pub etag: String,          // include quotes, e.g. "\"123\""
-    pub size: u64,
-    pub owner: Option<ListOwnerInfo>,
+    pub etag:          String, // include quotes, e.g. "\"123\""
+    pub size:          u64,
+    pub owner:         Option<ListOwnerInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -525,13 +552,13 @@ struct ListBucketResultV2 {
 #[derive(Debug, Serialize)]
 struct ContentsV2 {
     #[serde(rename = "Key")]
-    key: String,
+    key:           String,
     #[serde(rename = "LastModified")]
     last_modified: String,
     #[serde(rename = "ETag")]
-    etag: String,
+    etag:          String,
     #[serde(rename = "Size")]
-    size: u64,
+    size:          u64,
     #[serde(rename = "StorageClass")]
     storage_class: String,
 
@@ -542,7 +569,7 @@ struct ContentsV2 {
 #[derive(Debug, Serialize)]
 struct OwnerV2 {
     #[serde(rename = "ID")]
-    id: String,
+    id:           String,
     #[serde(rename = "DisplayName")]
     display_name: String,
 }
@@ -568,11 +595,11 @@ struct CopyObjectResultDoc {
     etag: String,
 
     #[serde(rename = "ChecksumCRC32", skip_serializing_if = "Option::is_none")]
-    checksum_crc32: Option<String>,
+    checksum_crc32:  Option<String>,
     #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "Option::is_none")]
     checksum_crc32c: Option<String>,
     #[serde(rename = "ChecksumSHA1", skip_serializing_if = "Option::is_none")]
-    checksum_sha1: Option<String>,
+    checksum_sha1:   Option<String>,
     #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
     checksum_sha256: Option<String>,
 }
@@ -601,9 +628,9 @@ struct DeletedEntry {
 #[derive(Debug, Serialize)]
 struct DeleteErrorEntry {
     #[serde(rename = "Key")]
-    key: String,
+    key:     String,
     #[serde(rename = "Code")]
-    code: String,
+    code:    String,
     #[serde(rename = "Message")]
     message: String,
 }
@@ -707,10 +734,8 @@ pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
                         .xml_content()
                         .map_err(|e| anyhow!("xml text decode error: {e}"))?
                         .into_owned();
-                    let pn: u32 = s
-                        .trim()
-                        .parse()
-                        .map_err(|_| anyhow!("invalid PartNumber: {s}"))?;
+                    let pn: u32 =
+                        s.trim().parse().map_err(|_| anyhow!("invalid PartNumber: {s}"))?;
                     parts.push(pn);
                 }
             }

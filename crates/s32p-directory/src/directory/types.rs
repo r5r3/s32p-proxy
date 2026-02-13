@@ -4,24 +4,24 @@ use serde::{Deserialize, Serialize};
 pub struct UserDoc {
     pub access_key: String,
     pub secret_key: String,
-    pub username: String,
-    pub uid: u32,
-    pub gid: u32,
+    pub username:   String,
+    pub uid:        u32,
+    pub gid:        u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BucketDoc {
-    pub id: String,
-    pub name: String,
+    pub id:        String,
+    pub name:      String,
     pub data_path: String,
     #[serde(default)]
-    pub acl: Vec<AclEntry>,
+    pub acl:       Vec<AclEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AclEntry {
     pub principal: Principal,
-    pub access: AccessLevel,
+    pub access:    AccessLevel,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,9 +40,8 @@ pub enum AccessLevel {
 
 #[derive(Clone, Debug)]
 pub struct BucketView {
-    pub bucket_id: String,
+    pub bucket_id:   String,
     pub bucket_name: String,
-    pub data_path: String,
-    pub access: AccessLevel,
+    pub data_path:   String,
+    pub access:      AccessLevel,
 }
-

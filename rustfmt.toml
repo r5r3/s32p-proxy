@@ -1,0 +1,26 @@
+# Rust formatting configuration for s32p
+# Only specifies non-default settings
+
+edition = "2024"
+use_small_heuristics = "Max"
+
+# Import organization
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
+# Code organization
+reorder_impl_items = true
+reorder_modules = true
+
+# Comment formatting
+format_code_in_doc_comments = true
+
+# Match arm formatting
+match_arm_blocks = true
+match_arm_leading_pipes = "Never"
+
+# Struct formatting
+struct_field_align_threshold = 20
+
+# Chain formatting
+chain_width = 80

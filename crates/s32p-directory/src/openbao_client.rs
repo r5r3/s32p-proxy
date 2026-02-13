@@ -1,34 +1,32 @@
-use anyhow::{anyhow, Context, Result};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow};
 use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use s32p_support::utils::trim_slashes;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub enum OpenBaoAuth {
     Token(String),
-    AppRole {
-        mount: String,
-        role_id: String,
-        secret_id: String,
-    },
+    AppRole { mount: String, role_id: String, secret_id: String },
 }
 
 #[derive(Clone)]
 pub struct OpenBaoClient {
     address: String, // base, no trailing slash
-    auth: OpenBaoAuth,
-    http: reqwest::Client,
-    state: Arc<Mutex<TokenState>>,
+    auth:    OpenBaoAuth,
+    http:    reqwest::Client,
+    state:   Arc<Mutex<TokenState>>,
 }
 
 #[derive(Debug)]
 struct TokenState {
-    token: Option<String>,
+    token:      Option<String>,
     expires_at: Option<Instant>,
 }
 
@@ -37,12 +35,9 @@ impl OpenBaoClient {
         let token = token.into();
         Self {
             address: address.into().trim_end_matches('/').to_string(),
-            auth: OpenBaoAuth::Token(token.clone()),
-            http: reqwest::Client::new(),
-            state: Arc::new(Mutex::new(TokenState {
-                token: Some(token),
-                expires_at: None,
-            })),
+            auth:    OpenBaoAuth::Token(token.clone()),
+            http:    reqwest::Client::new(),
+            state:   Arc::new(Mutex::new(TokenState { token: Some(token), expires_at: None })),
         }
     }
 
@@ -54,31 +49,29 @@ impl OpenBaoClient {
     ) -> Self {
         Self {
             address: address.into().trim_end_matches('/').to_string(),
-            auth: OpenBaoAuth::AppRole {
-                mount: trim_slashes(&approle_mount.into()),
-                role_id: role_id.into(),
+            auth:    OpenBaoAuth::AppRole {
+                mount:     trim_slashes(&approle_mount.into()),
+                role_id:   role_id.into(),
                 secret_id: secret_id.into(),
             },
-            http: reqwest::Client::new(),
-            state: Arc::new(Mutex::new(TokenState {
-                token: None,
-                expires_at: None,
-            })),
+            http:    reqwest::Client::new(),
+            state:   Arc::new(Mutex::new(TokenState { token: None, expires_at: None })),
         }
     }
 
     fn url(&self, api_path: &str) -> String {
-        format!(
-            "{}/v1/{}",
-            self.address,
-            api_path.trim_start_matches('/')
-        )
+        format!("{}/v1/{}", self.address, api_path.trim_start_matches('/'))
     }
 
-    async fn approle_login(&self, mount: &str, role_id: &str, secret_id: &str) -> Result<(String, u64)> {
+    async fn approle_login(
+        &self,
+        mount: &str,
+        role_id: &str,
+        secret_id: &str,
+    ) -> Result<(String, u64)> {
         #[derive(Debug, Serialize)]
         struct Req<'a> {
-            role_id: &'a str,
+            role_id:   &'a str,
             secret_id: &'a str,
         }
 
@@ -89,7 +82,7 @@ impl OpenBaoClient {
 
         #[derive(Debug, Deserialize)]
         struct Auth {
-            client_token: String,
+            client_token:   String,
             lease_duration: u64,
         }
 
@@ -150,10 +143,7 @@ impl OpenBaoClient {
 
     async fn request(&self, method: Method, api_path: &str) -> Result<reqwest::RequestBuilder> {
         let token = self.ensure_token().await?;
-        Ok(self
-            .http
-            .request(method, self.url(api_path))
-            .header("X-Vault-Token", token))
+        Ok(self.http.request(method, self.url(api_path)).header("X-Vault-Token", token))
     }
 
     async fn send_ok(&self, rb: reqwest::RequestBuilder, ctx: &str) -> Result<reqwest::Response> {
@@ -248,7 +238,11 @@ impl OpenBaoClient {
         Ok(())
     }
 
-    pub async fn kv2_list_opt(&self, kv_mount: &str, rel_path: &str) -> Result<Option<Vec<String>>> {
+    pub async fn kv2_list_opt(
+        &self,
+        kv_mount: &str,
+        rel_path: &str,
+    ) -> Result<Option<Vec<String>>> {
         #[derive(Debug, Deserialize)]
         struct Resp {
             data: Option<Data>,
@@ -305,7 +299,9 @@ impl OpenBaoClient {
         // treat "already enabled" as OK
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        if status == StatusCode::BAD_REQUEST && body.to_ascii_lowercase().contains("path is already in use") {
+        if status == StatusCode::BAD_REQUEST
+            && body.to_ascii_lowercase().contains("path is already in use")
+        {
             return Ok(());
         }
 
@@ -337,19 +333,21 @@ impl OpenBaoClient {
         let api_path = format!("auth/{m}/role/{r}");
 
         self.send_ok(
-            self.request(Method::POST, &api_path)
-                .await?
-                .json(&json!({
-                    "token_policies": token_policies,
-                    "token_no_default_policy": true
-                })),
+            self.request(Method::POST, &api_path).await?.json(&json!({
+                "token_policies": token_policies,
+                "token_no_default_policy": true
+            })),
             "set approle role",
         )
         .await?;
         Ok(())
     }
 
-    pub async fn read_approle_role_id(&self, approle_mount: &str, role_name: &str) -> Result<String> {
+    pub async fn read_approle_role_id(
+        &self,
+        approle_mount: &str,
+        role_name: &str,
+    ) -> Result<String> {
         #[derive(Debug, Deserialize)]
         struct Resp {
             data: Option<Data>,
@@ -371,7 +369,11 @@ impl OpenBaoClient {
         Ok(r.data.ok_or_else(|| anyhow!("read role-id: missing data"))?.role_id)
     }
 
-    pub async fn generate_approle_secret_id(&self, approle_mount: &str, role_name: &str) -> Result<String> {
+    pub async fn generate_approle_secret_id(
+        &self,
+        approle_mount: &str,
+        role_name: &str,
+    ) -> Result<String> {
         #[derive(Debug, Deserialize)]
         struct Resp {
             data: Option<Data>,
@@ -396,6 +398,3 @@ impl OpenBaoClient {
         Ok(r.data.ok_or_else(|| anyhow!("generate secret-id: missing data"))?.secret_id)
     }
 }
-
-
-

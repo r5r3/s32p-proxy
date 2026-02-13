@@ -1,6 +1,8 @@
-use crate::directory::types::{AclEntry, AccessLevel, Principal};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::directory::types::{AccessLevel, AclEntry, Principal};
 
 #[derive(Clone, Debug)]
 pub struct DirectoryLayout {
@@ -26,19 +28,17 @@ impl DirectoryLayout {
         if rel.is_empty() {
             return self.prefix.clone();
         }
-        if self.prefix.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{}/{}", self.prefix, rel)
-        }
+        if self.prefix.is_empty() { rel.to_string() } else { format!("{}/{}", self.prefix, rel) }
     }
 
     pub fn users_root(&self) -> String {
         self.join("users")
     }
+
     pub fn buckets_root(&self) -> String {
         self.join("buckets")
     }
+
     pub fn index_root(&self) -> String {
         self.join("index")
     }
@@ -46,12 +46,15 @@ impl DirectoryLayout {
     pub fn user(&self, access_key: &str) -> String {
         self.join(&format!("users/{}", access_key))
     }
+
     pub fn bucket(&self, bucket_id: &str) -> String {
         self.join(&format!("buckets/{}", bucket_id))
     }
+
     pub fn idx_access_key(&self, access_key: &str) -> String {
         self.join(&format!("index/access_key/{}", access_key))
     }
+
     pub fn idx_group(&self, group_name: &str) -> String {
         self.join(&format!("index/group/{}", group_name))
     }
@@ -91,4 +94,3 @@ pub fn normalize_acl(acl: Vec<AclEntry>) -> Vec<AclEntry> {
     out.sort_by(|a, b| principal_key(&a.principal).cmp(&principal_key(&b.principal)));
     out
 }
-

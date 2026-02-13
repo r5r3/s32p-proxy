@@ -1,24 +1,31 @@
-use crate::directory::file::{parse_directory_yaml_str, DirectoryFileV1};
-use crate::directory::layout::normalize_acl;
-use crate::directory::posix_groups::groups_for_user;
-use crate::directory::{AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc};
-use anyhow::{anyhow, Context, Result};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
+
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
-use std::fs;
+
+use crate::directory::{
+    AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc,
+    file::{DirectoryFileV1, parse_directory_yaml_str},
+    layout::normalize_acl,
+    posix_groups::groups_for_user,
+};
 
 #[derive(Clone)]
 pub struct YamlDirectory {
-    users: HashMap<String, UserDoc>,     // access_key -> user
+    users:   HashMap<String, UserDoc>,   // access_key -> user
     buckets: HashMap<String, BucketDoc>, // bucket_id -> bucket
 
     index_access_key: HashMap<String, Vec<String>>, // access_key -> bucket_ids
-    index_group: HashMap<String, Vec<String>>,      // group_name -> bucket_ids
+    index_group:      HashMap<String, Vec<String>>, // group_name -> bucket_ids
 }
 
 impl YamlDirectory {
     pub fn from_path(path: &str) -> Result<Self> {
-        let text = fs::read_to_string(path).with_context(|| format!("read yaml directory: {path}"))?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("read yaml directory: {path}"))?;
         Self::from_str(&text)
     }
 
@@ -87,12 +94,7 @@ impl YamlDirectory {
             v.dedup();
         }
 
-        Ok(Self {
-            users,
-            buckets,
-            index_access_key,
-            index_group,
-        })
+        Ok(Self { users, buckets, index_access_key, index_group })
     }
 
     fn effective_access(
@@ -174,4 +176,3 @@ impl Directory for YamlDirectory {
         Ok(out)
     }
 }
-

@@ -1,11 +1,15 @@
-use anyhow::{anyhow, Result};
-use io_uring::{opcode, types, IoUring};
-use std::collections::VecDeque;
-use std::os::fd::AsRawFd;
-use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    collections::VecDeque,
+    os::{fd::AsRawFd, unix::io::RawFd},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+};
+
+use anyhow::{Result, anyhow};
+use io_uring::{IoUring, opcode, types};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -17,10 +21,10 @@ use crate::buffer::PooledBuf;
 
 struct SessionInner {
     pending: AtomicUsize,
-    closed: AtomicBool,
-    err: Mutex<Option<anyhow::Error>>,
-    done: Mutex<Option<oneshot::Sender<Result<()>>>>,
-    cancel: CancellationToken,
+    closed:  AtomicBool,
+    err:     Mutex<Option<anyhow::Error>>,
+    done:    Mutex<Option<oneshot::Sender<Result<()>>>>,
+    cancel:  CancellationToken,
 }
 
 impl SessionInner {
@@ -79,7 +83,9 @@ impl SessionInner {
         }
 
         let tx_opt = self.done.lock().unwrap().take();
-        let Some(tx) = tx_opt else { return; };
+        let Some(tx) = tx_opt else {
+            return;
+        };
 
         let res = match self.err.lock().unwrap().take() {
             Some(e) => Err(e),
@@ -95,18 +101,18 @@ impl SessionInner {
 
 /// Single shared io_uring instance (one thread) for both reads and writes.
 pub struct UringIO {
-    tx: mpsc::Sender<Msg>,
+    tx:     mpsc::Sender<Msg>,
     cancel: CancellationToken, // cancelled on fatal io_uring failure
 }
 
 /// Per-file/per-request sender that can submit both reads and writes.
 /// Enforces a max in-flight cap across *both* read+write ops for this sender.
 pub struct UringFileSender {
-    tx: mpsc::Sender<Msg>,
-    file: Arc<std::fs::File>,
-    fd: RawFd,
+    tx:      mpsc::Sender<Msg>,
+    file:    Arc<std::fs::File>,
+    fd:      RawFd,
     session: Arc<SessionInner>,
-    cancel: CancellationToken,
+    cancel:  CancellationToken,
     done_rx: Option<oneshot::Receiver<Result<()>>>,
 }
 
@@ -207,7 +213,12 @@ impl UringFileSender {
 
     /// Submit a read at `off` for up to `read_len` bytes into `pooled`.
     /// Returns (nread, pooled) when CQE completes. `nread` may be 0 at EOF.
-    pub async fn read(&self, off: u64, read_len: usize, pooled: PooledBuf) -> Result<(usize, PooledBuf)> {
+    pub async fn read(
+        &self,
+        off: u64,
+        read_len: usize,
+        pooled: PooledBuf,
+    ) -> Result<(usize, PooledBuf)> {
         if self.cancel.is_cancelled() {
             return Err(anyhow!("uring sender cancelled"));
         }
@@ -254,8 +265,7 @@ impl UringFileSender {
             .take()
             .ok_or_else(|| anyhow!("uring sender done receiver missing"))?;
 
-        rx.await
-            .map_err(|_| anyhow!("uring sender done channel closed"))?
+        rx.await.map_err(|_| anyhow!("uring sender done channel closed"))?
     }
 }
 
@@ -280,26 +290,26 @@ enum OpCode {
 }
 
 struct ReadItem {
-    fd: RawFd,
-    _file: Arc<std::fs::File>,
-    off: u64,
-    len: usize,
-    pooled: PooledBuf,
+    fd:      RawFd,
+    _file:   Arc<std::fs::File>,
+    off:     u64,
+    len:     usize,
+    pooled:  PooledBuf,
     session: Arc<SessionInner>,
-    done: Option<oneshot::Sender<Result<ReadDone>>>,
+    done:    Option<oneshot::Sender<Result<ReadDone>>>,
 }
 
 struct WriteItem {
-    fd: RawFd,
-    _file: Arc<std::fs::File>,
-    off: u64,
-    len: usize,
-    pooled: PooledBuf,
+    fd:      RawFd,
+    _file:   Arc<std::fs::File>,
+    off:     u64,
+    len:     usize,
+    pooled:  PooledBuf,
     session: Arc<SessionInner>,
 }
 
 struct ReadDone {
-    n: usize,
+    n:      usize,
     pooled: PooledBuf,
 }
 
@@ -323,7 +333,12 @@ fn io_thread(
         // Compute SQE from the item (must keep backing memory alive in slots[id]).
         let sqe = match &item {
             OpCode::Write(w) => {
-                tracing::debug!("submitting write {} at offset {}, inflight={}", w.len, w.off, *inflight+1);
+                tracing::debug!(
+                    "submitting write {} at offset {}, inflight={}",
+                    w.len,
+                    w.off,
+                    *inflight + 1
+                );
                 let ptr = w.pooled.as_bytes().as_ptr();
                 let len = w.len as u32;
                 opcode::Write::new(types::Fd(w.fd), ptr, len)
@@ -332,7 +347,12 @@ fn io_thread(
                     .user_data(id as u64)
             }
             OpCode::Read(r) => {
-                tracing::debug!("submitting read {} at offset {}, inflight={}", r.len, r.off, *inflight+1);
+                tracing::debug!(
+                    "submitting read {} at offset {}, inflight={}",
+                    r.len,
+                    r.off,
+                    *inflight + 1
+                );
                 // Cast to *mut u8 for read; buffer is exclusively owned.
                 let ptr = r.pooled.as_bytes().as_ptr() as *mut u8;
                 let len = r.len as u32;
@@ -346,9 +366,7 @@ fn io_thread(
         slots[id] = Some(item);
 
         unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| anyhow!("io_uring SQ full"))?;
+            ring.submission().push(&sqe).map_err(|_| anyhow!("io_uring SQ full"))?;
         }
 
         *inflight += 1;
@@ -427,7 +445,9 @@ fn io_thread(
                         if n > len {
                             let e = anyhow!(
                                 "io_uring read returned n={} > requested {} at off={}",
-                                n, len, off
+                                n,
+                                len,
+                                off
                             );
                             session.set_error_once(anyhow!("{e}"));
                             if let Some(tx) = done.take() {
@@ -507,7 +527,9 @@ fn io_thread(
         // Fill SQ
         let mut pushed = 0usize;
         while inflight < depth {
-            let Some(id) = free.pop_front() else { break; };
+            let Some(id) = free.pop_front() else {
+                break;
+            };
 
             let item = if let Some(it) = backlog.pop_front() {
                 it

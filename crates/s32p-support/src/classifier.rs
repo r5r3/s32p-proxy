@@ -1,7 +1,8 @@
-use http::{HeaderMap, Uri};
 use std::collections::HashMap;
 
-use super::utils::{parse_u32};
+use http::{HeaderMap, Uri};
+
+use super::utils::parse_u32;
 
 /// High-level classification for S3 REST requests.
 /// Shared by proxy and gateway to avoid duplicated request parsing logic.
@@ -10,11 +11,11 @@ pub struct S3RequestClass {
     /// Bucket name if present (path-style parsing for now).
     pub bucket: Option<String>,
     /// Object key if present (everything after bucket/).
-    pub key: Option<String>,
+    pub key:    Option<String>,
     /// Parsed query parameters (lowercased keys).
-    pub query: QueryParams,
+    pub query:  QueryParams,
     /// Classified operation bucket.
-    pub op: S3Op,
+    pub op:     S3Op,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,22 +41,13 @@ pub enum MultipartOp {
     /// POST /{bucket}/{key}?uploads
     CreateMultipartUpload,
     /// PUT /{bucket}/{key}?partNumber=N&uploadId=...
-    UploadPart {
-        upload_id: String,
-        part_number: u32,
-    },
+    UploadPart { upload_id: String, part_number: u32 },
     /// GET /{bucket}/{key}?uploadId=...
-    ListParts {
-        upload_id: String,
-    },
+    ListParts { upload_id: String },
     /// POST /{bucket}/{key}?uploadId=...
-    CompleteMultipartUpload {
-        upload_id: String,
-    },
+    CompleteMultipartUpload { upload_id: String },
     /// DELETE /{bucket}/{key}?uploadId=...
-    AbortMultipartUpload {
-        upload_id: String,
-    },
+    AbortMultipartUpload { upload_id: String },
     /// GET /{bucket}?uploads
     ListMultipartUploads,
     /// Some multipart-ish request we recognized as multipart but couldn't fully parse.
@@ -135,11 +127,7 @@ pub enum BucketAdminOp {
     DeleteBucket,
 }
 
-
-
 /// Parse/validate conditional headers.
-
-
 
 /// Parsed query params with lowercased keys.
 /// Values are percent-decoded (via url::form_urlencoded), which is correct for routing.
@@ -228,9 +216,9 @@ impl QueryParams {
 
     /// True if there are no *effective* query params except SigV4-presign params and non-effective keys.
     pub fn is_empty_effective(&self) -> bool {
-        self.inner
-            .keys()
-            .all(|k| Self::is_sigv4_presign_key(k.as_str()) || Self::is_non_effective_key(k.as_str()))
+        self.inner.keys().all(|k| {
+            Self::is_sigv4_presign_key(k.as_str()) || Self::is_non_effective_key(k.as_str())
+        })
     }
 
     /// True if the only *effective* (non-presign, non-non-effective) query param key is `key`.
@@ -270,79 +258,60 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
 
 /// Classify an incoming request into S3 operation buckets, using headers when needed.
 /// (CopyObject is distinguished from PutObject via x-amz-copy-source.)
-/// 
+///
 /// This function automatically detects virtual-hosted-style vs path-style requests
 /// based on the Host header and virtual_hosted_suffixes configuration.
 pub fn classify_with_headers(
-    method: &str, 
-    uri: &Uri, 
+    method: &str,
+    uri: &Uri,
     headers: Option<&HeaderMap>,
-    virtual_hosted_suffixes: &[String]
+    virtual_hosted_suffixes: &[String],
 ) -> S3RequestClass {
-    let (bucket, key, _is_virtual_hosted) = parse_bucket_key_auto(method, uri, headers, virtual_hosted_suffixes);
+    let (bucket, key, _is_virtual_hosted) =
+        parse_bucket_key_auto(method, uri, headers, virtual_hosted_suffixes);
     let query = QueryParams::from_uri(uri);
 
     // Rest of the classification logic...
 
     // ListBuckets: GET / (may include pagination/filter query params, allow x-id)
     if method == "GET" && bucket.is_none() && key.is_none() && query.validate_xid("ListBuckets") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::ListBuckets),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListBuckets) };
     }
 
     // Detect multipart first (uploadId can coexist with versionId in theory,
     // but multipart routing is usually clearer).
     if let Some(op) = classify_multipart(method, &bucket, &key, &query) {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Multipart(op),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Multipart(op) };
     }
 
     if let Some(op) = classify_versioning(method, &bucket, &key, &query) {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Versioning(op),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Versioning(op) };
     }
 
     // Object lock / retention / legal-hold (query sub-resources).
     // This must come before versioning so "?retention&versionId=..." is treated as object-lock.
     if let Some(op) = classify_object_lock(method, &bucket, &key, &query) {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::ObjectLock(op),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::ObjectLock(op) };
     }
 
     // GetBucketLocation: GET /{bucket}?location (or /{bucket}/?location), and ONLY that param (allow x-id)
-    if method == "GET" && bucket.is_some() && key.is_none() && query.is_only_effective("location") && query.validate_xid("GetBucketLocation") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::GetBucketLocation),
-        };
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.is_only_effective("location")
+        && query.validate_xid("GetBucketLocation")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetBucketLocation) };
     }
 
     // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
-    if method == "HEAD" && bucket.is_some() && key.is_none() && query.is_empty_effective() && query.validate_xid("HeadBucket") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::HeadBucket),
-        };
+    if method == "HEAD"
+        && bucket.is_some()
+        && key.is_none()
+        && query.is_empty_effective()
+        && query.validate_xid("HeadBucket")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::HeadBucket) };
     }
 
     // CreateBucket: PUT /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
@@ -375,25 +344,24 @@ pub fn classify_with_headers(
         };
     }
 
-
     // GetObject: GET /{bucket}/{key} with *no* query params (allow x-id)
-    if method == "GET" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("GetObject") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::GetObject),
-        };
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_some()
+        && query.is_empty_effective()
+        && query.validate_xid("GetObject")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetObject) };
     }
 
     // HeadObject: HEAD /{bucket}/{key} with *no* query params (allow x-id)
-    if method == "HEAD" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("HeadObject") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::HeadObject),
-        };
+    if method == "HEAD"
+        && bucket.is_some()
+        && key.is_some()
+        && query.is_empty_effective()
+        && query.validate_xid("HeadObject")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::HeadObject) };
     }
 
     // ListObjectsV2: GET /{bucket}?list-type=2 (may have other params, allow x-id)
@@ -403,12 +371,7 @@ pub fn classify_with_headers(
         && query.first("list-type") == Some("2")
         && query.validate_xid("ListObjectsV2")
     {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Read(ReadOp::ListObjectsV2),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListObjectsV2) };
     }
 
     // CopyObject: PUT /{bucket}/{key} with *no* query params and x-amz-copy-source (allow x-id)
@@ -419,12 +382,7 @@ pub fn classify_with_headers(
         && headers.is_some_and(|h| h.get("x-amz-copy-source").is_some())
         && query.validate_xid("CopyObject")
     {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Write(WriteOp::CopyObject),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::CopyObject) };
     }
 
     // RenameObject: PUT /{bucket}/{key}?renameObject with x-amz-rename-source (allow x-id)
@@ -435,50 +393,40 @@ pub fn classify_with_headers(
         && headers.is_some_and(|h| h.get("x-amz-rename-source").is_some())
         && query.validate_xid("RenameObject")
     {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Write(WriteOp::RenameObject),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::RenameObject) };
     }
 
     // PutObject: PUT /{bucket}/{key} with *no* query params (allow x-id)
-    if method == "PUT" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("PutObject") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Write(WriteOp::PutObject),
-        };
+    if method == "PUT"
+        && bucket.is_some()
+        && key.is_some()
+        && query.is_empty_effective()
+        && query.validate_xid("PutObject")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::PutObject) };
     }
 
     // DeleteObjects (multi-delete): POST /{bucket}?delete (may also include x-id=DeleteObjects etc.)
-    if method == "POST" && bucket.is_some() && key.is_none() && query.has("delete") && query.validate_xid("DeleteObjects") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Write(WriteOp::DeleteObjects),
-        };
+    if method == "POST"
+        && bucket.is_some()
+        && key.is_none()
+        && query.has("delete")
+        && query.validate_xid("DeleteObjects")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::DeleteObjects) };
     }
 
     // DeleteObject: DELETE /{bucket}/{key} with *no* query params (allow x-id)
-    if method == "DELETE" && bucket.is_some() && key.is_some() && query.is_empty_effective() && query.validate_xid("DeleteObject") {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Write(WriteOp::DeleteObject),
-        };
+    if method == "DELETE"
+        && bucket.is_some()
+        && key.is_some()
+        && query.is_empty_effective()
+        && query.validate_xid("DeleteObject")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::DeleteObject) };
     }
 
-    S3RequestClass {
-        bucket,
-        key,
-        query,
-        op: S3Op::Other,
-    }
+    S3RequestClass { bucket, key, query, op: S3Op::Other }
 }
 
 /// If this request should be rejected as "NotImplemented" (for now), return a message.
@@ -502,12 +450,22 @@ fn classify_multipart(
     query: &QueryParams,
 ) -> Option<MultipartOp> {
     // ListMultipartUploads: GET /{bucket}?uploads (allow x-id)
-    if method == "GET" && bucket.is_some() && key.is_none() && query.has("uploads") && query.validate_xid("ListMultipartUploads") {
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.has("uploads")
+        && query.validate_xid("ListMultipartUploads")
+    {
         return Some(MultipartOp::ListMultipartUploads);
     }
 
     // CreateMultipartUpload: POST /{bucket}/{key}?uploads (allow x-id)
-    if method == "POST" && bucket.is_some() && key.is_some() && query.has("uploads") && query.validate_xid("CreateMultipartUpload") {
+    if method == "POST"
+        && bucket.is_some()
+        && key.is_some()
+        && query.has("uploads")
+        && query.validate_xid("CreateMultipartUpload")
+    {
         return Some(MultipartOp::CreateMultipartUpload);
     }
 
@@ -516,10 +474,7 @@ fn classify_multipart(
         // UploadPart: PUT ?partNumber=N&uploadId=...
         if method == "PUT" && query.validate_xid("UploadPart") {
             if let Some(pn) = query.first("partnumber").and_then(parse_u32) {
-                return Some(MultipartOp::UploadPart {
-                    upload_id,
-                    part_number: pn,
-                });
+                return Some(MultipartOp::UploadPart { upload_id, part_number: pn });
             }
             return Some(MultipartOp::Unknown);
         }
@@ -554,14 +509,23 @@ fn classify_versioning(
     // Bucket versioning configuration: GET/PUT /{bucket}?versioning (allow x-id)
     if bucket.is_some() && key.is_none() && query.has("versioning") {
         return match method {
-            "GET" if query.validate_xid("GetBucketVersioning") => Some(VersioningOp::GetBucketVersioning),
-            "PUT" if query.validate_xid("PutBucketVersioning") => Some(VersioningOp::PutBucketVersioning),
+            "GET" if query.validate_xid("GetBucketVersioning") => {
+                Some(VersioningOp::GetBucketVersioning)
+            }
+            "PUT" if query.validate_xid("PutBucketVersioning") => {
+                Some(VersioningOp::PutBucketVersioning)
+            }
             _ => Some(VersioningOp::Unknown),
         };
     }
 
     // List object versions: GET /{bucket}?versions (allow x-id)
-    if method == "GET" && bucket.is_some() && key.is_none() && query.has("versions") && query.validate_xid("ListObjectVersions") {
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.has("versions")
+        && query.validate_xid("ListObjectVersions")
+    {
         return Some(VersioningOp::ListObjectVersions);
     }
 
@@ -569,9 +533,7 @@ fn classify_versioning(
     if key.is_some() {
         if let Some(vid) = query.first("versionid") {
             if query.validate_xid("ObjectWithVersionId") {
-                return Some(VersioningOp::ObjectWithVersionId {
-                    version_id: vid.to_string(),
-                });
+                return Some(VersioningOp::ObjectWithVersionId { version_id: vid.to_string() });
             }
         }
     }
@@ -588,8 +550,12 @@ fn classify_object_lock(
     // Bucket Object Lock configuration: GET/PUT /{bucket}?object-lock (allow x-id)
     if bucket.is_some() && key.is_none() && query.has("object-lock") {
         return match method {
-            "GET" if query.validate_xid("GetBucketObjectLockConfiguration") => Some(ObjectLockOp::GetBucketObjectLockConfiguration),
-            "PUT" if query.validate_xid("PutBucketObjectLockConfiguration") => Some(ObjectLockOp::PutBucketObjectLockConfiguration),
+            "GET" if query.validate_xid("GetBucketObjectLockConfiguration") => {
+                Some(ObjectLockOp::GetBucketObjectLockConfiguration)
+            }
+            "PUT" if query.validate_xid("PutBucketObjectLockConfiguration") => {
+                Some(ObjectLockOp::PutBucketObjectLockConfiguration)
+            }
             _ => Some(ObjectLockOp::Unknown),
         };
     }
@@ -597,8 +563,12 @@ fn classify_object_lock(
     // Object retention: GET/PUT /{bucket}/{key}?retention (allow x-id)
     if bucket.is_some() && key.is_some() && query.has("retention") {
         return match method {
-            "GET" if query.validate_xid("GetObjectRetention") => Some(ObjectLockOp::GetObjectRetention),
-            "PUT" if query.validate_xid("PutObjectRetention") => Some(ObjectLockOp::PutObjectRetention),
+            "GET" if query.validate_xid("GetObjectRetention") => {
+                Some(ObjectLockOp::GetObjectRetention)
+            }
+            "PUT" if query.validate_xid("PutObjectRetention") => {
+                Some(ObjectLockOp::PutObjectRetention)
+            }
             _ => Some(ObjectLockOp::Unknown),
         };
     }
@@ -606,8 +576,12 @@ fn classify_object_lock(
     // Object legal hold: GET/PUT /{bucket}/{key}?legal-hold (allow x-id)
     if bucket.is_some() && key.is_some() && query.has("legal-hold") {
         return match method {
-            "GET" if query.validate_xid("GetObjectLegalHold") => Some(ObjectLockOp::GetObjectLegalHold),
-            "PUT" if query.validate_xid("PutObjectLegalHold") => Some(ObjectLockOp::PutObjectLegalHold),
+            "GET" if query.validate_xid("GetObjectLegalHold") => {
+                Some(ObjectLockOp::GetObjectLegalHold)
+            }
+            "PUT" if query.validate_xid("PutObjectLegalHold") => {
+                Some(ObjectLockOp::PutObjectLegalHold)
+            }
             _ => Some(ObjectLockOp::Unknown),
         };
     }
@@ -646,16 +620,16 @@ fn parse_bucket_key_path_style(path: &str) -> (Option<String>, Option<String>) {
 /// Detect request style and parse bucket/key accordingly
 /// Returns (bucket, key, is_virtual_hosted_style)
 fn parse_bucket_key_auto(
-    method: &str, 
-    uri: &Uri, 
+    method: &str,
+    uri: &Uri,
     headers: Option<&HeaderMap>,
-    virtual_hosted_suffixes: &[String]
+    virtual_hosted_suffixes: &[String],
 ) -> (Option<String>, Option<String>, bool) {
     // Virtual-hosted-style detection:
     // - Host header format: bucket.suffix (where suffix is in virtual_hosted_suffixes)
     // - Path contains only the key (no bucket)
     // - Not applicable for ListBuckets (GET /)
-    
+
     if method == "GET" && uri.path() == "/" {
         // ListBuckets always uses path-style (no bucket in path)
         return (None, None, false);
@@ -665,7 +639,7 @@ fn parse_bucket_key_auto(
     if let Some(host) = headers.and_then(|h| h.get("host").and_then(|v| v.to_str().ok())) {
         // Remove port number if present (e.g., "bucket.suffix:9000" -> "bucket.suffix")
         let host_without_port = host.split(':').next().unwrap_or(host);
-        
+
         // Check if host ends with any of the configured suffixes
         for suffix in virtual_hosted_suffixes {
             if host_without_port.ends_with(suffix) {
@@ -673,7 +647,7 @@ fn parse_bucket_key_auto(
                 let prefix = host_without_port.trim_end_matches(suffix);
                 // Remove the trailing dot if present
                 let prefix = prefix.trim_end_matches('.');
-                
+
                 // If there's exactly one component before the suffix, it's likely a bucket name
                 if !prefix.is_empty() {
                     // This is virtual-hosted-style: bucket in host, key in path
@@ -693,4 +667,3 @@ fn parse_bucket_key_auto(
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     (bucket, key, false)
 }
-

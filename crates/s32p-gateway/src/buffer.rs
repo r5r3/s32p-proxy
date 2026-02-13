@@ -1,6 +1,7 @@
+use std::sync::Arc;
+
 use aligned_buffer::UniqueAlignedBuffer;
 use crossbeam_queue::ArrayQueue;
-use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Fixed alignment for now (good default for O_DIRECT)
@@ -12,10 +13,10 @@ pub type ABuf = UniqueAlignedBuffer<ALIGN>;
 /// A global pool of fixed-size aligned buffers (bounded).
 pub struct BufPool {
     chunk_size: usize,
-    q: Arc<ArrayQueue<ABuf>>,
+    q:          Arc<ArrayQueue<ABuf>>,
     // One permit per buffer that exists in the pool.
     // acquire() blocks when there are no buffers available.
-    sem: Arc<Semaphore>,
+    sem:        Arc<Semaphore>,
 }
 
 impl BufPool {
@@ -42,12 +43,7 @@ impl BufPool {
     pub async fn acquire(self: &Arc<Self>) -> Result<PooledBuf, tokio::sync::AcquireError> {
         let global = self.sem.clone().acquire_owned().await?;
         let b = self.q.pop().expect("permit acquired but no buffer in queue");
-        Ok(PooledBuf {
-            pool: self.clone(),
-            buf: Some(b),
-            _global: global,
-            _stream: None,
-        })
+        Ok(PooledBuf { pool: self.clone(), buf: Some(b), _global: global, _stream: None })
     }
 
     /// Acquire one buffer but also attach a per-stream inflight permit.
@@ -73,7 +69,7 @@ impl BufPool {
 /// Also holds global + (optional) per-stream inflight permits.
 pub struct PooledBuf {
     pool: Arc<BufPool>,
-    buf: Option<ABuf>,
+    buf:  Option<ABuf>,
 
     // One permit per global buffer in use
     _global: OwnedSemaphorePermit,
@@ -107,8 +103,8 @@ impl Drop for PooledBuf {
 /// Owner type used for zero-copy `Bytes::from_owner(...)`.
 pub struct SliceOwner {
     pooled: PooledBuf,
-    start: usize,
-    end: usize,
+    start:  usize,
+    end:    usize,
 }
 
 impl SliceOwner {
@@ -123,4 +119,3 @@ impl AsRef<[u8]> for SliceOwner {
         &self.pooled.as_bytes()[self.start..self.end]
     }
 }
-

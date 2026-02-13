@@ -1,12 +1,17 @@
-use anyhow::{anyhow, Result};
-use std::ffi::CString;
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::{
+    ffi::CString,
+    fs::{File, OpenOptions},
+    io,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::OpenOptionsExt,
+        io::{AsRawFd, RawFd},
+    },
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Result, anyhow};
 
 /// Align `x` down to multiple of `a` (a > 0).
 #[inline]
@@ -72,7 +77,11 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     {
         let src_bytes = src.as_os_str().as_bytes();
         let dst_bytes = dst.as_os_str().as_bytes();
-        if src_bytes.is_empty() || src_bytes.contains(&0) || dst_bytes.is_empty() || dst_bytes.contains(&0) {
+        if src_bytes.is_empty()
+            || src_bytes.contains(&0)
+            || dst_bytes.is_empty()
+            || dst_bytes.contains(&0)
+        {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL/empty path"));
         }
 
@@ -104,10 +113,7 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
                 // Kernel/libc doesn't support renameat2(RENAME_NOREPLACE).
                 // Best-effort fallback (not race-free).
                 if dst.exists() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "destination exists",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
                 }
                 return std::fs::rename(src, dst);
             }
@@ -118,10 +124,7 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         if dst.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination exists",
-            ));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
         }
         std::fs::rename(src, dst)
     }
@@ -153,11 +156,11 @@ pub enum OpenDirect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LustreStriping {
     /// Stripe size in bytes.
-    pub stripe_size: u64,
+    pub stripe_size:    u64,
     /// Stripe count (number of OSTs). Must be >= 1.
-    pub stripe_count: i32,
+    pub stripe_count:   i32,
     /// Stripe offset (starting OST index). Use -1 for default.
-    pub stripe_offset: i32,
+    pub stripe_offset:  i32,
     /// Stripe pattern. Use 0 (LOV_PATTERN_RAID0) for normal striping.
     pub stripe_pattern: u32,
 }
@@ -253,7 +256,7 @@ pub fn open_file(
                             return Err(anyhow!(
                                 "remove_file {} failed before llapi_file_create: {e}",
                                 path.display()
-                            ))
+                            ));
                         }
                     }
                 }
@@ -283,20 +286,17 @@ pub fn open_file(
     }
 
     match direct {
-        OpenDirect::Buffered => Ok((
-            open_file_io(path, mode, false).map_err(anyhow::Error::from)?,
-            false,
-        )),
-        OpenDirect::Direct => Ok((
-            open_file_io(path, mode, true).map_err(anyhow::Error::from)?,
-            true,
-        )),
+        OpenDirect::Buffered => {
+            Ok((open_file_io(path, mode, false).map_err(anyhow::Error::from)?, false))
+        }
+        OpenDirect::Direct => {
+            Ok((open_file_io(path, mode, true).map_err(anyhow::Error::from)?, true))
+        }
         OpenDirect::TryDirect => match open_file_io(path, mode, true) {
             Ok(f) => Ok((f, true)),
-            Err(e) if is_direct_io_not_supported(&e) => Ok((
-                open_file_io(path, mode, false).map_err(anyhow::Error::from)?,
-                false,
-            )),
+            Err(e) if is_direct_io_not_supported(&e) => {
+                Ok((open_file_io(path, mode, false).map_err(anyhow::Error::from)?, false))
+            }
             Err(e) => Err(anyhow!(e)),
         },
     }
@@ -309,11 +309,7 @@ pub fn open_file(
 pub fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
     let rc = unsafe { libc::ftruncate(fd, len as libc::off_t) };
     if rc != 0 {
-        return Err(anyhow!(
-            "ftruncate({}) failed: {}",
-            len,
-            std::io::Error::last_os_error()
-        ));
+        return Err(anyhow!("ftruncate({}) failed: {}", len, std::io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -328,9 +324,9 @@ pub fn try_preallocate_range(fd: RawFd, start: u64, len: u64) -> Result<()> {
         return Ok(());
     }
 
-    let end = start.checked_add(len).ok_or_else(|| {
-        anyhow!("preallocate range overflow: start={start} len={len}")
-    })?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("preallocate range overflow: start={start} len={len}"))?;
 
     let rc = unsafe { libc::fallocate(fd, 0, start as libc::off_t, len as libc::off_t) };
     if rc == 0 {
@@ -355,9 +351,9 @@ pub fn try_preallocate_range(fd: RawFd, start: u64, len: u64) -> Result<()> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct StatxInfo {
-    pub ino: u64,
-    pub size: u64,
-    pub uid: u32,
+    pub ino:   u64,
+    pub size:  u64,
+    pub uid:   u32,
     pub mtime: SystemTime,
 }
 
@@ -379,8 +375,7 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
 
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
     let mask: libc::c_uint =
-        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID)
-            as libc::c_uint;
+        (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
 
     let rc = unsafe {
         libc::statx(
@@ -395,8 +390,7 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
         return None;
     }
 
-    let mtime =
-        system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
+    let mtime = system_time_from_unix(stx.stx_mtime.tv_sec as i64, stx.stx_mtime.tv_nsec as u32);
 
     Some(StatxInfo {
         ino: stx.stx_ino as u64,
@@ -405,4 +399,3 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
         mtime,
     })
 }
-

@@ -1,18 +1,23 @@
-use crate::directory::layout::{DirectoryLayout, IndexDoc};
-use crate::directory::posix_groups::groups_for_user;
-use crate::directory::{AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc};
-use crate::openbao_client::OpenBaoClient;
+use std::collections::HashSet;
+
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use s32p_support::utils::trim_slashes;
 
-use anyhow::{anyhow, Result};
-use async_trait::async_trait;
-use std::collections::HashSet;
+use crate::{
+    directory::{
+        AccessLevel, BucketDoc, BucketView, Directory, Principal, UserDoc,
+        layout::{DirectoryLayout, IndexDoc},
+        posix_groups::groups_for_user,
+    },
+    openbao_client::OpenBaoClient,
+};
 
 #[derive(Clone)]
 pub struct OpenBaoDirectory {
     kv_mount: String,
-    layout: DirectoryLayout,
-    client: OpenBaoClient,
+    layout:   DirectoryLayout,
+    client:   OpenBaoClient,
 }
 
 impl OpenBaoDirectory {
@@ -26,8 +31,8 @@ impl OpenBaoDirectory {
     ) -> Self {
         Self {
             kv_mount: trim_slashes(&kv_mount),
-            layout: DirectoryLayout::new(prefix),
-            client: OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
+            layout:   DirectoryLayout::new(prefix),
+            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
         }
     }
 
@@ -130,6 +135,3 @@ impl Directory for OpenBaoDirectory {
         Ok(out)
     }
 }
-
-
-

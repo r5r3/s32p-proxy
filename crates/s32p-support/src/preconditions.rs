@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Result};
-use http::HeaderMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, anyhow};
+use http::HeaderMap;
 
 fn trunc_to_seconds(t: SystemTime) -> SystemTime {
     match t.duration_since(UNIX_EPOCH) {
@@ -11,27 +12,27 @@ fn trunc_to_seconds(t: SystemTime) -> SystemTime {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConditionalHeaders {
-    pub if_match: Option<crate::utils::ETagCondition>,
-    pub if_none_match: Option<crate::utils::ETagCondition>,
-    pub if_modified_since: Option<SystemTime>,
+    pub if_match:            Option<crate::utils::ETagCondition>,
+    pub if_none_match:       Option<crate::utils::ETagCondition>,
+    pub if_modified_since:   Option<SystemTime>,
     pub if_unmodified_since: Option<SystemTime>,
 
     // CopyObject source preconditions
-    pub copy_source_if_match: Option<crate::utils::ETagCondition>,
-    pub copy_source_if_none_match: Option<crate::utils::ETagCondition>,
-    pub copy_source_if_modified_since: Option<SystemTime>,
+    pub copy_source_if_match:            Option<crate::utils::ETagCondition>,
+    pub copy_source_if_none_match:       Option<crate::utils::ETagCondition>,
+    pub copy_source_if_modified_since:   Option<SystemTime>,
     pub copy_source_if_unmodified_since: Option<SystemTime>,
 
     // DeleteObject "directory bucket" extras (safe to parse even if you don't enforce everywhere)
-    pub amz_if_match_size: Option<u64>,
+    pub amz_if_match_size:               Option<u64>,
     pub amz_if_match_last_modified_time: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreconditionOutcome {
     Proceed,
-    NotModified,         // for GET/HEAD
-    PreconditionFailed,  // 412
+    NotModified,        // for GET/HEAD
+    PreconditionFailed, // 412
 }
 
 /// Parse/validate conditional headers.
@@ -41,13 +42,14 @@ pub enum PreconditionOutcome {
 /// - ETag headers must contain "*" or at least one token
 /// - Date headers must parse as HTTP-date
 pub fn parse_conditional_headers(headers: &HeaderMap) -> Result<ConditionalHeaders> {
-    fn header_to_str<'a>(headers: &'a HeaderMap, name: &http::header::HeaderName) -> Result<Option<&'a str>> {
+    fn header_to_str<'a>(
+        headers: &'a HeaderMap,
+        name: &http::header::HeaderName,
+    ) -> Result<Option<&'a str>> {
         match headers.get(name) {
             None => Ok(None),
             Some(v) => {
-                let s = v
-                    .to_str()
-                    .map_err(|_| anyhow!("header {} is not valid ASCII", name))?;
+                let s = v.to_str().map_err(|_| anyhow!("header {} is not valid ASCII", name))?;
                 let s = s.trim();
                 if s.is_empty() {
                     return Err(anyhow!("empty header value for {}", name));
@@ -79,8 +81,10 @@ pub fn parse_conditional_headers(headers: &HeaderMap) -> Result<ConditionalHeade
     };
 
     // CopyObject source conditionals
-    let h_copy_if_match: http::header::HeaderName = http::header::HeaderName::from_static("x-amz-copy-source-if-match");
-    let h_copy_if_none_match: http::header::HeaderName = http::header::HeaderName::from_static("x-amz-copy-source-if-none-match");
+    let h_copy_if_match: http::header::HeaderName =
+        http::header::HeaderName::from_static("x-amz-copy-source-if-match");
+    let h_copy_if_none_match: http::header::HeaderName =
+        http::header::HeaderName::from_static("x-amz-copy-source-if-none-match");
     let h_copy_if_modified_since: http::header::HeaderName =
         http::header::HeaderName::from_static("x-amz-copy-source-if-modified-since");
     let h_copy_if_unmodified_since: http::header::HeaderName =
@@ -101,14 +105,17 @@ pub fn parse_conditional_headers(headers: &HeaderMap) -> Result<ConditionalHeade
         None => None,
     };
 
-    let copy_source_if_unmodified_since = match header_to_str(headers, &h_copy_if_unmodified_since)? {
+    let copy_source_if_unmodified_since = match header_to_str(headers, &h_copy_if_unmodified_since)?
+    {
         Some(v) => Some(crate::utils::parse_http_date(v)?),
         None => None,
     };
 
     // DeleteObject extras
-    let h_if_match_size: http::header::HeaderName = http::header::HeaderName::from_static("x-amz-if-match-size");
-    let h_if_match_lmt: http::header::HeaderName = http::header::HeaderName::from_static("x-amz-if-match-last-modified-time");
+    let h_if_match_size: http::header::HeaderName =
+        http::header::HeaderName::from_static("x-amz-if-match-size");
+    let h_if_match_lmt: http::header::HeaderName =
+        http::header::HeaderName::from_static("x-amz-if-match-last-modified-time");
 
     let amz_if_match_size = match header_to_str(headers, &h_if_match_size)? {
         Some(v) => Some(crate::utils::parse_u64_strict(v, "x-amz-if-match-size")?),
@@ -143,7 +150,7 @@ pub fn evaluate_read_preconditions(
     last_modified: SystemTime,
 ) -> PreconditionOutcome {
     // Order loosely follows RFC 7232 precedence: If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since.
-    
+
     let last_modified = trunc_to_seconds(last_modified);
 
     if let Some(ifm) = &cond.if_match {
@@ -190,16 +197,18 @@ pub fn evaluate_write_preconditions(
 
     if let Some(ifm) = &cond.if_match {
         match existing {
-            Some((etag, _lm)) if ifm.matches(etag) => {},
+            Some((etag, _lm)) if ifm.matches(etag) => {}
             _ => return PreconditionOutcome::PreconditionFailed,
         }
     }
 
     if let Some(inm) = &cond.if_none_match {
         match existing {
-            Some((etag, _lm)) if inm.matches(etag) => return PreconditionOutcome::PreconditionFailed,
+            Some((etag, _lm)) if inm.matches(etag) => {
+                return PreconditionOutcome::PreconditionFailed;
+            }
             Some((_etag, _lm)) => {} // does not match => ok
-            None => {}              // no existing => ok
+            None => {}               // no existing => ok
         }
     }
 

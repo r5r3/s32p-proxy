@@ -1,37 +1,39 @@
-use anyhow::{anyhow, Result};
-use bytes::{Bytes, Buf};
-use futures_util::Stream;
-use futures_util::stream::{FuturesOrdered, StreamExt, TryStreamExt};
-use http_body_util::{StreamBody, BodyExt};
-use hyper::body::{Body, Incoming, Frame};
-use std::convert::Infallible;
-use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio::io;
-use tokio::sync::{mpsc, Semaphore};
-
-use crate::buffer::{BufPool, PooledBuf, SliceOwner, ALIGN};
-use crate::uring_io::{UringIO, UringFileSender};
-use crate::fs_helpers::{
-    align_down,
-    align_up,
-    ftruncate_file,
-    open_file,
-    OpenMode,
-    OpenDirect,
-    LustreStriping,
-    try_preallocate_range,
+use std::{
+    convert::Infallible,
+    os::unix::{fs::FileExt, io::AsRawFd},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
+
+use anyhow::{Result, anyhow};
+use bytes::{Buf, Bytes};
+use futures_util::{
+    Stream,
+    stream::{FuturesOrdered, StreamExt, TryStreamExt},
+};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::{Body, Frame, Incoming};
 use s32p_support::utils::ByteRange;
+use tokio::{
+    io,
+    sync::{Semaphore, mpsc},
+};
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::{
+    buffer::{ALIGN, BufPool, PooledBuf, SliceOwner},
+    fs_helpers::{
+        LustreStriping, OpenDirect, OpenMode, align_down, align_up, ftruncate_file, open_file,
+        try_preallocate_range,
+    },
+    uring_io::{UringFileSender, UringIO},
+};
 
 #[derive(Clone)]
 pub struct StreamCfg {
     pub chunk_size: usize,
-    pub inflight: usize,
-    pub direct_io: bool,
+    pub inflight:   usize,
+    pub direct_io:  bool,
 }
 
 /// Stream a range from file as a Hyper body using the shared UringIO.
@@ -79,7 +81,10 @@ async fn stream_range_task(
 
     let mut direct = cfg.direct_io;
     if direct && (chunk % ALIGN != 0) {
-        tracing::warn!(chunk, "direct_io enabled but chunk not aligned; disabling direct_io for this request");
+        tracing::warn!(
+            chunk,
+            "direct_io enabled but chunk not aligned; disabling direct_io for this request"
+        );
         direct = false;
     }
 
@@ -97,11 +102,7 @@ async fn stream_range_task(
     let aligned_size = align_down(file_size, a);
 
     // If direct, cap streaming end to aligned_size (NOT align_up(file_size)).
-    let direct_end = if direct {
-        std::cmp::min(seg_end, aligned_size)
-    } else {
-        seg_end
-    };
+    let direct_end = if direct { std::cmp::min(seg_end, aligned_size) } else { seg_end };
 
     // If there is nothing to do in the direct segment, skip it.
     if direct_end > seg_start {
@@ -114,7 +115,8 @@ async fn stream_range_task(
         let allowed = std::cmp::min(inflight_cfg, needed);
         let stream_sem = Arc::new(Semaphore::new(allowed.max(1) + out.capacity().max(allowed)));
 
-        let (std_file, _used_direct) = open_file(&path, OpenMode::Read, OpenDirect::Buffered, None)?;
+        let (std_file, _used_direct) =
+            open_file(&path, OpenMode::Read, OpenDirect::Buffered, None)?;
         let file = Arc::new(std_file);
         let sender = uring.sender(file.clone());
 
@@ -122,7 +124,7 @@ async fn stream_range_task(
             &sender,
             file_size,
             seg_start,
-            direct_end,       // <-- capped
+            direct_end, // <-- capped
             want.start,
             want.end_excl,
             chunk,
@@ -151,12 +153,7 @@ async fn stream_range_task(
     Ok(())
 }
 
-async fn read_tail_bytes(
-    path: &Path,
-    pool: Arc<BufPool>,
-    off: u64,
-    len: usize,
-) -> Result<Bytes> {
+async fn read_tail_bytes(path: &Path, pool: Arc<BufPool>, off: u64, len: usize) -> Result<Bytes> {
     if len == 0 {
         return Ok(Bytes::new());
     }
@@ -164,10 +161,7 @@ async fn read_tail_bytes(
     let (f, _used_direct) = open_file(path, OpenMode::Read, OpenDirect::Buffered, None)?;
     let file = Arc::new(f);
 
-    let pooled = pool
-        .acquire()
-        .await
-        .map_err(|_| anyhow!("buffer pool closed"))?;
+    let pooled = pool.acquire().await.map_err(|_| anyhow!("buffer pool closed"))?;
 
     let (n, pooled) = tokio::task::spawn_blocking(move || -> Result<(usize, PooledBuf)> {
         let mut pooled = pooled;
@@ -294,7 +288,6 @@ async fn stream_segment(
     #[cfg(feature = "lustre")]
     advise_section(seg_start);
 
-
     // When we begin reading a section (i.e., submit its first read),
     // advise the *next* section (one section ahead).
     #[cfg(feature = "lustre")]
@@ -339,7 +332,9 @@ async fn stream_segment(
     }
 
     while let Some(res) = futs.next().await {
-        let Some(bytes) = res? else { break; };
+        let Some(bytes) = res? else {
+            break;
+        };
 
         // Send CURRENT bytes
         if !bytes.is_empty() {
@@ -352,7 +347,7 @@ async fn stream_segment(
         if next_off < effective_end {
             #[cfg(feature = "lustre")]
             maybe_advise_next_section(next_off);
-            
+
             let len = submit_len(next_off);
 
             let pooled = pool
@@ -376,8 +371,8 @@ async fn stream_segment(
 
 struct PlainFrameReader<S> {
     stream: S,
-    buf: Bytes,
-    done: bool,
+    buf:    Bytes,
+    done:   bool,
 }
 
 impl<S> PlainFrameReader<S>
@@ -406,7 +401,10 @@ where
         while !dst.is_empty() {
             self.refill().await?;
             if self.done && self.buf.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body shorter than expected"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "body shorter than expected",
+                ));
             }
 
             let n = dst.len().min(self.buf.len());
@@ -421,7 +419,10 @@ where
         while let Some(item) = self.stream.next().await {
             let b = item?;
             if !b.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "body longer than expected"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "body longer than expected",
+                ));
             }
         }
         Ok(())
@@ -429,20 +430,27 @@ where
 }
 
 pub mod aws_chunked {
-    use super::*;
     use futures_util::Stream;
 
+    use super::*;
+
     #[derive(Debug, Clone, Copy)]
-    enum State { NeedHeader, NeedData, NeedCrlf, NeedTrailers, Done }
+    enum State {
+        NeedHeader,
+        NeedData,
+        NeedCrlf,
+        NeedTrailers,
+        Done,
+    }
 
     pub struct Decoder<S> {
-        stream: S,
-        buf: Bytes,
-        pending: Bytes,
-        scratch: Vec<u8>,
-        state: State,
+        stream:             S,
+        buf:                Bytes,
+        pending:            Bytes,
+        scratch:            Vec<u8>,
+        state:              State,
         remaining_in_chunk: usize,
-        eof: bool,
+        eof:                bool,
     }
 
     impl<S> Decoder<S>
@@ -506,14 +514,21 @@ pub mod aws_chunked {
 
             let hex_part = line.split(|&c| c == b';').next().unwrap_or(&[]);
             if hex_part.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: empty chunk size"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "aws-chunked: empty chunk size",
+                ));
             }
 
-            let s = std::str::from_utf8(hex_part)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: non-utf8 size"))?;
+            let s = std::str::from_utf8(hex_part).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: non-utf8 size")
+            })?;
 
             usize::from_str_radix(s, 16).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("aws-chunked: invalid hex chunk size: {s}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("aws-chunked: invalid hex chunk size: {s}"),
+                )
             })
         }
 
@@ -529,7 +544,10 @@ pub mod aws_chunked {
 
                 let take = need.len().min(self.buf.len());
                 if &self.buf[..take] != &need[..take] {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "aws-chunked: missing/invalid CRLF"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aws-chunked: missing/invalid CRLF",
+                    ));
                 }
 
                 self.buf.advance(take);
@@ -571,7 +589,10 @@ pub mod aws_chunked {
 
                         self.refill().await?;
                         if self.eof && self.buf.is_empty() {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "aws-chunked: unexpected EOF in chunk data"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "aws-chunked: unexpected EOF in chunk data",
+                            ));
                         }
 
                         let take = self.remaining_in_chunk.min(self.buf.len());
@@ -608,9 +629,16 @@ pub mod aws_chunked {
                 }
 
                 match self.next_payload_raw().await? {
-                    None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "aws-chunked: decoded payload shorter than expected")),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "aws-chunked: decoded payload shorter than expected",
+                        ));
+                    }
                     Some(b) => {
-                        if b.is_empty() { continue; }
+                        if b.is_empty() {
+                            continue;
+                        }
                         let n = dst.len().min(b.len());
                         dst[..n].copy_from_slice(&b[..n]);
                         dst = &mut dst[n..];
@@ -688,7 +716,9 @@ pub async fn write_object_body(
     // Decide direct I/O (final decision used for scheduling/padding behavior).
     let mut direct = match &dest {
         WriteObjectDest::Path { .. } => cfg.direct_io && logical_len > chunk as u64,
-        WriteObjectDest::File { start_off, .. } => direct_io_ok_for_aligned_range(*start_off, logical_len, &cfg),
+        WriteObjectDest::File { start_off, .. } => {
+            direct_io_ok_for_aligned_range(*start_off, logical_len, &cfg)
+        }
     };
 
     if direct && (chunk % ALIGN != 0) {
@@ -748,9 +778,9 @@ pub async fn write_object_body(
     let cancel = sender.cancel_token().clone();
 
     // Source stream (plain or AWS-chunked SigV4 streaming)
-    let data_stream = body.into_data_stream().map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("body read error: {e}"))
-    });
+    let data_stream = body
+        .into_data_stream()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("body read error: {e}")));
 
     enum Src<S> {
         Plain(PlainFrameReader<S>),
@@ -792,11 +822,7 @@ pub async fn write_object_body(
         // For new-file + O_DIRECT we may need to pad the final (short) chunk.
         // For existing-file writes we MUST NOT pad (would corrupt layout).
         let write_len = if direct && truncate_to_logical {
-            if real_len == chunk {
-                chunk
-            } else {
-                align_up(real_len as u64, a) as usize
-            }
+            if real_len == chunk { chunk } else { align_up(real_len as u64, a) as usize }
         } else {
             // No padding path (includes multipart / existing-file writes).
             if direct {
@@ -836,9 +862,9 @@ pub async fn write_object_body(
         if tx_dead || cancel.is_cancelled() {
             drop(pooled);
         } else {
-            let dst_off = start_off
-                .checked_add(off_in_obj)
-                .ok_or_else(|| anyhow!("write offset overflow: start_off={start_off} off={off_in_obj}"))?;
+            let dst_off = start_off.checked_add(off_in_obj).ok_or_else(|| {
+                anyhow!("write offset overflow: start_off={start_off} off={off_in_obj}")
+            })?;
 
             tokio::select! {
                 r = sender.write(dst_off, write_len, pooled) => {
@@ -1101,4 +1127,3 @@ pub async fn copy_file_to_file(
     ftruncate_file(&dst_file, file_size)?;
     Ok(())
 }
-

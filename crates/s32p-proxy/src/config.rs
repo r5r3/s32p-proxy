@@ -1,12 +1,13 @@
-use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::Path};
+
+use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub version: u32,
-    pub server: ServerConfig,
-    pub auth: AuthConfig,
+    pub server:  ServerConfig,
+    pub auth:    AuthConfig,
     pub workers: WorkersConfig,
     pub routing: RoutingConfig,
 }
@@ -14,17 +15,17 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// e.g. "0.0.0.0:9000"
-    pub listen: String,
+    pub listen:                  String,
     /// "http" in dev, "https" behind TLS termination
-    pub public_scheme: String,
+    pub public_scheme:           String,
     /// Path to TLS certificate (full chain)
-    pub tls_cert_path: Option<String>,
+    pub tls_cert_path:           Option<String>,
     /// Path to TLS private key (in PEM format)
-    pub tls_key_path: Option<String>,
+    pub tls_key_path:            Option<String>,
     /// Bucket region returned by GetBucketLocation (e.g. "eu-central-1"). Use "us-east-1" for the classic default.
-    pub region: String,
+    pub region:                  String,
     /// e.g. "info", "debug", or "s32p_proxy=debug"
-    pub log_level: Option<String>,
+    pub log_level:               Option<String>,
     /// Host suffixes for virtual-hosted-style bucket detection.
     /// If a request's Host header ends with one of these suffixes and has exactly one additional component,
     /// it will be treated as virtual-hosted-style (bucket in host, key in path).
@@ -75,7 +76,7 @@ pub struct OpenBaoAuthConfig {
     pub approle_mount: String,
 
     /// Files containing role_id/secret_id (recommended over inline secrets in YAML)
-    pub role_id_file: String,
+    pub role_id_file:   String,
     pub secret_id_file: String,
 
     /// KV v2 mount name, e.g. "secret"
@@ -108,10 +109,7 @@ pub enum UpstreamKind {
 
 impl Default for UpstreamConfig {
     fn default() -> Self {
-        Self {
-            kind: UpstreamKind::Tcp,
-            uds_run_dir: None,
-        }
+        Self { kind: UpstreamKind::Tcp, uds_run_dir: None }
     }
 }
 
@@ -120,7 +118,7 @@ pub struct WorkersConfig {
     /// Shared POSIX root directory passed to the worker template ({{posix_root}})
     pub posix_root: String,
 
-    pub launcher: LauncherConfig,
+    pub launcher:  LauncherConfig,
     pub lifecycle: LifecycleConfig,
 
     /// Named worker templates
@@ -129,13 +127,13 @@ pub struct WorkersConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LauncherConfig {
-    pub path: String,
+    pub path:                   String,
     pub pass_user_flag_if_root: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LifecycleConfig {
-    pub idle_timeout_secs: u64,
+    pub idle_timeout_secs:   u64,
     pub sweep_interval_secs: u64,
 }
 
@@ -149,7 +147,7 @@ pub struct WorkerProfile {
 
     #[serde(default)]
     pub upstream: UpstreamConfig,
-    
+
     /// Environment variables for the worker process.
     /// Values may include placeholders like "{{access_key}}".
     #[serde(default)]
@@ -161,7 +159,6 @@ pub struct RoutingConfig {
     /// Maps classifier classes (e.g. "multipart", "versioning", "other")
     /// to an action.
     pub class_map: BTreeMap<String, RouteAction>,
-
     // Reserved for later:
     // #[serde(default)]
     // pub rules: Vec<RouteRule>,
@@ -193,10 +190,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 {
-            return Err(anyhow!(
-                "unsupported config version {} (expected 1)",
-                self.version
-            ));
+            return Err(anyhow!("unsupported config version {} (expected 1)", self.version));
         }
 
         if self.server.listen.trim().is_empty() {
@@ -208,16 +202,20 @@ impl Config {
             other => {
                 return Err(anyhow!(
                     "server.public_scheme must be 'http' or 'https' (got '{other}')"
-                ))
+                ));
             }
         }
 
         if self.server.public_scheme == "https" {
             if self.server.tls_cert_path.is_none() || self.server.tls_key_path.is_none() {
-                return Err(anyhow!("TLS certificate and key paths are required when public_scheme is 'https'"));
+                return Err(anyhow!(
+                    "TLS certificate and key paths are required when public_scheme is 'https'"
+                ));
             }
             // Verify files exist and are readable
-            if let (Some(cert_path), Some(key_path)) = (&self.server.tls_cert_path, &self.server.tls_key_path) {
+            if let (Some(cert_path), Some(key_path)) =
+                (&self.server.tls_cert_path, &self.server.tls_key_path)
+            {
                 if !Path::new(cert_path).exists() || !Path::new(key_path).exists() {
                     return Err(anyhow!("TLS certificate or key file does not exist"));
                 }
@@ -230,24 +228,38 @@ impl Config {
 
         match self.auth.backend {
             AuthBackend::Yaml => {
-                let y = self.auth.yaml.as_ref().ok_or_else(|| anyhow::anyhow!(
-                    "auth.backend is 'yaml' but auth.yaml is missing"
-                ))?;
+                let y = self.auth.yaml.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("auth.backend is 'yaml' but auth.yaml is missing")
+                })?;
                 if y.path.trim().is_empty() {
                     return Err(anyhow::anyhow!("auth.yaml.path must not be empty"));
                 }
             }
             AuthBackend::OpenBao => {
-                let o = self.auth.openbao.as_ref().ok_or_else(|| anyhow::anyhow!(
-                    "auth.backend is 'open_bao'/'openbao' but auth.openbao is missing"
-                ))?;
+                let o = self.auth.openbao.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "auth.backend is 'open_bao'/'openbao' but auth.openbao is missing"
+                    )
+                })?;
 
-                if o.address.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.address must not be empty")); }
-                if o.approle_mount.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.approle_mount must not be empty")); }
-                if o.role_id_file.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.role_id_file must not be empty")); }
-                if o.secret_id_file.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.secret_id_file must not be empty")); }
-                if o.kv_mount.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.kv_mount must not be empty")); }
-                if o.prefix.trim().is_empty() { return Err(anyhow::anyhow!("auth.openbao.prefix must not be empty")); }
+                if o.address.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.address must not be empty"));
+                }
+                if o.approle_mount.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.approle_mount must not be empty"));
+                }
+                if o.role_id_file.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.role_id_file must not be empty"));
+                }
+                if o.secret_id_file.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.secret_id_file must not be empty"));
+                }
+                if o.kv_mount.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.kv_mount must not be empty"));
+                }
+                if o.prefix.trim().is_empty() {
+                    return Err(anyhow::anyhow!("auth.openbao.prefix must not be empty"));
+                }
             }
         }
 
@@ -269,12 +281,14 @@ impl Config {
                 UpstreamKind::Uds => {
                     let dir = profile.upstream.uds_run_dir.as_deref().unwrap_or("").trim();
                     if dir.is_empty() {
-                        return Err(anyhow!("workers.profile.upstream.uds_run_dir must be set when kind=uds"));
+                        return Err(anyhow!(
+                            "workers.profile.upstream.uds_run_dir must be set when kind=uds"
+                        ));
                     }
                 }
             }
         }
-            
+
         // Validate routing targets exist
         for (class, action) in &self.routing.class_map {
             match action {
@@ -298,4 +312,3 @@ impl Config {
         Ok(())
     }
 }
-

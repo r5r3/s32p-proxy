@@ -32,4 +32,3 @@ pub fn percent_decode_path_segments_lossy(input: &str) -> String {
 
     out
 }
-

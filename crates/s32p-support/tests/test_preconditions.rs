@@ -1,10 +1,15 @@
 // Tests for S3 precondition evaluation functions
 
-use http::HeaderMap;
-use s32p_support::preconditions::{parse_conditional_headers, ConditionalHeaders};
-use s32p_support::utils::ETagCondition;
-use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, PreconditionOutcome};
 use std::time::UNIX_EPOCH;
+
+use http::HeaderMap;
+use s32p_support::{
+    preconditions::{
+        ConditionalHeaders, PreconditionOutcome, evaluate_copy_source_preconditions,
+        evaluate_read_preconditions, evaluate_write_preconditions, parse_conditional_headers,
+    },
+    utils::ETagCondition,
+};
 
 // ============ READ PRECONDITIONS (GET/HEAD) ============
 
@@ -72,11 +77,19 @@ fn test_read_preconditions_if_modified_since() {
     };
 
     // Should return NotModified if not modified since specified time
-    let result = evaluate_read_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50));
+    let result = evaluate_read_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(50),
+    );
     assert!(matches!(result, PreconditionOutcome::NotModified));
 
     // Should succeed if modified after specified time
-    let result = evaluate_read_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150));
+    let result = evaluate_read_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(150),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 }
 
@@ -96,11 +109,19 @@ fn test_read_preconditions_if_unmodified_since() {
     };
 
     // Should succeed if not modified after specified time
-    let result = evaluate_read_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50));
+    let result = evaluate_read_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(50),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 
     // Should fail if modified after specified time
-    let result = evaluate_read_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150));
+    let result = evaluate_read_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(150),
+    );
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 }
 
@@ -251,11 +272,17 @@ fn test_write_preconditions_if_unmodified_since() {
     assert!(matches!(result, PreconditionOutcome::Proceed));
 
     // Should succeed if not modified after specified time
-    let result = evaluate_write_preconditions(&cond, Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50))));
+    let result = evaluate_write_preconditions(
+        &cond,
+        Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50))),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 
     // Should fail if modified after specified time
-    let result = evaluate_write_preconditions(&cond, Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150))));
+    let result = evaluate_write_preconditions(
+        &cond,
+        Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150))),
+    );
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 }
 
@@ -279,11 +306,17 @@ fn test_write_preconditions_if_modified_since() {
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 
     // Should fail if not modified since specified time
-    let result = evaluate_write_preconditions(&cond, Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50))));
+    let result = evaluate_write_preconditions(
+        &cond,
+        Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50))),
+    );
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 
     // Should succeed if modified after specified time
-    let result = evaluate_write_preconditions(&cond, Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150))));
+    let result = evaluate_write_preconditions(
+        &cond,
+        Some(("any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150))),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 }
 
@@ -294,7 +327,7 @@ fn test_write_preconditions_no_conditions() {
     // Should succeed if object doesn't exist
     let result = evaluate_write_preconditions(&cond, None);
     assert!(matches!(result, PreconditionOutcome::Proceed));
-    
+
     // Should succeed if object exists
     let result = evaluate_write_preconditions(&cond, Some(("any-etag", UNIX_EPOCH)));
     assert!(matches!(result, PreconditionOutcome::Proceed));
@@ -367,11 +400,19 @@ fn test_copy_source_preconditions_time_based() {
     };
 
     // Should fail if modified after specified time
-    let result = evaluate_copy_source_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150));
+    let result = evaluate_copy_source_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(150),
+    );
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 
     // Should succeed if not modified after specified time
-    let result = evaluate_copy_source_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50));
+    let result = evaluate_copy_source_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(50),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 
     // Test If-Modified-Since
@@ -389,11 +430,19 @@ fn test_copy_source_preconditions_time_based() {
     };
 
     // Should fail if not modified since specified time
-    let result = evaluate_copy_source_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(50));
+    let result = evaluate_copy_source_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(50),
+    );
     assert!(matches!(result, PreconditionOutcome::PreconditionFailed));
 
     // Should succeed if modified after specified time
-    let result = evaluate_copy_source_preconditions(&cond, "any-etag", UNIX_EPOCH + std::time::Duration::from_secs(150));
+    let result = evaluate_copy_source_preconditions(
+        &cond,
+        "any-etag",
+        UNIX_EPOCH + std::time::Duration::from_secs(150),
+    );
     assert!(matches!(result, PreconditionOutcome::Proceed));
 }
 
@@ -464,8 +513,8 @@ fn test_parse_conditional_headers_standard() {
 #[test]
 fn test_parse_conditional_headers_wildcard() {
     let mut headers = HeaderMap::new();
-    headers.insert("if-match", "*" .parse().unwrap());
-    headers.insert("if-none-match", "*" .parse().unwrap());
+    headers.insert("if-match", "*".parse().unwrap());
+    headers.insert("if-none-match", "*".parse().unwrap());
 
     let result = parse_conditional_headers(&headers);
     assert!(result.is_ok());
@@ -479,14 +528,24 @@ fn test_parse_conditional_headers_copy_source() {
     let mut headers = HeaderMap::new();
     headers.insert("x-amz-copy-source-if-match", "\"etag1\"".parse().unwrap());
     headers.insert("x-amz-copy-source-if-none-match", "\"etag2\"".parse().unwrap());
-    headers.insert("x-amz-copy-source-if-modified-since", "Thu, 01 Jan 1970 00:00:01 GMT".parse().unwrap());
-    headers.insert("x-amz-copy-source-if-unmodified-since", "Thu, 01 Jan 1970 00:00:02 GMT".parse().unwrap());
+    headers.insert(
+        "x-amz-copy-source-if-modified-since",
+        "Thu, 01 Jan 1970 00:00:01 GMT".parse().unwrap(),
+    );
+    headers.insert(
+        "x-amz-copy-source-if-unmodified-since",
+        "Thu, 01 Jan 1970 00:00:02 GMT".parse().unwrap(),
+    );
 
     let result = parse_conditional_headers(&headers);
     assert!(result.is_ok());
     let cond = result.unwrap();
-    assert!(matches!(cond.copy_source_if_match, Some(ETagCondition::OneOf(ref v)) if v == &vec!["etag1"]));
-    assert!(matches!(cond.copy_source_if_none_match, Some(ETagCondition::OneOf(ref v)) if v == &vec!["etag2"]));
+    assert!(
+        matches!(cond.copy_source_if_match, Some(ETagCondition::OneOf(ref v)) if v == &vec!["etag1"])
+    );
+    assert!(
+        matches!(cond.copy_source_if_none_match, Some(ETagCondition::OneOf(ref v)) if v == &vec!["etag2"])
+    );
     assert!(cond.copy_source_if_modified_since.is_some());
     assert!(cond.copy_source_if_unmodified_since.is_some());
 }
@@ -495,7 +554,10 @@ fn test_parse_conditional_headers_copy_source() {
 fn test_parse_conditional_headers_amz_extras() {
     let mut headers = HeaderMap::new();
     headers.insert("x-amz-if-match-size", "1024".parse().unwrap());
-    headers.insert("x-amz-if-match-last-modified-time", "Thu, 01 Jan 1970 00:00:01 GMT".parse().unwrap());
+    headers.insert(
+        "x-amz-if-match-last-modified-time",
+        "Thu, 01 Jan 1970 00:00:01 GMT".parse().unwrap(),
+    );
 
     let result = parse_conditional_headers(&headers);
     assert!(result.is_ok());

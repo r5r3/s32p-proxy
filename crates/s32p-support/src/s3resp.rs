@@ -1,10 +1,13 @@
-use crate::s3xml;
+use std::convert::Infallible;
 
 use bytes::Bytes;
-use http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED};
-use http::{Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use std::convert::Infallible;
+use http::{
+    Response, StatusCode,
+    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED},
+};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
+
+use crate::s3xml;
 
 /// Body type we use for small/complete responses.
 /// Hyper can use `http::Response<impl http_body::Body>` directly, and `BoxBody` works everywhere.
@@ -30,10 +33,8 @@ pub fn response_bytes(
     let mut resp = Response::new(boxed_full(body));
     *resp.status_mut() = status;
 
-    resp.headers_mut()
-        .insert(CONTENT_TYPE, content_type.parse().unwrap());
-    resp.headers_mut()
-        .insert(CONTENT_LENGTH, len.to_string().parse().unwrap());
+    resp.headers_mut().insert(CONTENT_TYPE, content_type.parse().unwrap());
+    resp.headers_mut().insert(CONTENT_LENGTH, len.to_string().parse().unwrap());
 
     for (k, v) in headers {
         // All our generated header values are ASCII-ish; if parse fails, skip (best-effort).
@@ -59,13 +60,11 @@ pub fn s3_error(
     resource: Option<&str>,
     request_id: Option<&str>,
 ) -> HttpResponse {
-    let body = s3xml::s3_error_body(code, message, resource, request_id, None).unwrap_or_else(|_| {
-        format!(
-            "<Error><Code>{}</Code><Message>{}</Message></Error>",
-            code, message
-        )
-        .into_bytes()
-    });
+    let body =
+        s3xml::s3_error_body(code, message, resource, request_id, None).unwrap_or_else(|_| {
+            format!("<Error><Code>{}</Code><Message>{}</Message></Error>", code, message)
+                .into_bytes()
+        });
 
     let mut headers = Vec::new();
     if let Some(rid) = request_id {
@@ -84,19 +83,16 @@ pub fn not_modified(etag: Option<&str>, last_modified: Option<&str>) -> HttpResp
     *resp.status_mut() = StatusCode::NOT_MODIFIED;
 
     // Many clients are fine either way; setting 0 is safe and consistent.
-    resp.headers_mut()
-        .insert(CONTENT_LENGTH, "0".parse().unwrap());
+    resp.headers_mut().insert(CONTENT_LENGTH, "0".parse().unwrap());
 
     if let Some(etag) = etag {
         resp.headers_mut().insert(ETAG, etag.parse().unwrap());
     }
     if let Some(lm) = last_modified {
-        resp.headers_mut()
-            .insert(LAST_MODIFIED, lm.parse().unwrap());
+        resp.headers_mut().insert(LAST_MODIFIED, lm.parse().unwrap());
     }
 
-    resp.headers_mut()
-        .insert("server", "s32p-gateway".parse().unwrap());
+    resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
 
     resp
 }
@@ -114,24 +110,12 @@ pub fn not_implemented(message: &str, resource: Option<&str>) -> HttpResponse {
 
 /// Convenience: InvalidRequest (400).
 pub fn invalid_request(message: &str, resource: Option<&str>) -> HttpResponse {
-    s3_error(
-        StatusCode::BAD_REQUEST,
-        s3xml::error_code::INVALID_REQUEST,
-        message,
-        resource,
-        None,
-    )
+    s3_error(StatusCode::BAD_REQUEST, s3xml::error_code::INVALID_REQUEST, message, resource, None)
 }
 
 /// Convenience: AccessDenied (403).
 pub fn access_denied(message: &str, resource: Option<&str>) -> HttpResponse {
-    s3_error(
-        StatusCode::FORBIDDEN,
-        s3xml::error_code::ACCESS_DENIED,
-        message,
-        resource,
-        None,
-    )
+    s3_error(StatusCode::FORBIDDEN, s3xml::error_code::ACCESS_DENIED, message, resource, None)
 }
 
 /// Convenience: SignatureDoesNotMatch (403).
@@ -158,24 +142,12 @@ pub fn invalid_access_key_id(message: &str, resource: Option<&str>) -> HttpRespo
 
 /// Convenience: NoSuchBucket (404).
 pub fn no_such_bucket(message: &str, resource: Option<&str>) -> HttpResponse {
-    s3_error(
-        StatusCode::NOT_FOUND,
-        s3xml::error_code::NO_SUCH_BUCKET,
-        message,
-        resource,
-        None,
-    )
+    s3_error(StatusCode::NOT_FOUND, s3xml::error_code::NO_SUCH_BUCKET, message, resource, None)
 }
 
 /// Convenience: NoSuchKey (404).
 pub fn no_such_key(message: &str, resource: Option<&str>) -> HttpResponse {
-    s3_error(
-        StatusCode::NOT_FOUND,
-        s3xml::error_code::NO_SUCH_KEY,
-        message,
-        resource,
-        None,
-    )
+    s3_error(StatusCode::NOT_FOUND, s3xml::error_code::NO_SUCH_KEY, message, resource, None)
 }
 
 /// Convenience: PreconditionFailed (412).
@@ -201,7 +173,11 @@ pub fn invalid_range(message: &str, resource: Option<&str>) -> HttpResponse {
 }
 
 /// Convenience: InternalError (500).
-pub fn internal_error(message: &str, resource: Option<&str>, request_id: Option<&str>) -> HttpResponse {
+pub fn internal_error(
+    message: &str,
+    resource: Option<&str>,
+    request_id: Option<&str>,
+) -> HttpResponse {
     s3_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         s3xml::error_code::INTERNAL_ERROR,
@@ -212,7 +188,11 @@ pub fn internal_error(message: &str, resource: Option<&str>, request_id: Option<
 }
 
 /// Convenience: ServiceUnavailable (503).
-pub fn service_unavailable(message: &str, resource: Option<&str>, request_id: Option<&str>) -> HttpResponse {
+pub fn service_unavailable(
+    message: &str,
+    resource: Option<&str>,
+    request_id: Option<&str>,
+) -> HttpResponse {
     s3_error(
         StatusCode::SERVICE_UNAVAILABLE,
         s3xml::error_code::SERVICE_UNAVAILABLE,
@@ -223,7 +203,11 @@ pub fn service_unavailable(message: &str, resource: Option<&str>, request_id: Op
 }
 
 /// Convenience: ListBuckets success (200).
-pub fn list_buckets(owner_id: &str, owner_display_name: &str, buckets: &[s3xml::BucketInfo]) -> HttpResponse {
+pub fn list_buckets(
+    owner_id: &str,
+    owner_display_name: &str,
+    buckets: &[s3xml::BucketInfo],
+) -> HttpResponse {
     list_buckets_paginated(owner_id, owner_display_name, buckets, None, None)
 }
 
@@ -245,7 +229,9 @@ pub fn list_buckets_paginated(
         prefix,
         next_continuation_token,
     )
-    .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+    .unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
 
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
@@ -387,9 +373,8 @@ pub fn list_objects_v2(
 /// We return an ETag and keep the "server" header consistent with gateway responses.
 pub fn put_object_ok(etag: &str) -> HttpResponse {
     // Empty body, but still include Content-Length and Content-Type (many clients are picky).
-    let mut resp = response_bytes(StatusCode::OK, "application/xml", Vec::new(), [
-        ("etag", etag.to_string()),
-    ]);
+    let mut resp =
+        response_bytes(StatusCode::OK, "application/xml", Vec::new(), [("etag", etag.to_string())]);
 
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
@@ -402,9 +387,8 @@ pub fn copy_object_ok(etag: &str, last_modified: &str) -> HttpResponse {
         b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
     });
 
-    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, [
-        ("etag", etag.to_string()),
-    ]);
+    let mut resp =
+        response_bytes(StatusCode::OK, "application/xml", body, [("etag", etag.to_string())]);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
@@ -436,8 +420,10 @@ pub fn delete_objects_result(
  * ------------------------- */
 
 pub fn create_multipart_upload_ok(bucket: &str, key: &str, upload_id: &str) -> HttpResponse {
-    let body = s3xml::initiate_multipart_upload_result_body(bucket, key, upload_id)
-        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+    let body =
+        s3xml::initiate_multipart_upload_result_body(bucket, key, upload_id).unwrap_or_else(|_| {
+            b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+        });
 
     let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
@@ -445,38 +431,53 @@ pub fn create_multipart_upload_ok(bucket: &str, key: &str, upload_id: &str) -> H
 }
 
 pub fn upload_part_ok(etag: &str) -> HttpResponse {
-    let mut resp = response_bytes(StatusCode::OK, "application/xml", Vec::new(), [
-        ("etag", etag.to_string()),
-    ]);
+    let mut resp =
+        response_bytes(StatusCode::OK, "application/xml", Vec::new(), [("etag", etag.to_string())]);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
 
-pub fn list_multipart_uploads_ok(bucket: &str, uploads: &[s3xml::MultipartUploadInfo]) -> HttpResponse {
-    let body = s3xml::list_multipart_uploads_body(bucket, uploads)
-        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+pub fn list_multipart_uploads_ok(
+    bucket: &str,
+    uploads: &[s3xml::MultipartUploadInfo],
+) -> HttpResponse {
+    let body = s3xml::list_multipart_uploads_body(bucket, uploads).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
 
     let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
 
-pub fn list_parts_ok(bucket: &str, key: &str, upload_id: &str, parts: &[s3xml::MultipartPartInfo]) -> HttpResponse {
-    let body = s3xml::list_parts_body(bucket, key, upload_id, parts)
-        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+pub fn list_parts_ok(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[s3xml::MultipartPartInfo],
+) -> HttpResponse {
+    let body = s3xml::list_parts_body(bucket, key, upload_id, parts).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
 
     let mut resp = response_bytes(StatusCode::OK, "application/xml", body, []);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
 
-pub fn complete_multipart_upload_ok(location: &str, bucket: &str, key: &str, etag: &str) -> HttpResponse {
+pub fn complete_multipart_upload_ok(
+    location: &str,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> HttpResponse {
     let body = s3xml::complete_multipart_upload_result_body(location, bucket, key, etag)
-        .unwrap_or_else(|_| b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec());
+        .unwrap_or_else(|_| {
+            b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+        });
 
-    let mut resp = response_bytes(StatusCode::OK, "application/xml", body, [
-        ("etag", etag.to_string()),
-    ]);
+    let mut resp =
+        response_bytes(StatusCode::OK, "application/xml", body, [("etag", etag.to_string())]);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
@@ -486,5 +487,3 @@ pub fn abort_multipart_upload_no_content() -> HttpResponse {
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
 }
-
-

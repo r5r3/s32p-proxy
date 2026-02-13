@@ -4,61 +4,55 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod buffer;
+mod fs_helpers;
+mod multipart;
 pub mod streaming;
 mod uring_io;
-mod multipart;
-mod fs_helpers;
 
 #[cfg(feature = "lustre")]
 mod lustre;
 
-use anyhow::{anyhow, Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use std::{
+    convert::Infallible,
+    fs,
+    os::unix::fs::{FileExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
+
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use httpdate::fmt_http_date;
-use hyper::body::Incoming;
-use hyper::HeaderMap;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
+use hyper::{HeaderMap, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use s32p_support::{
+    self,
+    preconditions::{
+        PreconditionOutcome, evaluate_copy_source_preconditions, evaluate_read_preconditions,
+        evaluate_write_preconditions, parse_conditional_headers,
+    },
+    utils::{ByteRange, parse_range_header},
+};
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::net::{TcpListener, UnixListener};
-
-use crate::buffer::{BufPool, PooledBuf, SliceOwner};
-use crate::uring_io::UringIO;
-use crate::streaming::{
-    copy_file_to_file,
-    stream_range_body,
-    StreamCfg,
-    write_object_body,
-    WriteObjectDest,
-};
-use crate::fs_helpers::{
-    bucket_exists_dir,
-    bucket_root_path,
-    join_object_path,
-    open_file,
-    statx_info,
-    LustreStriping,
-    OpenMode,
-    OpenDirect,
-};
 
 #[cfg(feature = "lustre")]
 use crate::fs_helpers::stripe_count_for_size;
-use s32p_support;
-use s32p_support::utils::{ByteRange, parse_range_header};
-use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, parse_conditional_headers, PreconditionOutcome};
+use crate::{
+    buffer::{BufPool, PooledBuf, SliceOwner},
+    fs_helpers::{
+        LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path,
+        join_object_path, open_file, statx_info,
+    },
+    streaming::{
+        StreamCfg, WriteObjectDest, copy_file_to_file, stream_range_body, write_object_body,
+    },
+    uring_io::UringIO,
+};
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -66,19 +60,19 @@ type Resp = s32p_support::s3resp::HttpResponse;
 
 #[derive(Clone)]
 struct Cfg {
-    bind_addr: String,
-    bind_uds: Option<PathBuf>,
-    posix_root: PathBuf,
-    access_key: String,
-    secret_key: String,
-    public_scheme: String,
-    region: String,
-    chunk_size: usize,
-    inflight: usize,
-    pool_size: usize,
-    direct_io: bool,
-    copy_max_size: u64,
-    mpu_dir_name: String,
+    bind_addr:               String,
+    bind_uds:                Option<PathBuf>,
+    posix_root:              PathBuf,
+    access_key:              String,
+    secret_key:              String,
+    public_scheme:           String,
+    region:                  String,
+    chunk_size:              usize,
+    inflight:                usize,
+    pool_size:               usize,
+    direct_io:               bool,
+    copy_max_size:           u64,
+    mpu_dir_name:            String,
     #[cfg(feature = "lustre")]
     lustre_max_stripe_count: u32,
     virtual_hosted_suffixes: Vec<String>,
@@ -100,10 +94,12 @@ fn env_usize(k: &str, default: usize) -> usize {
 fn load_cfg() -> Result<Cfg> {
     let bind_addr = std::env::var("S32P_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_string());
     let bind_uds = std::env::var("S32P_BIND_UDS").ok().map(PathBuf::from);
-    let posix_root = PathBuf::from(std::env::var("S32P_POSIX_ROOT").context("S32P_POSIX_ROOT missing")?);
+    let posix_root =
+        PathBuf::from(std::env::var("S32P_POSIX_ROOT").context("S32P_POSIX_ROOT missing")?);
 
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID missing")?;
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY missing")?;
+    let secret_key =
+        std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY missing")?;
 
     let public_scheme = std::env::var("S32P_PUBLIC_SCHEME").unwrap_or_else(|_| "http".to_string());
     let region = std::env::var("S32P_REGION").unwrap_or_else(|_| "us-east-1".to_string());
@@ -128,7 +124,9 @@ fn load_cfg() -> Result<Cfg> {
         || mpu_dir_name.contains('/')
         || mpu_dir_name.contains('\\')
     {
-        return Err(anyhow!("invalid S32P_MPU_DIR={mpu_dir_name:?} (must be a single path component)"));
+        return Err(anyhow!(
+            "invalid S32P_MPU_DIR={mpu_dir_name:?} (must be a single path component)"
+        ));
     }
 
     // Maximum Lustre stripe count (only effective with --features lustre)
@@ -160,13 +158,12 @@ fn load_cfg() -> Result<Cfg> {
     })
 }
 
-
 // ---- request handler ----
 
 struct App {
-    cfg: Arc<Cfg>,
-    pool: Arc<BufPool>,
-    uring: Arc<UringIO>,
+    cfg:                     Arc<Cfg>,
+    pool:                    Arc<BufPool>,
+    uring:                   Arc<UringIO>,
     virtual_hosted_suffixes: Vec<String>,
 }
 
@@ -183,7 +180,8 @@ fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
     if key_or_prefix == mpu_dir_name {
         return true;
     }
-    key_or_prefix.strip_prefix(mpu_dir_name)
+    key_or_prefix
+        .strip_prefix(mpu_dir_name)
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
@@ -193,10 +191,7 @@ async fn read_small(
     off: u64,
     len: usize,
 ) -> Result<Bytes> {
-    let pooled = pool
-        .acquire()
-        .await
-        .map_err(|_| anyhow!("buffer pool closed"))?;
+    let pooled = pool.acquire().await.map_err(|_| anyhow!("buffer pool closed"))?;
 
     let (n, pooled) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, PooledBuf)> {
         let mut pooled = pooled;
@@ -218,10 +213,10 @@ async fn read_small(
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
     let class = s32p_support::classifier::classify_with_headers(
-        req.method().as_str(), 
-        req.uri(), 
+        req.method().as_str(),
+        req.uri(),
         Some(req.headers()),
-        &app.virtual_hosted_suffixes
+        &app.virtual_hosted_suffixes,
     );
 
     // All actions require authentication
@@ -234,9 +229,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::ListBuckets) => {
             handle_list_buckets(req, app, &class).await
         }
-        s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::GetBucketLocation) => {
-            handle_get_bucket_location(req, app, &class).await
-        }
+        s32p_support::classifier::S3Op::Read(
+            s32p_support::classifier::ReadOp::GetBucketLocation,
+        ) => handle_get_bucket_location(req, app, &class).await,
         s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::HeadBucket) => {
             handle_head_bucket(req, app, &class).await
         }
@@ -296,10 +291,10 @@ fn has_effective_query(req: &Request<Incoming>) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListBucketsToken {
-    v: u8,
+    v:             u8,
     bucket_region: Option<String>,
-    prefix: Option<String>,
-    after: String,
+    prefix:        Option<String>,
+    after:         String,
 }
 
 fn encode_list_buckets_token(tok: &ListBucketsToken) -> Result<String> {
@@ -311,8 +306,8 @@ fn decode_list_buckets_token(s: &str) -> Result<ListBucketsToken> {
     let raw = URL_SAFE_NO_PAD
         .decode(s.as_bytes())
         .map_err(|e| anyhow!("bad continuation-token: {e}"))?;
-    let tok: ListBucketsToken = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow!("bad continuation-token json: {e}"))?;
+    let tok: ListBucketsToken =
+        serde_json::from_slice(&raw).map_err(|e| anyhow!("bad continuation-token json: {e}"))?;
     Ok(tok)
 }
 
@@ -516,10 +511,10 @@ async fn handle_list_buckets(
             page.truncate(ps);
 
             let tok = ListBucketsToken {
-                v: 1,
+                v:             1,
                 bucket_region: bucket_region_q.clone(),
-                prefix: prefix_q.clone(),
-                after: last_name,
+                prefix:        prefix_q.clone(),
+                after:         last_name,
             };
             match encode_list_buckets_token(&tok) {
                 Ok(s) => next_token_out = Some(s),
@@ -573,7 +568,9 @@ async fn handle_get_bucket_location(
 
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => s32p_support::s3resp::get_bucket_location(&cfg.region),
-        Ok(false) => s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Ok(false) => {
+            s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+        }
         Err(e) => s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     }
 }
@@ -597,7 +594,9 @@ async fn handle_head_bucket(
 
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => s32p_support::s3resp::head_bucket_ok(&cfg.region),
-        Ok(false) => s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
+        Ok(false) => {
+            s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+        }
         Err(e) => s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     }
 }
@@ -610,16 +609,28 @@ async fn handle_multipart(
     crate::multipart::handle(req, app, class).await
 }
 
-async fn handle_versioning(_req: Request<Incoming>, _app: Arc<App>, _class: &s32p_support::classifier::S3RequestClass) -> Resp {
+async fn handle_versioning(
+    _req: Request<Incoming>,
+    _app: Arc<App>,
+    _class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
     s32p_support::s3resp::not_implemented("versioning is not implemented", None)
 }
 
-async fn handle_other(_req: Request<Incoming>, _app: Arc<App>, _class: &s32p_support::classifier::S3RequestClass) -> Resp {
+async fn handle_other(
+    _req: Request<Incoming>,
+    _app: Arc<App>,
+    _class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
     // Preserve the previous general message
     s32p_support::s3resp::not_implemented("only GET/HEAD /{bucket}/{key} is implemented", None)
 }
 
-async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_support::classifier::S3RequestClass) -> Resp {
+async fn handle_get_object(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
     let cfg = app.cfg.clone();
 
     // Allow SigV4 presign query params; reject only effective (non-presign) query params.
@@ -643,8 +654,12 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
     // If the bucket is missing, S3 expects NoSuchBucket (not NoSuchKey).
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
@@ -653,27 +668,28 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
     };
 
     // open once (buffered) to stat + inode + size
-    let (std_file, _used_direct) = match open_file(&obj_path, OpenMode::Read, OpenDirect::Buffered, None) {
-        Ok(v) => v,
-        Err(e) => {
-            let ioe = e.downcast_ref::<std::io::Error>();
-            match ioe.map(|x| x.kind()) {
-                Some(std::io::ErrorKind::NotFound) => {
-                    return s32p_support::s3resp::no_such_key("not found", None)
-                }
-                Some(std::io::ErrorKind::PermissionDenied) => {
-                    return s32p_support::s3resp::access_denied("permission denied", None)
-                }
-                _ => {
-                    return s32p_support::s3resp::internal_error(
-                        &e.to_string(),
-                        Some(req.uri().path()),
-                        None,
-                    );
+    let (std_file, _used_direct) =
+        match open_file(&obj_path, OpenMode::Read, OpenDirect::Buffered, None) {
+            Ok(v) => v,
+            Err(e) => {
+                let ioe = e.downcast_ref::<std::io::Error>();
+                match ioe.map(|x| x.kind()) {
+                    Some(std::io::ErrorKind::NotFound) => {
+                        return s32p_support::s3resp::no_such_key("not found", None);
+                    }
+                    Some(std::io::ErrorKind::PermissionDenied) => {
+                        return s32p_support::s3resp::access_denied("permission denied", None);
+                    }
+                    _ => {
+                        return s32p_support::s3resp::internal_error(
+                            &e.to_string(),
+                            Some(req.uri().path()),
+                            None,
+                        );
+                    }
                 }
             }
-        }
-    };
+        };
 
     let meta = match std_file.metadata() {
         Ok(m) => m,
@@ -821,8 +837,8 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
         want,
         StreamCfg {
             chunk_size: cfg.chunk_size,
-            inflight: cfg.inflight,
-            direct_io: cfg.direct_io,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
         },
         app.uring.clone(),
         app.pool.clone(),
@@ -839,16 +855,11 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
         }
     };
 
-
     let (status, content_length, content_range) = if range_present {
         (
             StatusCode::PARTIAL_CONTENT,
             want_len,
-            Some(s32p_support::s3resp::object_content_range(
-                want.start,
-                want.end_excl - 1,
-                size,
-            )),
+            Some(s32p_support::s3resp::object_content_range(want.start, want.end_excl - 1, size)),
         )
     } else {
         (StatusCode::OK, size, None)
@@ -871,16 +882,16 @@ async fn handle_get_object(req: Request<Incoming>, app: Arc<App>, class: &s32p_s
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListV2Token {
-    v: u8,
-    bucket: String,
-    prefix: String,              // original request prefix (possibly empty)
+    v:         u8,
+    bucket:    String,
+    prefix:    String,           // original request prefix (possibly empty)
     delimiter: Option<String>,   // Some("/") or None (recursive)
-    stack: Vec<ListV2Frame>,     // root..deepest
+    stack:     Vec<ListV2Frame>, // root..deepest
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListV2Frame {
-    dir: String,   // key prefix for this directory frame ("" or ends with "/")
+    dir:   String, // key prefix for this directory frame ("" or ends with "/")
     after: String, // sort-key cursor within this dir ("" means start)
 }
 
@@ -893,8 +904,8 @@ fn decode_token(s: &str) -> Result<ListV2Token> {
     let raw = URL_SAFE_NO_PAD
         .decode(s.as_bytes())
         .map_err(|e| anyhow!("bad continuation-token: {e}"))?;
-    let tok: ListV2Token = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow!("bad continuation-token json: {e}"))?;
+    let tok: ListV2Token =
+        serde_json::from_slice(&raw).map_err(|e| anyhow!("bad continuation-token json: {e}"))?;
     Ok(tok)
 }
 
@@ -974,17 +985,17 @@ fn build_stack_from_last(dir_prefix: &str, last_key: &str, recursive: bool) -> V
 
 #[derive(Clone)]
 struct DirItem {
-    name: String,
+    name:     String,
     sort_key: String, // name or name + "/"
-    is_dir: bool,
-    path: PathBuf,
+    is_dir:   bool,
+    path:     PathBuf,
 }
 
 struct RuntimeFrame {
-    dir_key: String,     // key prefix for this directory ("" or ends_with "/")
-    after: String,       // cursor sort_key
+    dir_key: String,               // key prefix for this directory ("" or ends_with "/")
+    after:   String,               // cursor sort_key
     entries: Option<Vec<DirItem>>, // None = not loaded yet, Some = loaded (possibly empty)
-    idx: usize,
+    idx:     usize,
 }
 
 fn read_dir_sorted(dir_fs: &Path) -> Result<Vec<DirItem>> {
@@ -992,7 +1003,9 @@ fn read_dir_sorted(dir_fs: &Path) -> Result<Vec<DirItem>> {
     let rd = match fs::read_dir(dir_fs) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(anyhow!("permission denied")),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(anyhow!("permission denied"));
+        }
         Err(e) => return Err(anyhow!("read_dir failed: {e}")),
     };
 
@@ -1014,12 +1027,7 @@ fn read_dir_sorted(dir_fs: &Path) -> Result<Vec<DirItem>> {
 
         let is_dir = ft.is_dir();
         let sort_key = if is_dir { format!("{name}/") } else { name.clone() };
-        out.push(DirItem {
-            name,
-            sort_key,
-            is_dir,
-            path: ent.path(),
-        });
+        out.push(DirItem { name, sort_key, is_dir, path: ent.path() });
     }
 
     // Sort by key-order: files "name" vs dirs "name/" (important for correct lexicographic order).
@@ -1127,8 +1135,12 @@ async fn handle_list_objects_v2(
     // If bucket doesn't exist, return NoSuchBucket (S3 semantics).
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let prefix = class.query.first("prefix").unwrap_or("").to_string();
@@ -1211,13 +1223,22 @@ async fn handle_list_objects_v2(
         match decode_token(ct) {
             Ok(tok) => {
                 // Validate token belongs to the same listing shape
-                if tok.bucket != bucket || tok.prefix != prefix || tok.delimiter.as_deref() != delimiter_q {
+                if tok.bucket != bucket
+                    || tok.prefix != prefix
+                    || tok.delimiter.as_deref() != delimiter_q
+                {
                     let mut parts = Vec::new();
                     if tok.bucket != bucket {
-                        parts.push(format!("request-bucket {bucket} != token-bucket {}", tok.bucket));
+                        parts.push(format!(
+                            "request-bucket {bucket} != token-bucket {}",
+                            tok.bucket
+                        ));
                     }
                     if tok.prefix != prefix {
-                        parts.push(format!("request-prefix {prefix} != token-prefix {}", tok.prefix));
+                        parts.push(format!(
+                            "request-prefix {prefix} != token-prefix {}",
+                            tok.prefix
+                        ));
                     }
                     if tok.delimiter.as_deref() != delimiter_q {
                         parts.push(format!(
@@ -1257,7 +1278,10 @@ async fn handle_list_objects_v2(
     };
 
     // Reject continuation tokens that descend into the reserved dir
-    if token_stack.iter().any(|fr| is_reserved_first_segment(&fr.dir, &cfg.mpu_dir_name)) {
+    if token_stack
+        .iter()
+        .any(|fr| is_reserved_first_segment(&fr.dir, &cfg.mpu_dir_name))
+    {
         return s32p_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
             s32p_support::s3xml::error_code::INVALID_REQUEST,
@@ -1276,9 +1300,9 @@ async fn handle_list_objects_v2(
     for fr in token_stack {
         stack.push(RuntimeFrame {
             dir_key: fr.dir.clone(),
-            after: fr.after.clone(),
+            after:   fr.after.clone(),
             entries: None, // Will be loaded lazily
-            idx: 0,
+            idx:     0,
         });
     }
 
@@ -1288,12 +1312,16 @@ async fn handle_list_objects_v2(
     // Produce up to max_keys “results”; in delimiter mode keycount includes common prefixes
     while (contents.len() as u32 + common_prefixes.len() as u32) < max_keys {
         let stack_len = stack.len();
-        let Some(top) = stack.last_mut() else { break; };
+        let Some(top) = stack.last_mut() else {
+            break;
+        };
 
         // Lazy load entries if not already loaded
         if top.entries.is_none() {
             let is_root_frame = stack_len == 1;
-            if let Err(e) = ensure_frame_loaded(top, &cfg, bucket, leaf_filter.as_deref(), is_root_frame) {
+            if let Err(e) =
+                ensure_frame_loaded(top, &cfg, bucket, leaf_filter.as_deref(), is_root_frame)
+            {
                 tracing::warn!("Failed to load directory {}: {}", top.dir_key, e);
                 stack.pop();
                 continue;
@@ -1301,7 +1329,7 @@ async fn handle_list_objects_v2(
         }
 
         let entries = top.entries.as_ref().unwrap(); // Safe because we just ensured it's loaded
-        
+
         if top.idx >= entries.len() {
             stack.pop();
             continue;
@@ -1328,9 +1356,9 @@ async fn handle_list_objects_v2(
             let child_key = format!("{}{}{}", top.dir_key, it.name, "/");
             stack.push(RuntimeFrame {
                 dir_key: child_key,
-                after: "".to_string(),
+                after:   "".to_string(),
                 entries: None, // Will be loaded lazily
-                idx: 0,
+                idx:     0,
             });
             continue;
         }
@@ -1351,11 +1379,7 @@ async fn handle_list_objects_v2(
         let etag = format!("\"{}\"", stx.ino);
         let size = stx.size;
 
-        let owner = if fetch_owner {
-            Some(owner_info(stx.uid))
-        } else {
-            None
-        };
+        let owner = if fetch_owner { Some(owner_info(stx.uid)) } else { None };
 
         contents.push(s32p_support::s3xml::ListObjectInfo {
             key,
@@ -1372,16 +1396,13 @@ async fn handle_list_objects_v2(
     let next_token = if is_truncated && key_count > 0 {
         // Build token from current runtime stack
         let tok = ListV2Token {
-            v: 1,
-            bucket: bucket.to_string(),
-            prefix: prefix.clone(),
+            v:         1,
+            bucket:    bucket.to_string(),
+            prefix:    prefix.clone(),
             delimiter: if recursive { None } else { Some("/".to_string()) },
-            stack: stack
+            stack:     stack
                 .iter()
-                .map(|rf| ListV2Frame {
-                    dir: rf.dir_key.clone(),
-                    after: rf.after.clone(),
-                })
+                .map(|rf| ListV2Frame { dir: rf.dir_key.clone(), after: rf.after.clone() })
                 .collect(),
         };
         encode_token(&tok).ok()
@@ -1422,8 +1443,7 @@ fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("missing header {name}"))?
         .to_str()
         .map_err(|_| anyhow!("invalid utf8 in header {name}"))?;
-    v.parse::<u64>()
-        .map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
+    v.parse::<u64>().map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
 }
 
 fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
@@ -1453,11 +1473,8 @@ fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
 
 /// Returns (is_streaming_sigv4, logical_len)
 fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64)> {
-    let is_streaming = header_eq(
-        headers,
-        "x-amz-content-sha256",
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-    );
+    let is_streaming =
+        header_eq(headers, "x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
 
     let logical_len = if is_streaming {
         parse_u64_header(headers, "x-amz-decoded-content-length")?
@@ -1501,8 +1518,12 @@ async fn handle_put_object(
     // S3 semantics: if bucket doesn't exist => NoSuchBucket
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
@@ -1520,7 +1541,7 @@ async fn handle_put_object(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
+            );
         }
     };
 
@@ -1549,11 +1570,16 @@ async fn handle_put_object(
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {} // not used for PUT
         PreconditionOutcome::PreconditionFailed => {
-            tracing::debug!("Write preconditions failed (412) for PUT operation on {}", obj_path.display());
-            return s32p_support::s3resp::precondition_failed("PUT precondition failed", Some(req.uri().path()));
+            tracing::debug!(
+                "Write preconditions failed (412) for PUT operation on {}",
+                obj_path.display()
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "PUT precondition failed",
+                Some(req.uri().path()),
+            );
         }
     }
-
 
     // Still require Content-Length at HTTP layer
     if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
@@ -1584,8 +1610,8 @@ async fn handle_put_object(
         is_streaming_sigv4,
         StreamCfg {
             chunk_size: cfg.chunk_size,
-            inflight: cfg.inflight,
-            direct_io: cfg.direct_io,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
         },
         app.uring.clone(),
         app.pool.clone(),
@@ -1598,7 +1624,13 @@ async fn handle_put_object(
     // Build ETag (consistent with reads: inode-based ETag)
     let meta = match std::fs::metadata(&obj_path) {
         Ok(m) => m,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
+        }
     };
 
     let etag = format!("\"{}\"", meta.ino());
@@ -1632,8 +1664,12 @@ async fn handle_copy_object(
     // destination bucket must exist
     match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let (src_bucket, src_key) = match parse_copy_source(req.headers()) {
@@ -1645,7 +1681,7 @@ async fn handle_copy_object(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
+            );
         }
     };
 
@@ -1659,8 +1695,12 @@ async fn handle_copy_object(
     // source bucket must exist
     match bucket_exists_dir(&cfg.posix_root, &src_bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let src_path = match join_object_path(&cfg.posix_root, &src_bucket, &src_key) {
@@ -1676,13 +1716,17 @@ async fn handle_copy_object(
     let src_meta = match std::fs::metadata(&src_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key("not found", None)
+            return s32p_support::s3resp::no_such_key("not found", None);
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", None)
+            return s32p_support::s3resp::access_denied("permission denied", None);
         }
         Err(e) => {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
         }
     };
 
@@ -1705,8 +1749,14 @@ async fn handle_copy_object(
     match evaluate_copy_source_preconditions(&cond, &src_etag_unquoted, src_last_modified) {
         PreconditionOutcome::Proceed => {}
         _ => {
-            tracing::debug!("Copy source preconditions failed (412) for source {}", src_path.display());
-            return s32p_support::s3resp::precondition_failed("Copy source precondition failed", Some(req.uri().path()));
+            tracing::debug!(
+                "Copy source preconditions failed (412) for source {}",
+                src_path.display()
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "Copy source precondition failed",
+                Some(req.uri().path()),
+            );
         }
     }
 
@@ -1729,8 +1779,14 @@ async fn handle_copy_object(
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {} // not used for copy
         PreconditionOutcome::PreconditionFailed => {
-            tracing::debug!("Copy destination preconditions failed (412) for destination {}", dst_path.display());
-            return s32p_support::s3resp::precondition_failed("Copy destination precondition failed", Some(req.uri().path()));
+            tracing::debug!(
+                "Copy destination preconditions failed (412) for destination {}",
+                dst_path.display()
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "Copy destination precondition failed",
+                Some(req.uri().path()),
+            );
         }
     }
 
@@ -1764,8 +1820,8 @@ async fn handle_copy_object(
         dst_striping,
         StreamCfg {
             chunk_size: cfg.chunk_size,
-            inflight: cfg.inflight,
-            direct_io: cfg.direct_io,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
         },
         app.uring.clone(),
         app.pool.clone(),
@@ -1777,7 +1833,13 @@ async fn handle_copy_object(
 
     let dst_meta = match std::fs::metadata(&dst_path) {
         Ok(m) => m,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
     };
 
     let etag = format!("\"{}\"", dst_meta.ino());
@@ -1865,9 +1927,11 @@ async fn handle_rename_object(
     match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
         }
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let (src_bucket, src_key) = match parse_rename_source(dst_bucket, req.headers()) {
@@ -1879,7 +1943,7 @@ async fn handle_rename_object(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
+            );
         }
     };
 
@@ -1915,13 +1979,17 @@ async fn handle_rename_object(
     match std::fs::metadata(&src_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key("not found", None)
+            return s32p_support::s3resp::no_such_key("not found", None);
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", None)
+            return s32p_support::s3resp::access_denied("permission denied", None);
         }
         Err(e) => {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
         }
     };
 
@@ -1948,13 +2016,17 @@ async fn handle_rename_object(
             );
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key("not found", None)
+            return s32p_support::s3resp::no_such_key("not found", None);
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", None)
+            return s32p_support::s3resp::access_denied("permission denied", None);
         }
         Err(e) => {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
         }
     }
 
@@ -1991,7 +2063,9 @@ fn prune_empty_parents(bucket_root: &Path, mut dir: PathBuf) {
             }
         }
 
-        let Some(parent) = dir.parent() else { break; };
+        let Some(parent) = dir.parent() else {
+            break;
+        };
         dir = parent.to_path_buf();
     }
 }
@@ -2030,9 +2104,11 @@ async fn handle_delete_object(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
         }
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
@@ -2061,32 +2137,59 @@ async fn handle_delete_object(
     if let Some((etag_existing, lm, size)) = existing.as_ref() {
         // Enforce If-Match / If-None-Match / If-(Un)Modified-Since like a “write”
         let existing_ref = Some((etag_existing.as_str(), *lm));
-        if evaluate_write_preconditions(&cond, existing_ref) == PreconditionOutcome::PreconditionFailed {
-            tracing::debug!("Write preconditions failed (412) for DELETE operation on {}", obj_path.display());
-            return s32p_support::s3resp::precondition_failed("DELETE precondition failed", Some(req.uri().path()));
+        if evaluate_write_preconditions(&cond, existing_ref)
+            == PreconditionOutcome::PreconditionFailed
+        {
+            tracing::debug!(
+                "Write preconditions failed (412) for DELETE operation on {}",
+                obj_path.display()
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "DELETE precondition failed",
+                Some(req.uri().path()),
+            );
         }
 
         // Optional extra checks (x-amz-if-match-size / last-modified-time)
         if let Some(want_size) = cond.amz_if_match_size {
             if want_size != *size {
-                tracing::debug!("DELETE x-amz-if-match-size mismatch for {} (want: {}, got: {})", obj_path.display(), want_size, size);
-                return s32p_support::s3resp::precondition_failed("x-amz-if-match-size mismatch", Some(req.uri().path()));
+                tracing::debug!(
+                    "DELETE x-amz-if-match-size mismatch for {} (want: {}, got: {})",
+                    obj_path.display(),
+                    want_size,
+                    size
+                );
+                return s32p_support::s3resp::precondition_failed(
+                    "x-amz-if-match-size mismatch",
+                    Some(req.uri().path()),
+                );
             }
         }
         if let Some(want_lm) = cond.amz_if_match_last_modified_time {
             if *lm != want_lm {
-                tracing::debug!("DELETE x-amz-if-match-last-modified-time mismatch for {}", obj_path.display());
-                return s32p_support::s3resp::precondition_failed("x-amz-if-match-last-modified-time mismatch", Some(req.uri().path()));
+                tracing::debug!(
+                    "DELETE x-amz-if-match-last-modified-time mismatch for {}",
+                    obj_path.display()
+                );
+                return s32p_support::s3resp::precondition_failed(
+                    "x-amz-if-match-last-modified-time mismatch",
+                    Some(req.uri().path()),
+                );
             }
         }
     } else {
         // If object missing and caller supplied If-Match => fail (common behavior)
         if cond.if_match.is_some() {
-            tracing::debug!("DELETE If-Match precondition failed - object does not exist: {}", obj_path.display());
-            return s32p_support::s3resp::precondition_failed("DELETE If-Match but object does not exist", Some(req.uri().path()));
+            tracing::debug!(
+                "DELETE If-Match precondition failed - object does not exist: {}",
+                obj_path.display()
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "DELETE If-Match but object does not exist",
+                Some(req.uri().path()),
+            );
         }
     }
-
 
     // DeleteObject is idempotent: NotFound is still success.
     match std::fs::remove_file(&obj_path) {
@@ -2102,7 +2205,10 @@ async fn handle_delete_object(
             // still success
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", Some(req.uri().path()));
+            return s32p_support::s3resp::access_denied(
+                "permission denied",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::internal_error(
@@ -2115,7 +2221,6 @@ async fn handle_delete_object(
 
     s32p_support::s3resp::delete_object_no_content()
 }
-
 
 async fn handle_delete_objects(
     req: Request<Incoming>,
@@ -2144,9 +2249,11 @@ async fn handle_delete_objects(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()))
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
         }
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let (parts, body) = req.into_parts();
@@ -2274,10 +2381,8 @@ async fn main() -> Result<()> {
     let log_filter = std::env::var("S32P_LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".into());
-    
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .init();
+
+    tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     let cfg = Arc::new(load_cfg()?);
 

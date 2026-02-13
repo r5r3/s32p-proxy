@@ -1,47 +1,41 @@
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use http::{Request, StatusCode};
-use http::request::Parts;
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    os::unix::{fs::MetadataExt, io::AsRawFd},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
+};
+
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use http::{Request, StatusCode, request::Parts};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use s32p_support::{
+    preconditions::{PreconditionOutcome, evaluate_write_preconditions, parse_conditional_headers},
+    utils::ETagCondition,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::sync::Semaphore;
-
-use crate::buffer::BufPool;
-use crate::uring_io::UringIO;
-use crate::streaming::{
-    copy_file_to_file,
-    direct_io_ok_for_aligned_range,
-    StreamCfg,
-    write_object_body,
-    WriteObjectDest,
-};
-use s32p_support::preconditions::{evaluate_write_preconditions, PreconditionOutcome};
-use s32p_support::utils::ETagCondition;
-use crate::fs_helpers::{
-    bucket_exists_dir,
-    bucket_root_path,
-    join_object_path,
-    ftruncate_file,
-    open_file,
-    LustreStriping,
-    OpenDirect,
-    OpenMode,
-    rename_noreplace,
-};
 
 #[cfg(feature = "lustre")]
 use crate::fs_helpers::stripe_count_for_size;
-use s32p_support::preconditions::parse_conditional_headers;
+use crate::{
+    buffer::BufPool,
+    fs_helpers::{
+        LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path, ftruncate_file,
+        join_object_path, open_file, rename_noreplace,
+    },
+    streaming::{
+        StreamCfg, WriteObjectDest, copy_file_to_file, direct_io_ok_for_aligned_range,
+        write_object_body,
+    },
+    uring_io::UringIO,
+};
 
 type Resp = s32p_support::s3resp::HttpResponse;
 
@@ -57,12 +51,12 @@ enum UploadState {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadMeta {
-    v: u8,
-    bucket: String,
-    key: String,
+    v:         u8,
+    bucket:    String,
+    key:       String,
     upload_id: String,
     initiated: String, // ISO8601 Z
-    state: UploadState,
+    state:     UploadState,
 
     // Set as soon as we have 2 parts with the same size.
     assumed_part_size: Option<u64>,
@@ -73,10 +67,10 @@ struct UploadMeta {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct PartMeta {
-    size: u64,
-    etag: String,          // include quotes
+    size:          u64,
+    etag:          String, // include quotes
     last_modified: String, // ISO8601 Z
-    stored: PartStored,
+    stored:        PartStored,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -132,22 +126,14 @@ fn gen_upload_id() -> String {
 
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe {
-            libc::getrandom(
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
+        let rc = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if rc == buf.len() as isize {
             return URL_SAFE_NO_PAD.encode(buf);
         }
     }
 
     let n = UPLOAD_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     let mut fallback = [0u8; 32];
     fallback[..8].copy_from_slice(&now.as_secs().to_le_bytes());
     fallback[8..16].copy_from_slice(&now.subsec_nanos().to_le_bytes());
@@ -157,20 +143,12 @@ fn gen_upload_id() -> String {
 }
 
 fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
-    let (f, _used_direct) = open_file(
-        path,
-        OpenMode::ReadWriteCreate,
-        OpenDirect::Buffered,
-        None,
-    )
-    .with_context(|| format!("open lock {}", path.display()))?;
+    let (f, _used_direct) = open_file(path, OpenMode::ReadWriteCreate, OpenDirect::Buffered, None)
+        .with_context(|| format!("open lock {}", path.display()))?;
 
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        return Err(anyhow!(
-            "flock failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(anyhow!("flock failed: {}", std::io::Error::last_os_error()));
     }
     Ok(f)
 }
@@ -306,11 +284,7 @@ async fn copy_range_to_range(
 }
 
 fn build_location(parts: &Parts, scheme: &str) -> String {
-    let host = parts
-        .headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
+    let host = parts.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("localhost");
 
     // path-style gateway: uri.path() already includes "/{bucket}/{key}"
     format!("{scheme}://{host}{}", parts.uri.path())
@@ -326,7 +300,11 @@ fn no_such_upload(resource: Option<&str>) -> Resp {
     )
 }
 
-pub async fn handle(req: Request<Incoming>, app: Arc<crate::App>, class: &s32p_support::classifier::S3RequestClass) -> Resp {
+pub async fn handle(
+    req: Request<Incoming>,
+    app: Arc<crate::App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
     let bucket = class.bucket.as_deref().unwrap_or("");
     let key = class.key.as_deref().unwrap_or("");
 
@@ -351,10 +329,15 @@ pub async fn handle(req: Request<Incoming>, app: Arc<crate::App>, class: &s32p_s
                 handle_list_uploads(req, app, bucket).await
             }
             s32p_support::classifier::MultipartOp::Unknown => {
-                s32p_support::s3resp::not_implemented("unknown multipart request", Some(req.uri().path()))
+                s32p_support::s3resp::not_implemented(
+                    "unknown multipart request",
+                    Some(req.uri().path()),
+                )
             }
         },
-        _ => s32p_support::s3resp::not_implemented("not a multipart request", Some(req.uri().path())),
+        _ => {
+            s32p_support::s3resp::not_implemented("not a multipart request", Some(req.uri().path()))
+        }
     }
 }
 
@@ -378,13 +361,19 @@ async fn handle_create_mpu(
 
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
 
     let upload_id = gen_upload_id();
@@ -412,20 +401,26 @@ async fn handle_create_mpu(
     match lock_exclusive(&lock_path) {
         Ok(_lk) => {
             if let Err(e) = write_meta_atomic(&dir, &meta) {
-                return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
             }
         }
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
     }
 
     s32p_support::s3resp::create_multipart_upload_ok(bucket, key, &upload_id)
 }
 
-async fn handle_list_uploads(
-    req: Request<Incoming>,
-    app: Arc<crate::App>,
-    bucket: &str,
-) -> Resp {
+async fn handle_list_uploads(req: Request<Incoming>, app: Arc<crate::App>, bucket: &str) -> Resp {
     let cfg = app.cfg.clone();
 
     if bucket.is_empty() {
@@ -440,13 +435,19 @@ async fn handle_list_uploads(
 
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
-        Ok(false) => return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path())),
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     }
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
 
     let root = uploads_root(&bucket_root, &cfg.mpu_dir_name);
@@ -457,7 +458,13 @@ async fn handle_list_uploads(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return s32p_support::s3resp::list_multipart_uploads_ok(bucket, &out);
         }
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
     };
 
     for ent in rd.flatten() {
@@ -473,7 +480,7 @@ async fn handle_list_uploads(
             continue;
         }
         out.push(s32p_support::s3xml::MultipartUploadInfo {
-            key: meta.key,
+            key:       meta.key,
             upload_id: meta.upload_id,
             initiated: meta.initiated,
         });
@@ -513,7 +520,9 @@ async fn handle_list_parts(
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
 
     let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
@@ -523,7 +532,13 @@ async fn handle_list_parts(
 
     let _lk = match lock_exclusive(&upload_lock_path(&dir)) {
         Ok(lk) => lk,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
     };
 
     let meta = match read_meta(&dir) {
@@ -538,10 +553,10 @@ async fn handle_list_parts(
     let mut parts: Vec<s32p_support::s3xml::MultipartPartInfo> = Vec::new();
     for (pn, p) in meta.parts.iter() {
         parts.push(s32p_support::s3xml::MultipartPartInfo {
-            part_number: *pn,
+            part_number:   *pn,
             last_modified: p.last_modified.clone(),
-            etag: p.etag.clone(),
-            size: p.size,
+            etag:          p.etag.clone(),
+            size:          p.size,
         });
     }
 
@@ -579,7 +594,9 @@ async fn handle_abort(
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
 
     let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
@@ -653,13 +670,15 @@ async fn handle_upload_part(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            )
+            );
         }
     };
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
     let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
     if !dir.exists() {
@@ -669,7 +688,13 @@ async fn handle_upload_part(
     // Phase 1: lock + read meta (plan placement)
     let _lk = match lock_exclusive(&upload_lock_path(&dir)) {
         Ok(lk) => lk,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
     };
 
     let mut meta = match read_meta(&dir) {
@@ -713,7 +738,11 @@ async fn handle_upload_part(
             // Persist assumed_part_size before writing bytes.
             // This reduces the window where multiple concurrent part uploads all think assumed is None.
             if let Err(e) = write_meta_atomic(&dir, &meta) {
-                return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
             }
         }
     }
@@ -724,11 +753,7 @@ async fn handle_upload_part(
     // - If assumed is set, only place into direct.bin if logical_len <= assumed.
     //   (If logical_len > assumed and we wrote it at (pn-1)*assumed we'd risk overlap/corruption.)
     let direct_off = if let Some(s) = meta.assumed_part_size {
-        if logical_len <= s {
-            Some((part_number as u64 - 1) * s)
-        } else {
-            None
-        }
+        if logical_len <= s { Some((part_number as u64 - 1) * s) } else { None }
     } else {
         // As before: only place sequentially into direct if previous parts are direct + contiguous.
         compute_sequential_direct_offset(&meta, part_number)
@@ -747,8 +772,8 @@ async fn handle_upload_part(
         // Decide direct IO for THIS part+offset (multipart writes MUST NOT pad, so only use O_DIRECT when fully aligned).
         let mut part_cfg = StreamCfg {
             chunk_size: cfg.chunk_size,
-            inflight: cfg.inflight,
-            direct_io: cfg.direct_io,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
         };
 
         let mut use_direct = direct_io_ok_for_aligned_range(off, logical_len, &part_cfg);
@@ -804,13 +829,23 @@ async fn handle_upload_part(
         )
         .await
         {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
 
         // Phase 3: lock + re-read + update meta (merge-safe)
         let _lk2 = match lock_exclusive(&upload_lock_path(&dir)) {
             Ok(lk) => lk,
-            Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(parts.uri.path()),
+                    None,
+                );
+            }
         };
 
         let mut meta2 = match read_meta(&dir) {
@@ -828,22 +863,27 @@ async fn handle_upload_part(
             );
         }
 
-        meta2.parts.insert(part_number, PartMeta {
-            size: logical_len,
-            etag: etag.clone(),
-            last_modified: now,
-            stored: PartStored::Direct { off },
-        });
+        meta2.parts.insert(
+            part_number,
+            PartMeta {
+                size:          logical_len,
+                etag:          etag.clone(),
+                last_modified: now,
+                stored:        PartStored::Direct { off },
+            },
+        );
         recompute_assumed_part_size(&mut meta2);
 
         if let Err(e) = write_meta_atomic(&dir, &meta2) {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
 
         s32p_support::s3resp::upload_part_ok(&etag)
-
     } else {
-
         // Store as individual part file
         let parts_dir = upload_parts_dir(&dir);
         let name = part_file_name(part_number);
@@ -865,8 +905,8 @@ async fn handle_upload_part(
             is_streaming_sigv4,
             StreamCfg {
                 chunk_size: cfg.chunk_size,
-                inflight: cfg.inflight,
-                direct_io: cfg.direct_io,
+                inflight:   cfg.inflight,
+                direct_io:  cfg.direct_io,
             },
             app.uring.clone(),
             app.pool.clone(),
@@ -874,18 +914,32 @@ async fn handle_upload_part(
         .await
         {
             let _ = fs::remove_file(&tmp_path);
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
 
         if let Err(e) = fs::rename(&tmp_path, &final_path) {
             let _ = fs::remove_file(&tmp_path);
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
 
         // Phase 3: lock + re-read + update meta (merge-safe)
         let _lk2 = match lock_exclusive(&upload_lock_path(&dir)) {
             Ok(lk) => lk,
-            Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(parts.uri.path()),
+                    None,
+                );
+            }
         };
 
         let mut meta2 = match read_meta(&dir) {
@@ -903,16 +957,23 @@ async fn handle_upload_part(
             );
         }
 
-        meta2.parts.insert(part_number, PartMeta {
-            size: logical_len,
-            etag: etag.clone(),
-            last_modified: now,
-            stored: PartStored::File { name },
-        });
+        meta2.parts.insert(
+            part_number,
+            PartMeta {
+                size:          logical_len,
+                etag:          etag.clone(),
+                last_modified: now,
+                stored:        PartStored::File { name },
+            },
+        );
         recompute_assumed_part_size(&mut meta2);
 
         if let Err(e) = write_meta_atomic(&dir, &meta2) {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
 
         s32p_support::s3resp::upload_part_ok(&etag)
@@ -949,7 +1010,9 @@ async fn handle_complete(
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
     };
 
     let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
@@ -959,7 +1022,7 @@ async fn handle_complete(
 
     // Extract headers before moving req
     let headers = req.headers().clone();
-    
+
     // Read and parse complete body
     let (parts, body) = req.into_parts();
     let collected = match body.collect().await {
@@ -993,7 +1056,13 @@ async fn handle_complete(
     // Lock for the whole completion (prevents new part uploads + makes direct/rename deterministic)
     let _lk = match lock_exclusive(&upload_lock_path(&dir)) {
         Ok(lk) => lk,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
+        }
     };
 
     let mut meta = match read_meta(&dir) {
@@ -1049,7 +1118,9 @@ async fn handle_complete(
             if let Some(part) = meta.parts.get(&pn) {
                 if let PartStored::File { name } = &part.stored {
                     let src_path = upload_parts_dir(&dir).join(name);
-                    if let Ok((f, _)) = open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
+                    if let Ok((f, _)) =
+                        open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None)
+                    {
                         crate::lustre::advise_willread(f.as_raw_fd(), 0, part.size);
                     }
                 }
@@ -1100,9 +1171,10 @@ async fn handle_complete(
 
     let dst_path = match join_object_path(&cfg.posix_root, bucket, key) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), Some(parts.uri.path())),
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(parts.uri.path()));
+        }
     };
-
 
     // check preconditions
     let cond = match parse_conditional_headers(&headers) {
@@ -1131,18 +1203,24 @@ async fn handle_complete(
         PreconditionOutcome::Proceed => {}
         PreconditionOutcome::NotModified => {}
         PreconditionOutcome::PreconditionFailed => {
-            tracing::debug!("Write preconditions failed (412) for CompleteMultipartUpload on {}", dst_path.display());
+            tracing::debug!(
+                "Write preconditions failed (412) for CompleteMultipartUpload on {}",
+                dst_path.display()
+            );
             return s32p_support::s3resp::precondition_failed(
                 "CompleteMultipartUpload precondition failed",
-                Some(parts.uri.path())
+                Some(parts.uri.path()),
             );
         }
     }
 
-
     if let Some(parent) = dst_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
     }
 
@@ -1160,7 +1238,12 @@ async fn handle_complete(
     let direct_striping: Option<LustreStriping> = None;
 
     if can_fast {
-        match open_file(&direct_path, OpenMode::ReadWriteCreate, OpenDirect::Buffered, direct_striping) {
+        match open_file(
+            &direct_path,
+            OpenMode::ReadWriteCreate,
+            OpenDirect::Buffered,
+            direct_striping,
+        ) {
             Ok((f, _used_direct)) => {
                 direct_file_opt = Some(Arc::new(f));
             }
@@ -1188,19 +1271,15 @@ async fn handle_complete(
                 }
                 PartStored::File { name } => {
                     let src_path = upload_parts_dir(&dir).join(&name);
-                    let src_file = match open_file(
-                        &src_path,
-                        OpenMode::Read,
-                        OpenDirect::Buffered,
-                        None,
-                    ) {
-                        Ok((f, _used_direct)) => Arc::new(f),
-                        Err(e) => {
-                            can_fast = false;
-                            tracing::warn!("fast path disabled: open part file failed: {e}");
-                            break;
-                        }
-                    };
+                    let src_file =
+                        match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
+                            Ok((f, _used_direct)) => Arc::new(f),
+                            Err(e) => {
+                                can_fast = false;
+                                tracing::warn!("fast path disabled: open part file failed: {e}");
+                                break;
+                            }
+                        };
 
                     if let Err(e) = copy_range_to_range(
                         src_file,
@@ -1208,22 +1287,31 @@ async fn handle_complete(
                         direct_file.clone(),
                         expected_off,
                         part.size,
-                        StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false },
+                        StreamCfg {
+                            chunk_size: cfg.chunk_size,
+                            inflight:   cfg.inflight,
+                            direct_io:  false,
+                        },
                         app.uring.clone(),
                         app.pool.clone(),
-                    ).await {
+                    )
+                    .await
+                    {
                         can_fast = false;
                         tracing::warn!("fast path disabled: copy part->direct failed: {e}");
                         break;
                     }
 
                     // Update meta in-memory (we’ll write it at the end)
-                    meta.parts.insert(pn, PartMeta {
-                        size: part.size,
-                        etag: part.etag,
-                        last_modified: part.last_modified,
-                        stored: PartStored::Direct { off: expected_off },
-                    });
+                    meta.parts.insert(
+                        pn,
+                        PartMeta {
+                            size:          part.size,
+                            etag:          part.etag,
+                            last_modified: part.last_modified,
+                            stored:        PartStored::Direct { off: expected_off },
+                        },
+                    );
 
                     // best-effort delete source file to save space
                     let _ = fs::remove_file(&src_path);
@@ -1261,7 +1349,9 @@ async fn handle_complete(
                             Ok(p) => p,
                             Err(err) => {
                                 can_fast = false;
-                                tracing::warn!("fast path disabled: cannot build dst tmp path: {err}");
+                                tracing::warn!(
+                                    "fast path disabled: cannot build dst tmp path: {err}"
+                                );
                                 // fall through to fallback
                                 // (no break/return)
                                 PathBuf::new()
@@ -1275,12 +1365,20 @@ async fn handle_complete(
                             #[cfg(feature = "lustre")]
                             let dst_striping = Some(LustreStriping::new(
                                 cfg.chunk_size as u64,
-                                stripe_count_for_size(final_size, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+                                stripe_count_for_size(
+                                    final_size,
+                                    cfg.chunk_size as u64,
+                                    cfg.lustre_max_stripe_count,
+                                ),
                             ));
                             #[cfg(not(feature = "lustre"))]
                             let dst_striping: Option<LustreStriping> = None;
 
-                            let copy_cfg = StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false };
+                            let copy_cfg = StreamCfg {
+                                chunk_size: cfg.chunk_size,
+                                inflight:   cfg.inflight,
+                                direct_io:  false,
+                            };
                             match copy_file_to_file(
                                 direct_path.clone(),
                                 dst_tmp.clone(),
@@ -1289,7 +1387,9 @@ async fn handle_complete(
                                 copy_cfg,
                                 app.uring.clone(),
                                 app.pool.clone(),
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     if !noreplace && dst_path.exists() {
                                         let _ = fs::remove_file(&dst_path);
@@ -1302,7 +1402,9 @@ async fn handle_complete(
                                     };
 
                                     if let Err(e2) = commit_res {
-                                        if noreplace && e2.kind() == std::io::ErrorKind::AlreadyExists {
+                                        if noreplace
+                                            && e2.kind() == std::io::ErrorKind::AlreadyExists
+                                        {
                                             let _ = fs::remove_file(&dst_tmp);
                                             meta.state = UploadState::Active;
                                             let _ = write_meta_atomic(&dir, &meta);
@@ -1312,7 +1414,9 @@ async fn handle_complete(
                                             );
                                         }
 
-                                        tracing::warn!("fast path disabled: rename tmp->dst failed: {e2}");
+                                        tracing::warn!(
+                                            "fast path disabled: rename tmp->dst failed: {e2}"
+                                        );
                                         let _ = fs::remove_file(&dst_tmp);
                                     } else {
                                         meta.state = UploadState::Completed;
@@ -1321,14 +1425,24 @@ async fn handle_complete(
 
                                         let m = match fs::metadata(&dst_path) {
                                             Ok(m) => m,
-                                            Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+                                            Err(e) => {
+                                                return s32p_support::s3resp::internal_error(
+                                                    &e.to_string(),
+                                                    Some(parts.uri.path()),
+                                                    None,
+                                                );
+                                            }
                                         };
                                         let etag = format!("\"{}\"", m.ino());
-                                        return s32p_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag);
+                                        return s32p_support::s3resp::complete_multipart_upload_ok(
+                                            &location, bucket, key, &etag,
+                                        );
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::warn!("fast path disabled: copy direct->dst_tmp failed: {err}");
+                                    tracing::warn!(
+                                        "fast path disabled: copy direct->dst_tmp failed: {err}"
+                                    );
                                     let _ = fs::remove_file(&dst_tmp);
                                 }
                             }
@@ -1343,10 +1457,18 @@ async fn handle_complete(
 
                     let m = match fs::metadata(&dst_path) {
                         Ok(m) => m,
-                        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+                        Err(e) => {
+                            return s32p_support::s3resp::internal_error(
+                                &e.to_string(),
+                                Some(parts.uri.path()),
+                                None,
+                            );
+                        }
                     };
                     let etag = format!("\"{}\"", m.ino());
-                    return s32p_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag);
+                    return s32p_support::s3resp::complete_multipart_upload_ok(
+                        &location, bucket, key, &etag,
+                    );
                 }
             }
         }
@@ -1443,7 +1565,11 @@ async fn handle_complete(
         match part.stored {
             PartStored::Direct { off } => {
                 let Some(df) = direct_file.clone() else {
-                    return s32p_support::s3resp::internal_error("direct.bin missing", Some(parts.uri.path()), None);
+                    return s32p_support::s3resp::internal_error(
+                        "direct.bin missing",
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 };
                 if let Err(e) = copy_range_to_range(
                     df,
@@ -1451,36 +1577,57 @@ async fn handle_complete(
                     out_file.clone(),
                     out_off,
                     part.size,
-                    StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false },
+                    StreamCfg {
+                        chunk_size: cfg.chunk_size,
+                        inflight:   cfg.inflight,
+                        direct_io:  false,
+                    },
                     app.uring.clone(),
                     app.pool.clone(),
-                ).await {
-                    return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+                )
+                .await
+                {
+                    return s32p_support::s3resp::internal_error(
+                        &e.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 }
             }
             PartStored::File { name } => {
                 let src_path = upload_parts_dir(&dir).join(&name);
-                let src_file = match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
-                    Ok((f, _used_direct)) => Arc::new(f),
-                    Err(e) => {
-                        return s32p_support::s3resp::internal_error(
-                            &e.to_string(),
-                            Some(parts.uri.path()),
-                            None,
-                        );
-                    }
-                };
+                let src_file =
+                    match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
+                        Ok((f, _used_direct)) => Arc::new(f),
+                        Err(e) => {
+                            return s32p_support::s3resp::internal_error(
+                                &e.to_string(),
+                                Some(parts.uri.path()),
+                                None,
+                            );
+                        }
+                    };
                 if let Err(e) = copy_range_to_range(
                     src_file,
                     0,
                     out_file.clone(),
                     out_off,
                     part.size,
-                    StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false },
+                    StreamCfg {
+                        chunk_size: cfg.chunk_size,
+                        inflight:   cfg.inflight,
+                        direct_io:  false,
+                    },
                     app.uring.clone(),
                     app.pool.clone(),
-                ).await {
-                    return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+                )
+                .await
+                {
+                    return s32p_support::s3resp::internal_error(
+                        &e.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 }
             }
         }
@@ -1503,11 +1650,7 @@ async fn handle_complete(
     }
 
     let commit_rename = |src: &Path, dst: &Path| -> std::io::Result<()> {
-        if noreplace {
-            rename_noreplace(src, dst)
-        } else {
-            fs::rename(src, dst)
-        }
+        if noreplace { rename_noreplace(src, dst) } else { fs::rename(src, dst) }
     };
 
     if staged_in_dst {
@@ -1524,7 +1667,11 @@ async fn handle_complete(
             }
 
             let _ = fs::remove_file(&staged_out);
-            return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
         }
     } else {
         // Old behavior: rename if possible, else EXDEV => copy to dst tmp then rename.
@@ -1533,11 +1680,21 @@ async fn handle_complete(
             Err(e) if is_exdev(&e) => {
                 let dst_tmp = match dst_tmp_path(&dst_path, upload_id) {
                     Ok(p) => p,
-                    Err(err) => return s32p_support::s3resp::internal_error(&err.to_string(), Some(parts.uri.path()), None),
+                    Err(err) => {
+                        return s32p_support::s3resp::internal_error(
+                            &err.to_string(),
+                            Some(parts.uri.path()),
+                            None,
+                        );
+                    }
                 };
                 let _ = fs::remove_file(&dst_tmp);
 
-                let copy_cfg = StreamCfg { chunk_size: cfg.chunk_size, inflight: cfg.inflight, direct_io: false };
+                let copy_cfg = StreamCfg {
+                    chunk_size: cfg.chunk_size,
+                    inflight:   cfg.inflight,
+                    direct_io:  false,
+                };
                 if let Err(err) = copy_file_to_file(
                     staged_out.clone(),
                     dst_tmp.clone(),
@@ -1546,9 +1703,15 @@ async fn handle_complete(
                     copy_cfg,
                     app.uring.clone(),
                     app.pool.clone(),
-                ).await {
+                )
+                .await
+                {
                     let _ = fs::remove_file(&dst_tmp);
-                    return s32p_support::s3resp::internal_error(&err.to_string(), Some(parts.uri.path()), None);
+                    return s32p_support::s3resp::internal_error(
+                        &err.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 }
 
                 if !noreplace && dst_path.exists() {
@@ -1567,7 +1730,11 @@ async fn handle_complete(
                     }
 
                     let _ = fs::remove_file(&dst_tmp);
-                    return s32p_support::s3resp::internal_error(&e2.to_string(), Some(parts.uri.path()), None);
+                    return s32p_support::s3resp::internal_error(
+                        &e2.to_string(),
+                        Some(parts.uri.path()),
+                        None,
+                    );
                 }
 
                 // best-effort remove original staged_out after successful cross-dev copy
@@ -1583,7 +1750,11 @@ async fn handle_complete(
                         Some(parts.uri.path()),
                     );
                 }
-                return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(parts.uri.path()),
+                    None,
+                );
             }
         }
     }
@@ -1594,10 +1765,15 @@ async fn handle_complete(
 
     let m = match fs::metadata(&dst_path) {
         Ok(m) => m,
-        Err(e) => return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(parts.uri.path()),
+                None,
+            );
+        }
     };
     let etag = format!("\"{}\"", m.ino());
 
     s32p_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag)
 }
-

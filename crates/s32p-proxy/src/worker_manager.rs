@@ -1,53 +1,49 @@
-use anyhow::{anyhow, Context, Result};
-use dashmap::DashMap;
 use std::{
-    fmt,
-    fs,
+    fmt, fs,
     net::{SocketAddr, TcpListener},
-    os::unix::fs as unix_fs,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs as unix_fs},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use anyhow::{Context, Result, anyhow};
+use dashmap::DashMap;
+use s32p_directory::{BucketView, UserDoc};
+use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
     sync::{Mutex, Notify},
     time,
 };
-use tempfile::TempDir;
 
-use crate::config::{WorkersConfig, ServerConfig};
-use s32p_directory::{UserDoc, BucketView};
+use crate::config::{ServerConfig, WorkersConfig};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WorkerKey {
     pub access_key: String,
-    pub profile: String,
+    pub profile:    String,
 }
 
 impl WorkerKey {
     pub fn new(access_key: &str, profile: &str) -> Self {
-        Self {
-            access_key: access_key.to_string(),
-            profile: profile.to_string(),
-        }
+        Self { access_key: access_key.to_string(), profile: profile.to_string() }
     }
 }
 
 pub struct WorkerManager {
-    cfg: WorkersConfig,
-    server_cfg: ServerConfig,
-    slots: DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
+    cfg:             WorkersConfig,
+    server_cfg:      ServerConfig,
+    slots:           DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
     sweeper_started: AtomicBool,
 }
 
 struct WorkerSlot {
-    state: Mutex<SlotState>,
+    state:  Mutex<SlotState>,
     notify: Notify,
 }
 
@@ -73,13 +69,13 @@ impl fmt::Display for WorkerEndpoint {
 }
 
 pub struct WorkerHandle {
-    pub key: WorkerKey,
-    pub username: String,
-    pub endpoint: WorkerEndpoint,
+    pub key:        WorkerKey,
+    pub username:   String,
+    pub endpoint:   WorkerEndpoint,
     pub posix_root: PathBuf,
-    tempdir: Mutex<Option<TempDir>>,
+    tempdir:        Mutex<Option<TempDir>>,
     last_used_unix: AtomicU64,
-    child: Mutex<Child>,
+    child:          Mutex<Child>,
 }
 
 impl WorkerHandle {
@@ -113,7 +109,7 @@ impl WorkerHandle {
             self.username,
             self.key.access_key
         );
-        
+
         let mut child = self.child.lock().await;
         let _ = child.kill().await; // SIGKILL on Unix
         let _ = child.wait().await;
@@ -124,7 +120,7 @@ impl WorkerHandle {
         if let Some(dir) = td.take() {
             let _ = dir.close(); // ignore error; best-effort cleanup
         }
-        
+
         tracing::debug!(
             "worker process terminated and resources cleaned up (unix_user={}, access_key={})",
             self.username,
@@ -189,7 +185,12 @@ impl WorkerManager {
     }
 
     /// Ensure a worker exists for (user, profile). Uses singleflight per key (concurrent callers wait).
-    pub async fn ensure_running(&self, user: &UserDoc, buckets: &[BucketView], profile: &str) -> Result<Arc<WorkerHandle>> {
+    pub async fn ensure_running(
+        &self,
+        user: &UserDoc,
+        buckets: &[BucketView],
+        profile: &str,
+    ) -> Result<Arc<WorkerHandle>> {
         let key = WorkerKey::new(user.access_key.as_str(), profile);
 
         let slot = self
@@ -197,7 +198,7 @@ impl WorkerManager {
             .entry(key.clone())
             .or_insert_with(|| {
                 Arc::new(WorkerSlot {
-                    state: Mutex::new(SlotState::Stopped),
+                    state:  Mutex::new(SlotState::Stopped),
                     notify: Notify::new(),
                 })
             })
@@ -253,7 +254,12 @@ impl WorkerManager {
         }
     }
 
-    async fn spawn_worker(&self, user: &UserDoc, buckets: &[BucketView], profile_name: &str) -> Result<Arc<WorkerHandle>> {
+    async fn spawn_worker(
+        &self,
+        user: &UserDoc,
+        buckets: &[BucketView],
+        profile_name: &str,
+    ) -> Result<Arc<WorkerHandle>> {
         let profile = self
             .cfg
             .profiles
@@ -264,7 +270,7 @@ impl WorkerManager {
 
         // Create fresh staged root with bucket links
         let (tempdir, staged_root) = create_staged_posix_root(
-            &self.cfg.posix_root,       // treating cfg.posix_root as "runtime_root" base
+            &self.cfg.posix_root, // treating cfg.posix_root as "runtime_root" base
             user.uid,
             user.gid,
             &user.access_key,
@@ -297,9 +303,8 @@ impl WorkerManager {
             crate::config::UpstreamKind::Tcp => {
                 let port = pick_free_port().context("failed to pick a free local port")?;
                 let bind_addr = format!("127.0.0.1:{port}");
-                let addr: SocketAddr = bind_addr
-                    .parse()
-                    .map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
+                let addr: SocketAddr =
+                    bind_addr.parse().map_err(|e| anyhow!("bad bind addr '{bind_addr}': {e}"))?;
 
                 WorkerEndpoint::Tcp(addr)
             }
@@ -308,8 +313,13 @@ impl WorkerManager {
                     anyhow!("workers.upstream.uds_run_dir missing (required for uds)")
                 })?;
 
-                let sock_path = uds_socket_path(base, user.uid, profile_name)
-                    .with_context(|| format!("failed to build uds socket path for uid={} profile={profile_name}", user.uid))?;
+                let sock_path =
+                    uds_socket_path(base, user.uid, profile_name).with_context(|| {
+                        format!(
+                            "failed to build uds socket path for uid={} profile={profile_name}",
+                            user.uid
+                        )
+                    })?;
 
                 // Remove stale socket file from a previous crash/restart
                 let _ = std::fs::remove_file(&sock_path);
@@ -323,18 +333,18 @@ impl WorkerManager {
         } else {
             self.server_cfg.virtual_hosted_suffixes.join(",")
         };
-        
+
         let vars = TemplateVars {
-            username: &user.username,
-            uid: user.uid,
-            gid: user.gid,
-            access_key: &user.access_key,
-            secret_key: &user.secret_key,
-            posix_root: &staged_root_str,
-            endpoint: &endpoint,
-            region: &self.server_cfg.region,
+            username:                &user.username,
+            uid:                     user.uid,
+            gid:                     user.gid,
+            access_key:              &user.access_key,
+            secret_key:              &user.secret_key,
+            posix_root:              &staged_root_str,
+            endpoint:                &endpoint,
+            region:                  &self.server_cfg.region,
             virtual_hosted_suffixes: &virtual_hosted_suffixes_str,
-            log_level: &self.server_cfg.log_level.as_deref().unwrap_or("info"),
+            log_level:               &self.server_cfg.log_level.as_deref().unwrap_or("info"),
         };
 
         let rendered_args = render_args(&profile.args, &vars)
@@ -356,17 +366,17 @@ impl WorkerManager {
 
         // log command and env for debuuging
         tracing::debug!(command = ?cmd, "spawning worker");
-        
+
         let child = cmd.spawn().context("failed to spawn launcher/worker")?;
 
         let handle = Arc::new(WorkerHandle {
-            key: WorkerKey::new(user.access_key.as_str(), profile_name),
-            username: user.username.clone(),
-            endpoint: endpoint.clone(),
-            posix_root: staged_root.clone(),
-            tempdir: Mutex::new(Some(tempdir)),
+            key:            WorkerKey::new(user.access_key.as_str(), profile_name),
+            username:       user.username.clone(),
+            endpoint:       endpoint.clone(),
+            posix_root:     staged_root.clone(),
+            tempdir:        Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
-            child: Mutex::new(child),
+            child:          Mutex::new(child),
         });
 
         wait_until_ready(&endpoint, Duration::from_secs(20)).await?;
@@ -419,23 +429,26 @@ impl WorkerManager {
 /* ---------------- templating ---------------- */
 
 struct TemplateVars<'a> {
-    username: &'a str,
-    uid: u32,
-    gid: u32,
-    access_key: &'a str,
-    secret_key: &'a str,
-    posix_root: &'a str,
-    endpoint: &'a WorkerEndpoint,
-    region: &'a str,
+    username:                &'a str,
+    uid:                     u32,
+    gid:                     u32,
+    access_key:              &'a str,
+    secret_key:              &'a str,
+    posix_root:              &'a str,
+    endpoint:                &'a WorkerEndpoint,
+    region:                  &'a str,
     virtual_hosted_suffixes: &'a str,
-    log_level: &'a str,
+    log_level:               &'a str,
 }
 
 fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
     args.iter().map(|a| render_template(a, vars)).collect()
 }
 
-fn render_env(env: &std::collections::BTreeMap<String, String>, vars: &TemplateVars<'_>) -> Result<Vec<(String, String)>> {
+fn render_env(
+    env: &std::collections::BTreeMap<String, String>,
+    vars: &TemplateVars<'_>,
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(env.len());
     for (k, v) in env {
         out.push((k.clone(), render_template(v, vars)?));
@@ -605,15 +618,17 @@ fn create_staged_posix_root(
         let _ = fs::remove_file(&link_tmp);
         let _ = fs::remove_file(&link_final);
 
-        unix_fs::symlink(target, &link_tmp)
-            .with_context(|| format!("failed to symlink {} -> {}", link_tmp.display(), target.display()))?;
+        unix_fs::symlink(target, &link_tmp).with_context(|| {
+            format!("failed to symlink {} -> {}", link_tmp.display(), target.display())
+        })?;
 
         // If you care about link ownership (usually not required), lchown it when root.
         // Directory ownership is the important part.
         let _ = lchown_if_root(&link_tmp, user_uid, user_gid);
 
-        fs::rename(&link_tmp, &link_final)
-            .with_context(|| format!("failed to rename {} -> {}", link_tmp.display(), link_final.display()))?;
+        fs::rename(&link_tmp, &link_final).with_context(|| {
+            format!("failed to rename {} -> {}", link_tmp.display(), link_final.display())
+        })?;
     }
 
     Ok((td, root))
@@ -636,4 +651,3 @@ fn uds_socket_path(base: &str, uid: u32, profile: &str) -> Result<PathBuf> {
     ensure_dir(&dir, 0o755)?;
     Ok(dir.join(format!("{profile}.sock")))
 }
-

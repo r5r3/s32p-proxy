@@ -1,9 +1,9 @@
 use http_body_util::BodyExt;
-use pingora::http::{ResponseHeader, StatusCode};
-use pingora::proxy::Session;
-
+use pingora::{
+    http::{ResponseHeader, StatusCode},
+    proxy::Session,
+};
 use s32p_support::s3resp;
-
 // Re-export shared error codes + shared bucket info type to keep call-sites unchanged.
 pub use s32p_support::s3xml::error_code;
 
@@ -15,7 +15,11 @@ pub use s32p_support::s3xml::error_code;
 ///
 /// This is intended for **small/complete** responses (our shared s3resp builders always use full bodies).
 /// If you later want true streaming to downstream (large bodies), implement a streaming adapter instead.
-pub async fn respond_hyper(session: &mut Session, resp: s32p_support::s3resp::HttpResponse, close: bool) -> pingora::Result<()> {
+pub async fn respond_hyper(
+    session: &mut Session,
+    resp: s32p_support::s3resp::HttpResponse,
+    close: bool,
+) -> pingora::Result<()> {
     if close {
         session.set_keepalive(None);
         session.set_close_on_response_before_downstream_finish(true);

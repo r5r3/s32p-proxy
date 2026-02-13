@@ -9,8 +9,8 @@ pub mod types;
 pub mod yaml;
 
 pub use file::{
-    load_directory_yaml_file, parse_directory_yaml_str, render_directory_yaml_string,
-    save_directory_yaml_file, DirectoryFileV1,
+    DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
+    render_directory_yaml_string, save_directory_yaml_file,
 };
 pub use layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
 pub use types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc};

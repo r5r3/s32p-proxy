@@ -1,14 +1,15 @@
 //! Utility functions for string manipulation and other common operations.
 
-use anyhow::{anyhow, Result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, anyhow};
 
 /// A byte range for HTTP range requests.
 /// Represents a range [start, end_excl) where end_excl is exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
     /// Start of the range (inclusive)
-    pub start: u64,
+    pub start:    u64,
     /// End of the range (exclusive)
     pub end_excl: u64,
 }
@@ -67,14 +68,12 @@ pub fn parse_u64_strict(s: &str, what: &str) -> Result<u64> {
     if v.is_empty() {
         return Err(anyhow!("empty {what}"));
     }
-    v.parse::<u64>()
-        .map_err(|_| anyhow!("invalid {what}: {s:?}"))
+    v.parse::<u64>().map_err(|_| anyhow!("invalid {what}: {s:?}"))
 }
 
 /// Parse an HTTP date (IMF-fixdate, RFC 7231) into SystemTime.
 pub fn parse_http_date(s: &str) -> Result<SystemTime> {
-    httpdate::parse_http_date(s.trim())
-        .map_err(|_| anyhow!("invalid HTTP-date value: {s:?}"))
+    httpdate::parse_http_date(s.trim()).map_err(|_| anyhow!("invalid HTTP-date value: {s:?}"))
 }
 
 /// Parse x-amz-if-match-last-modified-time value.
@@ -122,11 +121,7 @@ pub fn normalize_etag_token(tok: &str) -> Option<String> {
     let t = t.strip_suffix('"').unwrap_or(t);
 
     let t = t.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
+    if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
 /// Parse If-Match / If-None-Match value (comma-separated).
@@ -153,9 +148,7 @@ pub fn parse_etag_condition(value: &str) -> Result<ETagCondition> {
     }
 
     if out.is_empty() {
-        return Err(anyhow!(
-            "ETag precondition header present but contains no usable ETag tokens"
-        ));
+        return Err(anyhow!("ETag precondition header present but contains no usable ETag tokens"));
     }
 
     out.sort();
@@ -177,7 +170,7 @@ pub fn parse_etag_condition(value: &str) -> Result<ETagCondition> {
 ///
 /// # Examples
 /// ```
-/// use s32p_support::utils::{parse_range_header, ByteRange};
+/// use s32p_support::utils::{ByteRange, parse_range_header};
 ///
 /// let range = parse_range_header("bytes=0-99", 200).unwrap();
 /// assert_eq!(range, Some(ByteRange { start: 0, end_excl: 100 }));
@@ -210,10 +203,7 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
             return Err(anyhow!("bad Range suffix"));
         }
         let start = size.saturating_sub(suffix);
-        return Ok(Some(ByteRange {
-            start,
-            end_excl: size,
-        }));
+        return Ok(Some(ByteRange { start, end_excl: size }));
     }
 
     let start: u64 = a.parse().map_err(|_| anyhow!("bad Range start"))?;
@@ -237,10 +227,7 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
         return Err(anyhow!("Range end < start"));
     }
 
-    Ok(Some(ByteRange {
-        start,
-        end_excl: end_incl + 1,
-    }))
+    Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
 }
 
 #[cfg(test)]

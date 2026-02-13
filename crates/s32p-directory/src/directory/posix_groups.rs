@@ -1,7 +1,10 @@
-use anyhow::{anyhow, Context, Result};
+use std::{
+    ffi::{CStr, CString},
+    ptr,
+};
+
+use anyhow::{Context, Result, anyhow};
 use libc::{c_char, gid_t};
-use std::ffi::{CStr, CString};
-use std::ptr;
 
 pub fn groups_for_user(username: &str, primary_gid: u32) -> Result<Vec<String>> {
     let c_user = CString::new(username).context("username contains NUL")?;
@@ -74,4 +77,3 @@ fn group_name_from_gid(gid: gid_t) -> Result<Option<String>> {
         Ok(Some(cstr.to_string_lossy().to_string()))
     }
 }
-

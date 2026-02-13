@@ -1,14 +1,16 @@
-use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use s32p_admin::{OpenBaoAdmin};
-use s32p_admin::yaml::{
-    DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
-    render_directory_yaml_string, save_directory_yaml_file,
-};
-use s32p_directory::directory::layout::{normalize_acl}; // ensure layout.rs is public
-use s32p_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
-
 use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use s32p_admin::{
+    OpenBaoAdmin,
+    yaml::{
+        DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
+        render_directory_yaml_string, save_directory_yaml_file,
+    },
+};
+use s32p_directory::directory::layout::normalize_acl; // ensure layout.rs is public
+use s32p_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
 use uuid::Uuid;
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -108,7 +110,8 @@ struct OpenBaoAuthArgs {
 
 impl OpenBaoAuthArgs {
     fn read_trimmed(path: &Path) -> Result<String> {
-        let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Ok(s.trim().to_string())
     }
 }
@@ -160,14 +163,14 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
 struct SetupArgs {
     /// For OpenBao: write proxy role_id to file
     #[arg(long)]
-    proxy_role_id_file: Option<PathBuf>,
+    proxy_role_id_file:   Option<PathBuf>,
     /// For OpenBao: write proxy secret_id to file
     #[arg(long)]
     proxy_secret_id_file: Option<PathBuf>,
 
     /// For OpenBao: write admin role_id to file
     #[arg(long)]
-    admin_role_id_file: Option<PathBuf>,
+    admin_role_id_file:   Option<PathBuf>,
     /// For OpenBao: write admin secret_id to file
     #[arg(long)]
     admin_secret_id_file: Option<PathBuf>,
@@ -175,7 +178,8 @@ struct SetupArgs {
 
 fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
     }
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
 
@@ -183,7 +187,8 @@ fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let perm = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perm).with_context(|| format!("chmod 0600 {}", path.display()))?;
+        std::fs::set_permissions(path, perm)
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
     }
 
     Ok(())
@@ -199,11 +204,7 @@ fn load_yaml_or_default(path: &Path) -> Result<DirectoryFileV1> {
     if path.exists() {
         load_directory_yaml_file(path.to_str().unwrap())
     } else {
-        Ok(DirectoryFileV1 {
-            version: 1,
-            users: vec![],
-            buckets: vec![],
-        })
+        Ok(DirectoryFileV1 { version: 1, users: vec![], buckets: vec![] })
     }
 }
 
@@ -223,11 +224,11 @@ struct UserAddArgs {
     #[arg(long)]
     secret_key: String,
     #[arg(long)]
-    username: String,
+    username:   String,
     #[arg(long)]
-    uid: u32,
+    uid:        u32,
     #[arg(long)]
-    gid: u32,
+    gid:        u32,
 }
 
 #[derive(Args, Debug)]
@@ -257,7 +258,7 @@ struct BucketAddArgs {
     bucket_id: Option<String>,
 
     #[arg(long)]
-    name: String,
+    name:      String,
     #[arg(long)]
     data_path: String,
 
@@ -319,12 +320,8 @@ fn parse_grant(s: &str) -> Result<AclEntry> {
     }
 
     let principal = match parts[0].trim().to_ascii_lowercase().as_str() {
-        "ak" | "access_key" => Principal::AccessKey {
-            access_key: parts[1].trim().to_string(),
-        },
-        "group" | "group_name" => Principal::GroupName {
-            name: parts[1].trim().to_string(),
-        },
+        "ak" | "access_key" => Principal::AccessKey { access_key: parts[1].trim().to_string() },
+        "group" | "group_name" => Principal::GroupName { name: parts[1].trim().to_string() },
         other => return Err(anyhow!("invalid grant principal type '{other}' in '{s}'")),
     };
 
@@ -365,7 +362,11 @@ fn yaml_bucket_delete(doc: &mut DirectoryFileV1, bucket_id: &str) {
     doc.buckets.retain(|b| b.id != bucket_id);
 }
 
-fn yaml_bucket_set_acl(doc: &mut DirectoryFileV1, bucket_id: &str, acl: Vec<AclEntry>) -> Result<()> {
+fn yaml_bucket_set_acl(
+    doc: &mut DirectoryFileV1,
+    bucket_id: &str,
+    acl: Vec<AclEntry>,
+) -> Result<()> {
     let b = doc
         .buckets
         .iter_mut()
@@ -395,11 +396,14 @@ async fn main() -> Result<()> {
                 let address = openbao
                     .address
                     .as_ref()
-                    .ok_or_else(|| anyhow!("missing OpenBao address: provide --address or VAULT_ADDR"))?
+                    .ok_or_else(|| {
+                        anyhow!("missing OpenBao address: provide --address or VAULT_ADDR")
+                    })?
                     .clone();
 
                 let root_token = openbao
-                    .auth.token
+                    .auth
+                    .token
                     .clone()
                     .ok_or_else(|| anyhow!("setup(openbao) requires --token or VAULT_TOKEN"))?;
 
@@ -435,11 +439,7 @@ async fn main() -> Result<()> {
             }
             Backend::Yaml => {
                 let path = require_yaml_path(&yaml_path)?;
-                let doc = DirectoryFileV1 {
-                    version: 1,
-                    users: vec![],
-                    buckets: vec![],
-                };
+                let doc = DirectoryFileV1 { version: 1, users: vec![], buckets: vec![] };
                 save_directory_yaml_file(path.to_str().unwrap(), &doc)?;
                 println!("ok: wrote {}", path.display());
             }
@@ -452,9 +452,9 @@ async fn main() -> Result<()> {
                     let user = UserDoc {
                         access_key: args.access_key,
                         secret_key: args.secret_key,
-                        username: args.username,
-                        uid: args.uid,
-                        gid: args.gid,
+                        username:   args.username,
+                        uid:        args.uid,
+                        gid:        args.gid,
                     };
                     admin.upsert_user(user).await?;
                     println!("ok");
@@ -465,9 +465,9 @@ async fn main() -> Result<()> {
                     let user = UserDoc {
                         access_key: args.access_key,
                         secret_key: args.secret_key,
-                        username: args.username,
-                        uid: args.uid,
-                        gid: args.gid,
+                        username:   args.username,
+                        uid:        args.uid,
+                        gid:        args.gid,
                     };
                     yaml_user_upsert(&mut doc, user);
                     save_directory_yaml_file(path.to_str().unwrap(), &doc)?;
@@ -521,16 +521,13 @@ async fn main() -> Result<()> {
                     }
 
                     if let Some(id) = args.bucket_id {
-                        let bucket = BucketDoc {
-                            id,
-                            name: args.name,
-                            data_path: args.data_path,
-                            acl,
-                        };
+                        let bucket =
+                            BucketDoc { id, name: args.name, data_path: args.data_path, acl };
                         admin.upsert_bucket(bucket).await?;
                         println!("ok");
                     } else {
-                        let bucket_id = admin.create_bucket(&args.name, &args.data_path, acl).await?;
+                        let bucket_id =
+                            admin.create_bucket(&args.name, &args.data_path, acl).await?;
                         println!("{bucket_id}");
                     }
                 }
@@ -623,9 +620,7 @@ async fn main() -> Result<()> {
         Cmd::ImportYaml(args) => match backend {
             Backend::Openbao => {
                 let admin = openbao_admin(&openbao).await?;
-                admin
-                    .import_yaml_file(args.yaml.to_str().unwrap(), args.replace)
-                    .await?;
+                admin.import_yaml_file(args.yaml.to_str().unwrap(), args.replace).await?;
                 println!("ok");
             }
             Backend::Yaml => {
@@ -671,4 +666,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
