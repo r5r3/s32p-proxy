@@ -477,7 +477,7 @@ fn test_precondition_precedence() {
 
 #[test]
 fn test_parse_conditional_headers_empty() {
-    let mut headers = HeaderMap::new();
+    let headers = HeaderMap::new();
     let result = parse_conditional_headers(&headers);
     assert!(result.is_ok());
     let cond = result.unwrap();
