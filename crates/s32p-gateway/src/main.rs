@@ -49,11 +49,13 @@ use crate::fs_helpers::{
     join_object_path,
     open_file,
     statx_info,
-    stripe_count_for_size,
     LustreStriping,
     OpenMode,
     OpenDirect,
 };
+
+#[cfg(feature = "lustre")]
+use crate::fs_helpers::stripe_count_for_size;
 use s32p_support;
 use s32p_support::utils::{ByteRange, parse_range_header};
 use s32p_support::preconditions::{evaluate_copy_source_preconditions, evaluate_read_preconditions, evaluate_write_preconditions, parse_conditional_headers, PreconditionOutcome};
@@ -77,6 +79,7 @@ struct Cfg {
     direct_io: bool,
     copy_max_size: u64,
     mpu_dir_name: String,
+    #[cfg(feature = "lustre")]
     lustre_max_stripe_count: u32,
     virtual_hosted_suffixes: Vec<String>,
 }
@@ -129,6 +132,7 @@ fn load_cfg() -> Result<Cfg> {
     }
 
     // Maximum Lustre stripe count (only effective with --features lustre)
+    #[allow(unused_variables)]
     let lustre_max_stripe_count = env_usize("S32P_LUSTRE_MAX_STRIPE_COUNT", 4).max(1) as u32;
 
     // Load virtual hosted suffixes from environment variable
@@ -150,6 +154,7 @@ fn load_cfg() -> Result<Cfg> {
         direct_io,
         copy_max_size,
         mpu_dir_name,
+        #[cfg(feature = "lustre")]
         lustre_max_stripe_count,
         virtual_hosted_suffixes,
     })

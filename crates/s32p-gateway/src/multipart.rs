@@ -33,12 +33,14 @@ use crate::fs_helpers::{
     join_object_path,
     ftruncate_file,
     open_file,
-    stripe_count_for_size,
     LustreStriping,
     OpenDirect,
     OpenMode,
     rename_noreplace,
 };
+
+#[cfg(feature = "lustre")]
+use crate::fs_helpers::stripe_count_for_size;
 use s32p_support::preconditions::parse_conditional_headers;
 
 type Resp = s32p_support::s3resp::HttpResponse;

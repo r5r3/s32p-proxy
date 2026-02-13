@@ -175,6 +175,7 @@ impl LustreStriping {
 
 /// Compute a stripe count matching file size (ceil(file_size / stripe_size)),
 /// capped by `max_stripe_count` (and always >= 1).
+#[cfg(feature = "lustre")]
 pub fn stripe_count_for_size(file_size: u64, stripe_size: u64, max_stripe_count: u32) -> u32 {
     if stripe_size == 0 {
         return 1;
@@ -230,7 +231,7 @@ pub fn open_file(
     path: &Path,
     mode: OpenMode,
     direct: OpenDirect,
-    striping: Option<LustreStriping>,
+    #[allow(unused_variables)] striping: Option<LustreStriping>,
 ) -> Result<(File, bool)> {
     // Lustre striping must be set at file creation time.
     #[cfg(all(feature = "lustre", target_os = "linux"))]
