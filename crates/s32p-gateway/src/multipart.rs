@@ -26,6 +26,7 @@ use crate::streaming::{
     WriteObjectDest,
 };
 use s32p_support::preconditions::{evaluate_write_preconditions, PreconditionOutcome};
+use s32p_support::utils::ETagCondition;
 use crate::fs_helpers::{
     bucket_exists_dir,
     bucket_root_path,
@@ -35,7 +36,8 @@ use crate::fs_helpers::{
     stripe_count_for_size,
     LustreStriping,
     OpenDirect,
-    OpenMode
+    OpenMode,
+    rename_noreplace,
 };
 use s32p_support::preconditions::parse_conditional_headers;
 
@@ -1109,6 +1111,9 @@ async fn handle_complete(
         }
     };
 
+    // For atomic commit behavior: If-None-Match: * means "must not overwrite an existing object".
+    let noreplace = matches!(cond.if_none_match, Some(ETagCondition::Any));
+
     // actual precondition check
     let existing = match fs::metadata(&dst_path) {
         Ok(m) => {
@@ -1229,8 +1234,25 @@ async fn handle_complete(
             if let Err(e) = ftruncate_file(&direct_file, final_size) {
                 tracing::warn!("fast path disabled: truncate failed: {e}");
             } else {
-                // Remove existing dst if needed (portable)
-                if let Err(e) = fs::rename(&direct_path, &dst_path) {
+                // Commit assembled direct.bin into final destination.
+                // If noreplace=true, fail with EEXIST instead of overwriting.
+                let rename_res = if noreplace {
+                    rename_noreplace(&direct_path, &dst_path)
+                } else {
+                    fs::rename(&direct_path, &dst_path)
+                };
+
+                if let Err(e) = rename_res {
+                    if noreplace && e.kind() == std::io::ErrorKind::AlreadyExists {
+                        // Destination appeared after our precheck; report correct S3 semantics.
+                        meta.state = UploadState::Active;
+                        let _ = write_meta_atomic(&dir, &meta);
+                        return s32p_support::s3resp::precondition_failed(
+                            "CompleteMultipartUpload precondition failed",
+                            Some(parts.uri.path()),
+                        );
+                    }
+
                     // Cross-device? do a single copy direct.bin -> dst_tmp, then rename tmp -> dst.
                     if is_exdev(&e) {
                         let dst_tmp = match dst_tmp_path(&dst_path, upload_id) {
@@ -1267,10 +1289,27 @@ async fn handle_complete(
                                 app.pool.clone(),
                             ).await {
                                 Ok(()) => {
-                                    if dst_path.exists() {
+                                    if !noreplace && dst_path.exists() {
                                         let _ = fs::remove_file(&dst_path);
                                     }
-                                    if let Err(e2) = fs::rename(&dst_tmp, &dst_path) {
+                                    let commit_res = if noreplace {
+                                        rename_noreplace(&dst_tmp, &dst_path)
+                                    } else {
+                                        // Old behavior overwrites (you already removed dst_path below in some places)
+                                        fs::rename(&dst_tmp, &dst_path)
+                                    };
+
+                                    if let Err(e2) = commit_res {
+                                        if noreplace && e2.kind() == std::io::ErrorKind::AlreadyExists {
+                                            let _ = fs::remove_file(&dst_tmp);
+                                            meta.state = UploadState::Active;
+                                            let _ = write_meta_atomic(&dir, &meta);
+                                            return s32p_support::s3resp::precondition_failed(
+                                                "CompleteMultipartUpload precondition failed",
+                                                Some(parts.uri.path()),
+                                            );
+                                        }
+
                                         tracing::warn!("fast path disabled: rename tmp->dst failed: {e2}");
                                         let _ = fs::remove_file(&dst_tmp);
                                     } else {
@@ -1455,20 +1494,39 @@ async fn handle_complete(
     // Close before rename on some FS implementations
     drop(out_file);
 
-    // Commit staged output into final destination
-    if dst_path.exists() {
+    // Commit staged output into final destination.
+    // If noreplace=true, do NOT remove an existing destination and commit via rename_noreplace.
+    if !noreplace && dst_path.exists() {
         let _ = fs::remove_file(&dst_path);
     }
 
+    let commit_rename = |src: &Path, dst: &Path| -> std::io::Result<()> {
+        if noreplace {
+            rename_noreplace(src, dst)
+        } else {
+            fs::rename(src, dst)
+        }
+    };
+
     if staged_in_dst {
-        // Same filesystem as destination => atomic rename, no extra copy.
-        if let Err(e) = fs::rename(&staged_out, &dst_path) {
+        // Same filesystem as destination => atomic rename (optionally NOREPLACE).
+        if let Err(e) = commit_rename(&staged_out, &dst_path) {
+            if noreplace && e.kind() == std::io::ErrorKind::AlreadyExists {
+                let _ = fs::remove_file(&staged_out);
+                meta.state = UploadState::Active;
+                let _ = write_meta_atomic(&dir, &meta);
+                return s32p_support::s3resp::precondition_failed(
+                    "CompleteMultipartUpload precondition failed",
+                    Some(parts.uri.path()),
+                );
+            }
+
             let _ = fs::remove_file(&staged_out);
             return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
         }
     } else {
         // Old behavior: rename if possible, else EXDEV => copy to dst tmp then rename.
-        match fs::rename(&staged_out, &dst_path) {
+        match commit_rename(&staged_out, &dst_path) {
             Ok(()) => {}
             Err(e) if is_exdev(&e) => {
                 let dst_tmp = match dst_tmp_path(&dst_path, upload_id) {
@@ -1491,10 +1549,21 @@ async fn handle_complete(
                     return s32p_support::s3resp::internal_error(&err.to_string(), Some(parts.uri.path()), None);
                 }
 
-                if dst_path.exists() {
+                if !noreplace && dst_path.exists() {
                     let _ = fs::remove_file(&dst_path);
                 }
-                if let Err(e2) = fs::rename(&dst_tmp, &dst_path) {
+                if let Err(e2) = commit_rename(&dst_tmp, &dst_path) {
+                    if noreplace && e2.kind() == std::io::ErrorKind::AlreadyExists {
+                        let _ = fs::remove_file(&dst_tmp);
+                        let _ = fs::remove_file(&staged_out);
+                        meta.state = UploadState::Active;
+                        let _ = write_meta_atomic(&dir, &meta);
+                        return s32p_support::s3resp::precondition_failed(
+                            "CompleteMultipartUpload precondition failed",
+                            Some(parts.uri.path()),
+                        );
+                    }
+
                     let _ = fs::remove_file(&dst_tmp);
                     return s32p_support::s3resp::internal_error(&e2.to_string(), Some(parts.uri.path()), None);
                 }
@@ -1503,6 +1572,15 @@ async fn handle_complete(
                 let _ = fs::remove_file(&staged_out);
             }
             Err(e) => {
+                if noreplace && e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = fs::remove_file(&staged_out);
+                    meta.state = UploadState::Active;
+                    let _ = write_meta_atomic(&dir, &meta);
+                    return s32p_support::s3resp::precondition_failed(
+                        "CompleteMultipartUpload precondition failed",
+                        Some(parts.uri.path()),
+                    );
+                }
                 return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
             }
         }

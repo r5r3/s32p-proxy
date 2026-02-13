@@ -56,6 +56,78 @@ pub fn bucket_exists_dir(root: &Path, bucket: &str) -> Result<bool> {
 }
 
 /* -------------------------
+ * Atomic rename helpers (Linux)
+ * ------------------------- */
+
+/// Atomically rename `src` to `dst` but fail if `dst` already exists.
+///
+/// On Linux this uses renameat2(RENAME_NOREPLACE).
+/// - If dst exists: returns io::ErrorKind::AlreadyExists (EEXIST)
+/// - If across devices: returns EXDEV (caller may fall back to copy+rename inside dst FS)
+///
+/// If renameat2 is not available (ENOSYS/EINVAL), this falls back to a best-effort
+/// "exists check + rename" (not race-free, but only used on kernels without renameat2).
+pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let src_bytes = src.as_os_str().as_bytes();
+        let dst_bytes = dst.as_os_str().as_bytes();
+        if src_bytes.is_empty() || src_bytes.contains(&0) || dst_bytes.is_empty() || dst_bytes.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL/empty path"));
+        }
+
+        let c_src = CString::new(src_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in src path"))?;
+        let c_dst = CString::new(dst_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in dst path"))?;
+
+        let rc = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                c_src.as_ptr(),
+                libc::AT_FDCWD,
+                c_dst.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+
+        if rc == 0 {
+            return Ok(());
+        }
+
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(errno) if errno == libc::EEXIST => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, err));
+            }
+            Some(errno) if errno == libc::ENOSYS || errno == libc::EINVAL => {
+                // Kernel/libc doesn't support renameat2(RENAME_NOREPLACE).
+                // Best-effort fallback (not race-free).
+                if dst.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "destination exists",
+                    ));
+                }
+                return std::fs::rename(src, dst);
+            }
+            _ => return Err(err),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if dst.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination exists",
+            ));
+        }
+        std::fs::rename(src, dst)
+    }
+}
+
+/* -------------------------
  * File open helpers (Linux)
  * ------------------------- */
 
