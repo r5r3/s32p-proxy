@@ -9,6 +9,7 @@ members = [
   "crates/s32p-admin",
   "crates/s32p-ctl",
   "crates/s32p-gateway",
+  "crates/restricted-exec",
 ]
 
 [workspace.package]

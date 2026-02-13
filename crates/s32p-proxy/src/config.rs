@@ -188,6 +188,25 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Resolve placeholders in the launcher path.
+    /// Currently supports: {{install_bin_dir}}
+    pub fn resolve_placeholders(&mut self, install_bin_dir: &str) -> Result<()> {
+        // Resolve {{install_bin_dir}} in launcher path
+        if self.workers.launcher.path.contains("{{install_bin_dir}}") {
+            self.workers.launcher.path = self.workers.launcher.path
+                .replace("{{install_bin_dir}}", install_bin_dir);
+        }
+
+        // Resolve {{install_bin_dir}} in worker profiles
+        for profile in self.workers.profiles.values_mut() {
+            if profile.exec.contains("{{install_bin_dir}}") {
+                profile.exec = profile.exec.replace("{{install_bin_dir}}", install_bin_dir);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != 1 {
             return Err(anyhow!("unsupported config version {} (expected 1)", self.version));

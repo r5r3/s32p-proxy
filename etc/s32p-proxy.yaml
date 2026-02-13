@@ -27,7 +27,7 @@ workers:
   posix_root: "/tmp/s3"
 
   launcher:
-    path: "../restricted-exec/target/debug/restricted-exec"
+    path: "{{install_bin_dir}}/restricted-exec"
     pass_user_flag_if_root: true
 
   lifecycle:
@@ -52,7 +52,7 @@ workers:
       upstream:
         kind: "uds"
         uds_run_dir: "/run/user/10270/s32p"
-      exec: "target/debug/s32p-gateway"
+      exec: "{{install_bin_dir}}/s32p-gateway"
       args: []
       env:
         S32P_BIND_UDS: "{{bind_uds}}"

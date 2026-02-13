@@ -316,6 +316,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - allows routing different command classes to different worker profiles per access key
 - Workers are started via a configurable launcher (default: `restricted-exec`)
   - If running as root and `pass_user_flag_if_root=true`, the proxy passes `--user <username>`
+  - The launcher path supports placeholders like `{{install_bin_dir}}` to dynamically resolve the executable directory.
 - Upstream bind (per worker):
   - TCP loopback: `127.0.0.1:<port>`
   - Unix domain socket: `/run/s32p/<uid>/worker.sock` (example; configurable)
@@ -331,6 +332,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
 
 Worker args/env templates support placeholders such as:
 - `{{bind_addr}}`, `{{port}}`, `{{posix_root}}`, `{{access_key}}`, `{{secret_key}}`, `{{region}}`, `{{virtual_hosted_suffixes}}`, etc.
+- `{{install_bin_dir}}`: Resolves to the directory containing the `s32p-proxy` executable (e.g., `target/debug` or `/usr/local/bin`).
 
 ---
 
@@ -644,6 +646,14 @@ s32p-ctl ... export-yaml --yaml /path/to/directory.yaml
 ## Building
 
 ```bash
+# Clone the repository with submodules
+git clone --recurse-submodules https://github.com/r5r3/s32p-proxy.git
+cd s32p
+
+# If you already cloned without submodules, initialize them:
+git submodule update --init --recursive
+
+# Build the workspace
 cargo build
 ```
 

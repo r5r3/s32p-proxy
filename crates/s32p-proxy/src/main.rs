@@ -430,7 +430,15 @@ fn main() -> Result<()> {
     rustls_prefer_fast_cipher().unwrap();
 
     // Load config first to get log level from config file
-    let cfg = config::Config::from_path("etc/s32p-proxy.yaml")?;
+    let mut cfg = config::Config::from_path("etc/s32p-proxy.yaml")?;
+
+    // Resolve placeholders in the config (e.g., {{install_bin_dir}})
+    // Determine the install_bin_dir: use the directory of the current executable
+    let install_bin_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "target/debug".to_string());
+    cfg.resolve_placeholders(&install_bin_dir)?;
 
     // Determine log level: config file takes precedence, then RUST_LOG env var, then default
     let log_filter = if let Some(log_level) = &cfg.server.log_level {
