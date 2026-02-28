@@ -124,7 +124,7 @@ pub fn file_create(
             stripe_size as libc::c_ulong,
             stripe_offset as libc::c_int,
             stripe_count as libc::c_int,
-            stripe_pattern as libc::c_uint,
+            stripe_pattern as libc::c_int,
         )
     };
 
