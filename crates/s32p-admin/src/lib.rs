@@ -1,4 +1,5 @@
 pub mod openbao;
+pub mod versity_iam;
 pub mod yaml;
 
 pub use openbao::{AppRoleCredentials, OpenBaoAdmin, OpenBaoAuth, SetupResult};

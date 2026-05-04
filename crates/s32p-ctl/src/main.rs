@@ -57,6 +57,13 @@ enum Cmd {
     /// Import a directory.yaml into the backend.
     ImportYaml(ImportYamlArgs),
 
+    /// Import users from a VersityGW IAM JSON file (`accessAccounts`).
+    ///
+    /// `username` is resolved at runtime via `getpwuid_r(userID)`.
+    /// VG `role` is discarded; VG IAM has no bucket concept, so buckets/ACLs
+    /// in the directory are not touched. Always merges (no `--replace`).
+    ImportVersityIam(ImportVersityIamArgs),
+
     /// Export backend state to a directory.yaml.
     ExportYaml(ExportYamlArgs),
 }
@@ -301,6 +308,45 @@ struct ExportYamlArgs {
     yaml: PathBuf,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum OnMissingUserArg {
+    /// Hard error and stop the import (default).
+    Error,
+    /// Use the VG access key string as the `username`.
+    UseAccessKey,
+    /// Log a warning and skip the entry.
+    Skip,
+}
+
+impl From<OnMissingUserArg> for s32p_admin::versity_iam::OnMissingUser {
+    fn from(v: OnMissingUserArg) -> Self {
+        match v {
+            OnMissingUserArg::Error => Self::Error,
+            OnMissingUserArg::UseAccessKey => Self::UseAccessKey,
+            OnMissingUserArg::Skip => Self::Skip,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct ImportVersityIamArgs {
+    /// Path to the VersityGW IAM JSON file.
+    #[arg(long)]
+    json: PathBuf,
+
+    /// What to do when `getpwuid_r(userID)` returns no entry.
+    #[arg(long, value_enum, default_value_t = OnMissingUserArg::Error)]
+    on_missing_user: OnMissingUserArg,
+
+    /// Only import these access keys (repeatable). Mutually exclusive with --exclude.
+    #[arg(long = "include")]
+    include: Vec<String>,
+
+    /// Skip these access keys (repeatable). Mutually exclusive with --include.
+    #[arg(long = "exclude", conflicts_with = "include")]
+    exclude: Vec<String>,
+}
+
 /* ------------------- parsing helpers ------------------- */
 
 fn parse_access_level(s: &str) -> Result<AccessLevel> {
@@ -360,6 +406,21 @@ fn yaml_bucket_upsert(doc: &mut DirectoryFileV1, mut bucket: BucketDoc) {
 
 fn yaml_bucket_delete(doc: &mut DirectoryFileV1, bucket_id: &str) {
     doc.buckets.retain(|b| b.id != bucket_id);
+}
+
+fn print_versity_report(r: &s32p_admin::versity_iam::ImportReport) {
+    println!(
+        "imported={} filtered={} missing-user-skipped={}",
+        r.imported.len(),
+        r.filtered.len(),
+        r.missing_user_skipped.len()
+    );
+    if !r.filtered.is_empty() {
+        println!("filtered: {}", r.filtered.join(", "));
+    }
+    if !r.missing_user_skipped.is_empty() {
+        println!("missing-user skipped: {}", r.missing_user_skipped.join(", "));
+    }
 }
 
 fn yaml_bucket_set_acl(
@@ -646,6 +707,48 @@ async fn main() -> Result<()> {
                 println!("ok");
             }
         },
+
+        Cmd::ImportVersityIam(args) => {
+            use s32p_admin::versity_iam::{
+                ImportFilter, parse_versity_iam_file, versity_iam_to_user_docs,
+            };
+
+            let filter = ImportFilter {
+                include: if args.include.is_empty() {
+                    None
+                } else {
+                    Some(args.include.iter().cloned().collect())
+                },
+                exclude: if args.exclude.is_empty() {
+                    None
+                } else {
+                    Some(args.exclude.iter().cloned().collect())
+                },
+            };
+            let on_missing = args.on_missing_user.into();
+
+            match backend {
+                Backend::Openbao => {
+                    let admin = openbao_admin(&openbao).await?;
+                    let report = admin
+                        .import_versity_iam_file(args.json.to_str().unwrap(), &filter, on_missing)
+                        .await?;
+                    print_versity_report(&report);
+                }
+                Backend::Yaml => {
+                    let path = require_yaml_path(&yaml_path)?;
+                    let mut doc = load_yaml_or_default(&path)?;
+                    let file = parse_versity_iam_file(args.json.to_str().unwrap())?;
+                    let (users, report) =
+                        versity_iam_to_user_docs(&file, &filter, on_missing)?;
+                    for u in users {
+                        yaml_user_upsert(&mut doc, u);
+                    }
+                    save_directory_yaml_file(path.to_str().unwrap(), &doc)?;
+                    print_versity_report(&report);
+                }
+            }
+        }
 
         Cmd::ExportYaml(args) => match backend {
             Backend::Openbao => {

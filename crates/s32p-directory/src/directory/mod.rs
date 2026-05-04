@@ -5,6 +5,7 @@ pub mod file;
 pub mod layout;
 pub mod openbao;
 pub mod posix_groups;
+pub mod posix_users;
 pub mod types;
 pub mod yaml;
 

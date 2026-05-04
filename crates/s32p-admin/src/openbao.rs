@@ -505,4 +505,35 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             std::fs::read_to_string(path).with_context(|| format!("read yaml file {path}"))?;
         self.import_yaml_string(&text, replace).await
     }
+
+    /* ----------------------------- VersityGW IAM JSON import ----------------------------- */
+
+    /// Import users from a VersityGW IAM JSON string. Always merges (existing
+    /// users with the same access_key are overwritten). Buckets/ACLs are not
+    /// touched: VG IAM has no bucket concept.
+    pub async fn import_versity_iam_string(
+        &self,
+        json: &str,
+        filter: &crate::versity_iam::ImportFilter,
+        on_missing: crate::versity_iam::OnMissingUser,
+    ) -> Result<crate::versity_iam::ImportReport> {
+        let file = crate::versity_iam::parse_versity_iam_str(json)?;
+        let (users, report) =
+            crate::versity_iam::versity_iam_to_user_docs(&file, filter, on_missing)?;
+        for u in users {
+            self.upsert_user(u).await?;
+        }
+        Ok(report)
+    }
+
+    pub async fn import_versity_iam_file(
+        &self,
+        path: &str,
+        filter: &crate::versity_iam::ImportFilter,
+        on_missing: crate::versity_iam::OnMissingUser,
+    ) -> Result<crate::versity_iam::ImportReport> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read versity iam file {path}"))?;
+        self.import_versity_iam_string(&text, filter, on_missing).await
+    }
 }

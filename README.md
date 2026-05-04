@@ -643,6 +643,48 @@ Export backend state to a directory YAML:
 s32p-ctl ... export-yaml --yaml /path/to/directory.yaml
 ```
 
+#### Importing VersityGW IAM JSON
+
+Import users from a VersityGW IAM JSON file (the `accessAccounts` map). Works
+against both backends, always merges into the existing directory (existing
+users with the same access key are overwritten; buckets/ACLs are not touched
+since VG IAM has no bucket concept).
+
+```bash
+s32p-ctl ... import-versity-iam --json /path/to/iam.json
+```
+
+Mapping: VG `access` → `access_key`, `secret` → `secret_key`, `userID` → `uid`,
+`groupID` → `gid`. The `username` field is resolved at runtime on the host
+running `s32p-ctl` via `getpwuid_r(userID)`. The VG `role` field and any other
+unknown fields (e.g. `projectID`) are ignored.
+
+Filtering (mutually exclusive, both repeatable, matched against the access key):
+
+- `--include <ACCESS_KEY>` — import only the listed users.
+- `--exclude <ACCESS_KEY>` — import everything except the listed users.
+
+What to do when `getpwuid_r(userID)` returns no entry on the local host:
+
+- `--on-missing-user error` (default) — hard error, stop the import.
+- `--on-missing-user use-access-key` — use the VG access key string as the username.
+- `--on-missing-user skip` — log a warning and skip that entry.
+
+Examples:
+
+```bash
+# OpenBao backend, only two users, fall back to access key for unknown uids
+s32p-ctl --backend openbao ... \
+  import-versity-iam \
+    --json iam.json \
+    --include alice --include bob \
+    --on-missing-user use-access-key
+
+# YAML backend, exclude a service account
+s32p-ctl --backend yaml --yaml-path /etc/s32p/directory.yaml \
+  import-versity-iam --json iam.json --exclude svc-test
+```
+
 ## Building
 
 ```bash

@@ -10,7 +10,7 @@ pub use directory::file::{
 // layout.rs API (so admin can import from s32p_directory::DirectoryLayout etc if you want)
 pub use directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
 pub use directory::{
-    Directory, file, layout, openbao, posix_groups, types,
+    Directory, file, layout, openbao, posix_groups, posix_users, types,
     types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc},
     yaml,
 };
