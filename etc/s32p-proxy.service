@@ -1,0 +1,38 @@
+[Unit]
+Description=S3 Proxy Manager (s32p-proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Proxy must run as root so restricted-exec can switch each worker into its
+# target Unix user (see workers.launcher.pass_user_flag_if_root in
+# s32p-proxy.yaml). Drop privileges only if you also remove that setting.
+User=root
+Group=root
+
+# Any relative paths inside the YAML (tls_cert_path, directory.yaml path, OpenBao
+# role/secret files, profile.exec for versitygw, etc.) are resolved against this
+# CWD. For a packaged install, prefer absolute paths in the YAML.
+WorkingDirectory=/etc/s32p
+ExecStart=/usr/local/bin/s32p-proxy --config /etc/s32p/s32p-proxy.yaml
+
+# Workers and restricted-exec inherit the proxy's stderr, so a single sink
+# captures all three. systemd creates /var/log/s32p/ for us.
+LogsDirectory=s32p
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/s32p/s32p.log
+StandardError=append:/var/log/s32p/s32p.log
+
+# Pingora + io_uring benefit from raised limits.
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
+Restart=on-failure
+RestartSec=5s
+
+# Kernel must allow io_uring (RHEL: sysctl kernel.io_uring_disabled=0).
+
+[Install]
+WantedBy=multi-user.target

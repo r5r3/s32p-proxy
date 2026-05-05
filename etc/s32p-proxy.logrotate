@@ -1,0 +1,9 @@
+/var/log/s32p/s32p.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
