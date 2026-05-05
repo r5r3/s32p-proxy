@@ -42,7 +42,7 @@ libc = "0.2"
 tempfile = "3"
 
 # responses and config
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 quick-xml = { version = "0.39", features = ["serialize"] }
 url = "2"

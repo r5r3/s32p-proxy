@@ -11,6 +11,7 @@ use s32p_admin::{
 };
 use s32p_directory::directory::layout::normalize_acl; // ensure layout.rs is public
 use s32p_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
+use serde::Deserialize;
 use uuid::Uuid;
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -22,9 +23,14 @@ enum Backend {
 #[derive(Parser, Debug)]
 #[command(name = "s32p-ctl", version)]
 struct Cli {
-    /// Backend to use: openbao or yaml.
-    #[arg(long, value_enum, default_value_t = Backend::Openbao)]
-    backend: Backend,
+    /// Read auth/backend defaults from an s32p-proxy YAML config.
+    /// Explicit flags still override; missing values fall back to built-in defaults.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Backend to use: openbao or yaml. Default: openbao (or auth.backend from --config).
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
 
     /// YAML directory file path (required for --backend yaml).
     #[arg(long)]
@@ -36,6 +42,100 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/* ------------------- subset of s32p-proxy YAML, for --config ------------------- */
+//
+// Mirrors the auth-relevant fields of s32p-proxy/src/config.rs. Unknown fields
+// are ignored by serde, so the proxy's full config can be passed directly.
+
+#[derive(Debug, Deserialize)]
+struct ProxyYamlSubset {
+    auth: ProxyAuth,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyAuth {
+    #[serde(default)]
+    backend: Option<ProxyBackend>,
+    yaml:    Option<ProxyYamlBackend>,
+    openbao: Option<ProxyOpenBao>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProxyBackend {
+    Yaml,
+    OpenBao,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyYamlBackend {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyOpenBao {
+    address:              Option<String>,
+    approle_mount:        Option<String>,
+    /// proxy's read-only AppRole credentials
+    role_id_file:         Option<String>,
+    secret_id_file:       Option<String>,
+    /// admin AppRole credentials — preferred by s32p-ctl when present
+    admin_role_id_file:   Option<String>,
+    admin_secret_id_file: Option<String>,
+    kv_mount:             Option<String>,
+    prefix:               Option<String>,
+}
+
+fn apply_config_defaults(cli: &mut Cli) -> Result<()> {
+    let Some(path) = cli.config.as_deref() else {
+        return Ok(());
+    };
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file: {}", path.display()))?;
+    let cfg: ProxyYamlSubset = serde_yaml::from_str(&text)
+        .with_context(|| format!("parse config file: {}", path.display()))?;
+
+    if cli.backend.is_none() {
+        cli.backend = cfg.auth.backend.as_ref().map(|b| match b {
+            ProxyBackend::Yaml => Backend::Yaml,
+            ProxyBackend::OpenBao => Backend::Openbao,
+        });
+    }
+
+    if cli.yaml_path.is_none() {
+        if let Some(y) = &cfg.auth.yaml {
+            cli.yaml_path = Some(PathBuf::from(&y.path));
+        }
+    }
+
+    if let Some(o) = &cfg.auth.openbao {
+        if cli.openbao.address.is_none() {
+            cli.openbao.address = o.address.clone();
+        }
+        if cli.openbao.kv_mount.is_none() {
+            cli.openbao.kv_mount = o.kv_mount.clone();
+        }
+        if cli.openbao.prefix.is_none() {
+            cli.openbao.prefix = o.prefix.clone();
+        }
+        if cli.openbao.auth.approle_mount.is_none() {
+            cli.openbao.auth.approle_mount = o.approle_mount.clone();
+        }
+        // Prefer admin_*_file over the proxy's read-only role/secret files.
+        let role_id_file = o.admin_role_id_file.as_ref().or(o.role_id_file.as_ref());
+        let secret_id_file = o.admin_secret_id_file.as_ref().or(o.secret_id_file.as_ref());
+        if cli.openbao.auth.role_id.is_none() && cli.openbao.auth.role_id_file.is_none() {
+            cli.openbao.auth.role_id_file = role_id_file.map(PathBuf::from);
+        }
+        if cli.openbao.auth.secret_id.is_none() && cli.openbao.auth.secret_id_file.is_none() {
+            cli.openbao.auth.secret_id_file = secret_id_file.map(PathBuf::from);
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,13 +176,13 @@ struct OpenBaoConnArgs {
     #[arg(long, env = "VAULT_ADDR")]
     address: Option<String>,
 
-    /// KV v2 mount name, e.g. "secret"
-    #[arg(long, default_value = "secret")]
-    kv_mount: String,
+    /// KV v2 mount name. Default: "secret" (or auth.openbao.kv_mount from --config).
+    #[arg(long)]
+    kv_mount: Option<String>,
 
-    /// Prefix within the KV store, e.g. "s32p"
-    #[arg(long, default_value = "s32p")]
-    prefix: String,
+    /// Prefix within the KV store. Default: "s32p" (or auth.openbao.prefix from --config).
+    #[arg(long)]
+    prefix: Option<String>,
 
     #[command(flatten)]
     auth: OpenBaoAuthArgs,
@@ -94,9 +194,9 @@ struct OpenBaoAuthArgs {
     #[arg(long, env = "VAULT_TOKEN")]
     token: Option<String>,
 
-    /// AppRole auth mount (default "approle")
-    #[arg(long, default_value = "approle")]
-    approle_mount: String,
+    /// AppRole auth mount. Default: "approle" (or auth.openbao.approle_mount from --config).
+    #[arg(long)]
+    approle_mount: Option<String>,
 
     /// Role ID string (alternative to --role-id-file)
     #[arg(long)]
@@ -131,14 +231,13 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
         .trim()
         .to_string();
 
+    let kv_mount = conn.kv_mount.clone().unwrap_or_else(|| "secret".to_string());
+    let prefix = conn.prefix.clone().unwrap_or_else(|| "s32p".to_string());
+    let approle_mount = conn.auth.approle_mount.clone().unwrap_or_else(|| "approle".to_string());
+
     // Token auth takes precedence
     if let Some(t) = &conn.auth.token {
-        return Ok(OpenBaoAdmin::new_token(
-            address,
-            t.clone(),
-            conn.kv_mount.clone(),
-            conn.prefix.clone(),
-        ));
+        return Ok(OpenBaoAdmin::new_token(address, t.clone(), kv_mount, prefix));
     }
 
     // Otherwise AppRole auth
@@ -154,14 +253,7 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
         _ => return Err(anyhow!("missing auth: provide --token or --secret-id/--secret-id-file")),
     };
 
-    Ok(OpenBaoAdmin::new_approle(
-        address,
-        conn.auth.approle_mount.clone(),
-        role_id,
-        secret_id,
-        conn.kv_mount.clone(),
-        conn.prefix.clone(),
-    ))
+    Ok(OpenBaoAdmin::new_approle(address, approle_mount, role_id, secret_id, kv_mount, prefix))
 }
 
 /* ------------------- setup ------------------- */
@@ -445,8 +537,9 @@ async fn main() -> Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
 
-    let cli = Cli::parse();
-    let backend = cli.backend;
+    let mut cli = Cli::parse();
+    apply_config_defaults(&mut cli)?;
+    let backend = cli.backend.unwrap_or(Backend::Openbao);
     let yaml_path = cli.yaml_path.clone();
     let openbao = cli.openbao.clone();
     let cmd = cli.cmd;
@@ -471,9 +564,9 @@ async fn main() -> Result<()> {
                 let res = OpenBaoAdmin::setup(
                     address,
                     root_token,
-                    openbao.auth.approle_mount.clone(),
-                    openbao.kv_mount.clone(),
-                    openbao.prefix.clone(),
+                    openbao.auth.approle_mount.clone().unwrap_or_else(|| "approle".to_string()),
+                    openbao.kv_mount.clone().unwrap_or_else(|| "secret".to_string()),
+                    openbao.prefix.clone().unwrap_or_else(|| "s32p".to_string()),
                 )
                 .await?;
 

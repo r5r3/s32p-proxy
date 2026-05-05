@@ -21,7 +21,7 @@ url = "2"
 percent-encoding = "2"
 
 # shared S3 REST-XML builders
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 quick-xml = { version = "0.39", features = ["serialize"] }
 
 # for http response bodyies and parsing
