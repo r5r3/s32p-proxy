@@ -516,26 +516,36 @@ s32p-ctl --backend openbao \
 ### Setup
 
 #### OpenBao setup
-Creates/updates:
+Setup is idempotent and verifying — re-runs are safe and abort hard rather than overwrite incompatible state. It creates/updates:
+- mounts KV v2 at `--kv-mount` (default: `secret`) if missing; if a mount already exists at that path, it is verified to be `type=kv` with `options.version=2` and reused — any other engine type or KV v1 aborts setup
 - enables AppRole auth method at `--approle-mount` (default: `approle`)
-- creates policies + roles:
+- creates policies + roles, scoped to `<kv-mount>/data/<prefix>/*` and `<kv-mount>/metadata/<prefix>/*`:
   - `s32p-proxy` (read-only)
   - `s32p-admin` (read-write)
+- reads the role IDs and generates a fresh secret ID per role; if the corresponding `--*-id-file` flags are given, the four IDs are written there with mode 0600 (Unix)
 
-You must provide a bootstrap token (`--token` or `VAULT_TOKEN`):
+The bootstrap token (`--token` or `VAULT_TOKEN`) must be allowed to write `sys/mounts/<kv-mount>`, `sys/auth/<approle-mount>`, `sys/policies/acl/*` and `auth/<approle-mount>/role/*`. A root token covers all of these; restricted bootstrap tokens need the corresponding capabilities.
+
+To keep the token out of your shell history and out of `ps`/`/proc/<pid>/cmdline`, prompt for it without echo:
 
 ```bash
 export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN=... # root/admin token for setup only
+read -rs VAULT_TOKEN && export VAULT_TOKEN   # paste token, hit enter; no echo
 
 s32p-ctl --backend openbao setup \
-  --proxy-role-id-file  /etc/s32p/proxy_role_id \
+  --proxy-role-id-file   /etc/s32p/proxy_role_id \
   --proxy-secret-id-file /etc/s32p/proxy_secret_id \
-  --admin-role-id-file  /etc/s32p/admin_role_id \
+  --admin-role-id-file   /etc/s32p/admin_role_id \
   --admin-secret-id-file /etc/s32p/admin_secret_id
+
+unset VAULT_TOKEN   # token is no longer needed
 ```
 
-The secret files are written with permissions 0600 on Unix.
+After setup the bootstrap token is **not needed for normal operation**:
+- the proxy authenticates via the `s32p-proxy` AppRole (`role_id_file` + `secret_id_file` in `etc/s32p-proxy.yaml` under `auth.openbao`)
+- further `s32p-ctl` commands (`user add`, `bucket add`, `import-yaml`, …) authenticate via the `s32p-admin` AppRole (`--role-id-file` + `--secret-id-file`)
+
+Re-running `setup` generates an *additional* `secret_id` for each role; existing secret IDs stay valid until destroyed via `auth/<approle-mount>/role/<role>/secret-id/destroy`. Rotate explicitly if you need the old ones revoked.
 
 #### YAML setup
 Creates an empty directory file skeleton:

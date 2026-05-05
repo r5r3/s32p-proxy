@@ -81,13 +81,14 @@ impl OpenBaoAdmin {
     ) -> Result<SetupResult> {
         let client = OpenBaoClient::new_token(address, root_token);
 
+        let kv_mount = trim_slashes(&kv_mount);
+        let prefix = trim_slashes(&prefix);
+
+        client.ensure_kv_v2_mount(&kv_mount).await?;
         client.enable_auth_approle(&approle_mount).await?;
 
         let proxy_role = "s32p-proxy";
         let admin_role = "s32p-admin";
-
-        let kv_mount = trim_slashes(&kv_mount);
-        let prefix = trim_slashes(&prefix);
 
         let proxy_policy = format!(
             r#"

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::{Method, StatusCode};
 use s32p_support::utils::trim_slashes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -280,6 +280,80 @@ impl OpenBaoClient {
 
     /* ----------------------------- Setup helpers (admin-only usage) ----------------------------- */
 
+    /// Idempotently mount KV v2 at `kv_mount/`.
+    ///
+    /// - missing → mount it (`type=kv`, `options.version=2`)
+    /// - already mounted as KV v2 → no-op
+    /// - mounted as something else → hard error (refuse to overwrite)
+    pub async fn ensure_kv_v2_mount(&self, kv_mount: &str) -> Result<()> {
+        let m = trim_slashes(kv_mount);
+        if m.is_empty() {
+            return Err(anyhow!("ensure_kv_v2_mount: empty mount path"));
+        }
+
+        if let Some((ty, ver)) = self.read_mount_info(&m).await? {
+            return verify_kv_v2(&m, &ty, &ver);
+        }
+
+        let api_path = format!("sys/mounts/{m}");
+        let resp = self
+            .request(Method::POST, &api_path)
+            .await?
+            .json(&json!({
+                "type": "kv",
+                "options": { "version": "2" },
+                "description": "s32p directory backend (KV v2)"
+            }))
+            .send()
+            .await
+            .context("mount kv-v2 send")?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        // Race: another client mounted between our list and create. Re-verify.
+        if status == StatusCode::BAD_REQUEST
+            && body.to_ascii_lowercase().contains("path is already in use")
+        {
+            if let Some((ty, ver)) = self.read_mount_info(&m).await? {
+                return verify_kv_v2(&m, &ty, &ver);
+            }
+        }
+
+        Err(anyhow!("mount kv-v2 at '{m}/' failed: {status} {body}"))
+    }
+
+    /// Look up a single mount by path. Returns `(type, options.version)`
+    /// if the mount exists, or `None` otherwise. Handles both the modern
+    /// (`{"data": {...}}`) and legacy (mount table at top level) shapes.
+    async fn read_mount_info(&self, kv_mount: &str) -> Result<Option<(String, String)>> {
+        let want = format!("{}/", trim_slashes(kv_mount));
+
+        let resp = self
+            .send_ok(self.request(Method::GET, "sys/mounts").await?, "list mounts")
+            .await?;
+        let v: Value = resp.json().await.context("list mounts json parse")?;
+
+        let table = v.get("data").unwrap_or(&v);
+        let Some(entry) = table.get(&want) else {
+            return Ok(None);
+        };
+
+        let ty = entry.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let ver = entry
+            .get("options")
+            .and_then(|o| o.get("version"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(Some((ty, ver)))
+    }
+
     pub async fn enable_auth_approle(&self, approle_mount: &str) -> Result<()> {
         let m = trim_slashes(approle_mount);
         let api_path = format!("sys/auth/{m}");
@@ -396,5 +470,15 @@ impl OpenBaoClient {
         let r: Resp = resp.json().await.context("generate secret-id json parse")?;
 
         Ok(r.data.ok_or_else(|| anyhow!("generate secret-id: missing data"))?.secret_id)
+    }
+}
+
+fn verify_kv_v2(mount: &str, ty: &str, ver: &str) -> Result<()> {
+    if ty == "kv" && ver == "2" {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "secrets engine at '{mount}/' exists but is not KV v2 (type='{ty}', options.version='{ver}'). Refusing to overwrite — fix the mount manually or pick a different --kv-mount."
+        ))
     }
 }
