@@ -3,10 +3,11 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{fs, sync::Arc, time::Instant};
+use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use clap::Parser;
 use pingora::{
     Error, ErrorType, Result as PResult,
     http::{RequestHeader, ResponseHeader, StatusCode},
@@ -24,6 +25,13 @@ mod worker_manager;
 use s32p_directory::{Directory, UserDoc, openbao::OpenBaoDirectory, yaml::YamlDirectory};
 use s32p_support;
 use worker_manager::{WorkerEndpoint, WorkerHandle, WorkerManager};
+
+#[derive(Parser, Debug)]
+#[command(version, about = "S3 to POSIX proxy", long_about = None)]
+struct Cli {
+    #[arg(short, long, default_value = "etc/s32p-proxy.yaml")]
+    config: PathBuf,
+}
 
 struct S3ProxyApp {
     directory:               Arc<dyn Directory>,
@@ -429,8 +437,10 @@ fn main() -> Result<()> {
     // aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
     rustls_prefer_fast_cipher().unwrap();
 
+    let cli = Cli::parse();
+
     // Load config first to get log level from config file
-    let mut cfg = config::Config::from_path("etc/s32p-proxy.yaml")?;
+    let mut cfg = config::Config::from_path(&cli.config)?;
 
     // Resolve placeholders in the config (e.g., {{install_bin_dir}})
     // Determine the install_bin_dir: use the directory of the current executable

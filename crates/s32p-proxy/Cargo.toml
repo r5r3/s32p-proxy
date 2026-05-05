@@ -28,6 +28,9 @@ time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 anyhow = "1"
 async-trait = "0.1"
 
+# CLI parsing
+clap = { workspace = true }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
