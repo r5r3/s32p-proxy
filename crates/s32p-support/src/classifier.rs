@@ -103,6 +103,11 @@ pub enum ReadOp {
     GetBucketLocation,
     /// GET /{bucket}?list-type=2 (ListObjectsV2)
     ListObjectsV2,
+    /// GET /{bucket} (ListObjectsV1, the legacy form). Matches a plain bucket-level
+    /// GET that isn't any other recognized op (`?location`, `?versioning`, multipart,
+    /// object lock, V2 listing). v1 query params (`prefix`, `delimiter`, `marker`,
+    /// `max-keys`, `encoding-type`) are all optional.
+    ListObjectsV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +377,18 @@ pub fn classify_with_headers(
         && query.validate_xid("ListObjectsV2")
     {
         return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListObjectsV2) };
+    }
+
+    // ListObjectsV1: GET /{bucket} that didn't match any earlier read shape.
+    // No special query marker — v1 is the default behavior of a bucket GET in S3.
+    // We get here only after multipart/versioning/object-lock/location/HeadBucket/V2
+    // have all been ruled out, so accepting any remaining bucket-level GET is safe.
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.validate_xid("ListObjects")
+    {
+        return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListObjectsV1) };
     }
 
     // CopyObject: PUT /{bucket}/{key} with *no* query params and x-amz-copy-source (allow x-id)

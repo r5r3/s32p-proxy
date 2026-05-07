@@ -76,34 +76,39 @@ pub fn verify_sigv4_request_any(
     secret_key: &str,
     resource: Option<&str>,
 ) -> std::result::Result<(), SigV4Rejection> {
+    // Generic, client-safe messages. Detailed `reason` strings stay server-side
+    // (in SigV4Rejection.reason) for operator debugging; never put canonical
+    // requests, signed-header lists, or signature bytes into responses.
+    const CLIENT_MSG_BAD_AUTH: &str = "invalid Authorization";
+    const CLIENT_MSG_BAD_KEY: &str = "access denied";
+    const CLIENT_MSG_BAD_SIG: &str = "the request signature we calculated does not match the signature you provided";
+    const CLIENT_MSG_NO_AUTH: &str = "request is missing authentication information";
+
     // Header-style SigV4
     if headers.get("authorization").is_some() {
         let auth = match parse_authorization(headers) {
             Ok(a) => a,
             Err(e) => {
-                let reason = format!("bad Authorization: {e}");
                 return Err(SigV4Rejection {
-                    response: crate::s3resp::access_denied(&reason, resource),
-                    reason,
+                    response: crate::s3resp::access_denied(CLIENT_MSG_BAD_AUTH, resource),
+                    reason:   format!("bad Authorization: {e}"),
                 });
             }
         };
 
         if let Some(exp) = expected_access_key {
             if auth.access_key != exp {
-                let reason = "unknown access key".to_string();
                 return Err(SigV4Rejection {
-                    response: crate::s3resp::access_denied(&reason, resource),
-                    reason,
+                    response: crate::s3resp::access_denied(CLIENT_MSG_BAD_KEY, resource),
+                    reason:   "unknown access key".to_string(),
                 });
             }
         }
 
         if let Err(e) = verify_sigv4_header_only(method, uri, headers, &auth, secret_key) {
-            let reason = e.to_string();
             return Err(SigV4Rejection {
-                response: crate::s3resp::signature_does_not_match(&reason, resource),
-                reason,
+                response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
+                reason:   e.to_string(),
             });
         }
 
@@ -114,36 +119,32 @@ pub fn verify_sigv4_request_any(
     let auth = match parse_presigned_query(uri) {
         Ok(Some(a)) => a,
         Ok(None) => {
-            let reason = "missing Authorization and missing presign params".to_string();
             return Err(SigV4Rejection {
-                response: crate::s3resp::access_denied(&reason, resource),
-                reason,
+                response: crate::s3resp::access_denied(CLIENT_MSG_NO_AUTH, resource),
+                reason:   "missing Authorization and missing presign params".to_string(),
             });
         }
         Err(e) => {
-            let reason = format!("bad presign params: {e}");
             return Err(SigV4Rejection {
-                response: crate::s3resp::access_denied(&reason, resource),
-                reason,
+                response: crate::s3resp::access_denied(CLIENT_MSG_BAD_AUTH, resource),
+                reason:   format!("bad presign params: {e}"),
             });
         }
     };
 
     if let Some(exp) = expected_access_key {
         if auth.access_key != exp {
-            let reason = "unknown access key".to_string();
             return Err(SigV4Rejection {
-                response: crate::s3resp::access_denied(&reason, resource),
-                reason,
+                response: crate::s3resp::access_denied(CLIENT_MSG_BAD_KEY, resource),
+                reason:   "unknown access key".to_string(),
             });
         }
     }
 
     if let Err(e) = verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key) {
-        let reason = e.to_string();
         return Err(SigV4Rejection {
-            response: crate::s3resp::signature_does_not_match(&reason, resource),
-            reason,
+            response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
+            reason:   e.to_string(),
         });
     }
 

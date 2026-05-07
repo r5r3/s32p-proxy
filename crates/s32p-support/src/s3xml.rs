@@ -180,6 +180,61 @@ pub fn list_objects_v2_body(
     Ok(xml.into_bytes())
 }
 
+/// Build XML body for ListObjectsV1 (`GET /{bucket}` legacy form).
+/// Differences vs. v2: pagination uses `Marker`/`NextMarker` (a key, not an opaque
+/// token), `Owner` is always included in `Contents`, and there's no `KeyCount`.
+pub fn list_objects_v1_body(
+    bucket_name: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: &str,
+    next_marker: Option<&str>,
+    max_keys: u32,
+    is_truncated: bool,
+    encoding_type: Option<&str>,
+    contents: &[ListObjectInfo],
+    common_prefixes: &[String],
+) -> Result<Vec<u8>> {
+    let doc = ListBucketResultV1 {
+        xmlns: S3_XMLNS,
+        name: bucket_name.to_string(),
+        prefix: prefix.to_string(),
+        marker: marker.to_string(),
+        next_marker: next_marker.map(|s| s.to_string()),
+        delimiter: delimiter.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        max_keys,
+        is_truncated,
+        encoding_type: encoding_type.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        contents: contents
+            .iter()
+            .map(|o| {
+                let owner = o.owner.clone().unwrap_or_else(|| ListOwnerInfo {
+                    id:           String::new(),
+                    display_name: String::new(),
+                });
+                ContentsV1 {
+                    key:           o.key.clone(),
+                    last_modified: o.last_modified.clone(),
+                    etag:          o.etag.clone(),
+                    size:          o.size,
+                    storage_class: "STANDARD".to_string(),
+                    owner:         OwnerV1 {
+                        id:           owner.id,
+                        display_name: owner.display_name,
+                    },
+                }
+            })
+            .collect(),
+        common_prefixes: common_prefixes
+            .iter()
+            .map(|p| CommonPrefixesV1 { prefix: p.clone() })
+            .collect(),
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
 /* -------------------------
  * CopyObject response
  * ------------------------- */
@@ -576,6 +631,76 @@ struct OwnerV2 {
 
 #[derive(Debug, Serialize)]
 struct CommonPrefixesV2 {
+    #[serde(rename = "Prefix")]
+    prefix: String,
+}
+
+// --- internal DTOs for ListObjectsV1 ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListBucketResult")]
+struct ListBucketResultV1 {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "Name")]
+    name: String,
+
+    #[serde(rename = "Prefix")]
+    prefix: String, // empty string if absent — v1 spec always emits this element
+
+    #[serde(rename = "Marker")]
+    marker: String, // empty string if absent — v1 spec always emits this element
+
+    #[serde(rename = "NextMarker", skip_serializing_if = "Option::is_none")]
+    next_marker: Option<String>,
+
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    delimiter: Option<String>,
+
+    #[serde(rename = "MaxKeys")]
+    max_keys: u32,
+
+    #[serde(rename = "IsTruncated")]
+    is_truncated: bool,
+
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    encoding_type: Option<String>,
+
+    #[serde(rename = "Contents", default, skip_serializing_if = "Vec::is_empty")]
+    contents: Vec<ContentsV1>,
+
+    #[serde(rename = "CommonPrefixes", default, skip_serializing_if = "Vec::is_empty")]
+    common_prefixes: Vec<CommonPrefixesV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContentsV1 {
+    #[serde(rename = "Key")]
+    key:           String,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag:          String,
+    #[serde(rename = "Size")]
+    size:          u64,
+    #[serde(rename = "StorageClass")]
+    storage_class: String,
+    // v1 Contents always carries Owner (unlike v2 where it's optional via fetch-owner).
+    #[serde(rename = "Owner")]
+    owner:         OwnerV1,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerV1 {
+    #[serde(rename = "ID")]
+    id:           String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CommonPrefixesV1 {
     #[serde(rename = "Prefix")]
     prefix: String,
 }

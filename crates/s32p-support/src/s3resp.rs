@@ -335,6 +335,38 @@ pub fn object_response(
     resp
 }
 
+/// Convenience: ListObjectsV1 success (200).
+pub fn list_objects_v1(
+    bucket_name: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: &str,
+    next_marker: Option<&str>,
+    max_keys: u32,
+    is_truncated: bool,
+    encoding_type: Option<&str>,
+    contents: &[s3xml::ListObjectInfo],
+    common_prefixes: &[String],
+) -> HttpResponse {
+    let body = s3xml::list_objects_v1_body(
+        bucket_name,
+        prefix,
+        delimiter,
+        marker,
+        next_marker,
+        max_keys,
+        is_truncated,
+        encoding_type,
+        contents,
+        common_prefixes,
+    )
+    .unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+
 /// Convenience: ListObjectsV2 success (200).
 pub fn list_objects_v2(
     bucket_name: &str,

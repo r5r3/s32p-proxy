@@ -278,6 +278,9 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::ListObjectsV2) => {
             handle_list_objects_v2(req, app, &class).await
         }
+        s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::ListObjectsV1) => {
+            handle_list_objects_v1(req, app, &class).await
+        }
         s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
         }
@@ -1466,6 +1469,233 @@ async fn handle_list_objects_v2(
         continuation_token_in.as_deref(),
         next_token.as_deref(),
         start_after.as_deref(),
+        &contents,
+        &common_prefixes,
+    )
+}
+
+// -------------------------
+// ListObjectsV1
+// -------------------------
+//
+// Reuses the v2 directory walk (RuntimeFrame stack, ensure_frame_loaded, split_prefix,
+// build_stack_from_last) and only differs in:
+//   - pagination uses `marker` (a key) instead of an opaque `continuation-token`
+//   - on truncation we emit `NextMarker` (the last emitted key/common-prefix);
+//     no continuation token machinery
+//   - the response shape: see `s3resp::list_objects_v1`
+
+async fn handle_list_objects_v1(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s32p_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let prefix = class.query.first("prefix").unwrap_or("").to_string();
+    let marker = class.query.first("marker").unwrap_or("").to_string();
+
+    let delimiter_q = class
+        .query
+        .first("delimiter")
+        .and_then(|d| if d.is_empty() { None } else { Some(d) });
+
+    let recursive = match delimiter_q {
+        None => true,
+        Some("/") => false,
+        Some(_) => {
+            return s32p_support::s3resp::not_implemented("only delimiter=/ is supported", None);
+        }
+    };
+
+    let max_keys = class
+        .query
+        .first("max-keys")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1000)
+        .min(1000);
+
+    if !prefix.is_empty() && is_reserved_first_segment(&prefix, cfg.mpu_dir_name.as_str()) {
+        return s32p_support::s3resp::list_objects_v1(
+            bucket,
+            &prefix,
+            if recursive { None } else { Some("/") },
+            &marker,
+            None,
+            max_keys,
+            false,
+            None,
+            &[],
+            &[],
+        );
+    }
+
+    let (dir_prefix, leaf_filter) = split_prefix(&prefix);
+
+    let start_dir_fs = match join_object_path(&cfg.posix_root, bucket, &dir_prefix) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    if !start_dir_fs.exists() || !start_dir_fs.is_dir() {
+        return s32p_support::s3resp::list_objects_v1(
+            bucket,
+            &prefix,
+            if recursive { None } else { Some("/") },
+            &marker,
+            None,
+            max_keys,
+            false,
+            None,
+            &[],
+            &[],
+        );
+    }
+
+    // Initial frame stack: marker positions us "after" a previously emitted key.
+    let token_stack: Vec<ListV2Frame> = if !marker.is_empty() {
+        build_stack_from_last(&dir_prefix, &marker, recursive)
+    } else {
+        vec![ListV2Frame { dir: dir_prefix.clone(), after: "".to_string() }]
+    };
+
+    if token_stack
+        .iter()
+        .any(|fr| is_reserved_first_segment(&fr.dir, &cfg.mpu_dir_name))
+    {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "marker points into a reserved prefix",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    let mut stack: Vec<RuntimeFrame> = Vec::new();
+    for fr in token_stack {
+        stack.push(RuntimeFrame {
+            dir_key: fr.dir.clone(),
+            after:   fr.after.clone(),
+            entries: None,
+            idx:     0,
+        });
+    }
+
+    let mut contents: Vec<s32p_support::s3xml::ListObjectInfo> = Vec::new();
+    let mut common_prefixes: Vec<String> = Vec::new();
+    // For NextMarker: the last *thing* emitted (key or common-prefix) wins.
+    let mut last_emitted: Option<String> = None;
+
+    while (contents.len() as u32 + common_prefixes.len() as u32) < max_keys {
+        let stack_len = stack.len();
+        let Some(top) = stack.last_mut() else {
+            break;
+        };
+
+        if top.entries.is_none() {
+            let is_root_frame = stack_len == 1;
+            if let Err(e) =
+                ensure_frame_loaded(top, &cfg, bucket, leaf_filter.as_deref(), is_root_frame)
+            {
+                tracing::warn!("Failed to load directory {}: {}", top.dir_key, e);
+                stack.pop();
+                continue;
+            }
+        }
+
+        let entries = top.entries.as_ref().unwrap();
+
+        if top.idx >= entries.len() {
+            stack.pop();
+            continue;
+        }
+
+        let it = entries[top.idx].clone();
+        top.idx += 1;
+        top.after = it.sort_key.clone();
+
+        if top.dir_key.is_empty() && it.is_dir && it.name == cfg.mpu_dir_name {
+            continue;
+        }
+
+        if it.is_dir {
+            if !recursive {
+                let cp = format!("{}{}{}", top.dir_key, it.name, "/");
+                last_emitted = Some(cp.clone());
+                common_prefixes.push(cp);
+                continue;
+            }
+
+            let child_key = format!("{}{}{}", top.dir_key, it.name, "/");
+            stack.push(RuntimeFrame {
+                dir_key: child_key,
+                after:   "".to_string(),
+                entries: None,
+                idx:     0,
+            });
+            continue;
+        }
+
+        let stx = match statx_info(&it.path) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let key = format!("{}{}", top.dir_key, it.name);
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+
+        let last_modified = s32p_support::s3xml::format_s3_time_system(stx.mtime);
+        let etag = format!("\"{}\"", stx.ino);
+        let size = stx.size;
+
+        // v1 always carries Owner in Contents.
+        let owner = Some(owner_info(stx.uid));
+
+        last_emitted = Some(key.clone());
+        contents.push(s32p_support::s3xml::ListObjectInfo {
+            key,
+            last_modified,
+            etag,
+            size,
+            owner,
+        });
+    }
+
+    let total = (contents.len() + common_prefixes.len()) as u32;
+    let is_truncated = total >= max_keys && !stack.is_empty();
+
+    // S3 v1: NextMarker is REQUIRED in the response only when delimiter is set; otherwise
+    // it's optional and clients fall back to using the last key in Contents as the next
+    // marker. We always emit it on truncation for consistency.
+    let next_marker = if is_truncated { last_emitted } else { None };
+
+    s32p_support::s3resp::list_objects_v1(
+        bucket,
+        &prefix,
+        if recursive { None } else { Some("/") },
+        &marker,
+        next_marker.as_deref(),
+        max_keys,
+        is_truncated,
+        None, // EncodingType: not echoed; we don't actually URL-encode keys (matches v2 behavior).
         &contents,
         &common_prefixes,
     )
