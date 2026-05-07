@@ -221,6 +221,15 @@ async fn read_small(
 }
 
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
+    let method = req.method().clone();
+    let uri_log = req.uri().to_string();
+    let host_log = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_string();
+
     let class = s32p_support::classifier::classify_with_headers(
         req.method().as_str(),
         req.uri(),
@@ -228,9 +237,25 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         &app.virtual_hosted_suffixes,
     );
 
+    tracing::debug!(
+        method = %method,
+        uri = %uri_log,
+        host = %host_log,
+        op = ?class.op,
+        bucket = ?class.bucket,
+        key = ?class.key,
+        "incoming request"
+    );
+
     // All actions require authentication
     let cfg = app.cfg.clone();
     if let Err(resp) = require_sigv4(&req, &cfg) {
+        tracing::debug!(
+            method = %method,
+            uri = %uri_log,
+            status = resp.status().as_u16(),
+            "sigv4 verification failed"
+        );
         return Ok(resp);
     }
 
@@ -270,6 +295,13 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         s32p_support::classifier::S3Op::Versioning(_) => handle_versioning(req, app, &class).await,
         _ => handle_other(req, app, &class).await,
     };
+
+    tracing::debug!(
+        method = %method,
+        uri = %uri_log,
+        status = resp.status().as_u16(),
+        "request completed"
+    );
 
     Ok(resp)
 }
