@@ -314,7 +314,7 @@ impl WorkerManager {
                 })?;
 
                 let sock_path =
-                    uds_socket_path(base, user.uid, profile_name).with_context(|| {
+                    uds_socket_path(base, user.uid, user.gid, profile_name).with_context(|| {
                         format!(
                             "failed to build uds socket path for uid={} profile={profile_name}",
                             user.uid
@@ -644,10 +644,12 @@ fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
 
 /// Create /run/s32p/<uid>/ and return the socket path <profile>.sock.
 /// The directory must be writable by the worker user because the worker creates/binds the socket file.
-fn uds_socket_path(base: &str, uid: u32, profile: &str) -> Result<PathBuf> {
+/// When the proxy is root, we chown the per-uid dir to (uid, gid) so the worker (which restricted-exec
+/// switches into) can bind. When the proxy is not root, the dir is created as the proxy's own uid
+/// (which is also the worker's uid in that mode), so chown is a no-op.
+fn uds_socket_path(base: &str, uid: u32, gid: u32, profile: &str) -> Result<PathBuf> {
     let dir = Path::new(base).join(uid.to_string());
-    // 0755 is the safest default if the proxy is *not* root.
-    // If your proxy runs as root and you want tighter perms, use 0700 + adjust ownership.
-    ensure_dir(&dir, 0o755)?;
+    ensure_dir(&dir, 0o700)?;
+    chown_if_root(&dir, uid, gid)?;
     Ok(dir.join(format!("{profile}.sock")))
 }
