@@ -338,16 +338,11 @@ pub fn verify_sigv4_presigned_url(
             .ok_or_else(|| anyhow!("signed header '{h}' missing in request"))?;
         header_storage.push((h, v.clone()));
     }
-    let header_iter = header_storage.iter().map(|(k, v)| (k.as_str(), v.as_str()));
 
     // 6) Presigned URLs are typically UNSIGNED-PAYLOAD
     let body = SignableBody::UnsignedPayload;
 
-    // 7) Build signable request
-    let signable = SignableRequest::new(method, &unsigned_uri, header_iter, body)
-        .map_err(|e| anyhow!("signable request error: {e}"))?;
-
-    // 8) Build signing params, forcing signature into query params
+    // 7) Build signing params, forcing signature into query params
     let credentials = Credentials::new(
         auth.access_key.clone(),
         secret_key.to_string(),
@@ -374,16 +369,47 @@ pub fn verify_sigv4_presigned_url(
         .map_err(|e| anyhow!("failed building signing params: {e}"))?
         .into();
 
-    // 9) Compute signature and compare
-    let (_instructions, our_sig) = aws_sigv4::http_request::sign(signable, &signing_params)
-        .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
-        .into_parts();
+    // 8) Try the original headers first; on mismatch, retry with default-port toggles
+    // on the `host` header (see verify_sigv4_header_only for rationale).
+    let host_variants = host_header_variants(&header_storage);
+    let mut last_err: Option<anyhow::Error> = None;
 
-    if !constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
-        return Err(anyhow!("signature mismatch"));
+    for variant in host_variants {
+        let attempt = match variant {
+            None => header_storage.clone(),
+            Some(new_host) => {
+                let mut hs = header_storage.clone();
+                if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
+                    slot.1 = new_host;
+                }
+                hs
+            }
+        };
+
+        let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+        let signable =
+            match SignableRequest::new(method, &unsigned_uri, header_iter, body.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(anyhow!("signable request error: {e}"));
+                    continue;
+                }
+            };
+
+        let our_sig = match aws_sigv4::http_request::sign(signable, &signing_params) {
+            Ok(out) => out.into_parts().1,
+            Err(e) => {
+                last_err = Some(anyhow!("sigv4 sign error: {e}"));
+                continue;
+            }
+        };
+
+        if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
+            return Ok(());
+        }
     }
 
-    Ok(())
+    Err(last_err.unwrap_or_else(|| anyhow!("signature mismatch")))
 }
 
 pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
@@ -531,13 +557,7 @@ pub fn verify_sigv4_header_only(
         header_storage.push((h, v.clone()));
     }
 
-    let header_iter = header_storage.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-
-    // 6) Build signable request
-    let signable = SignableRequest::new(method, path_and_query, header_iter, body)
-        .map_err(|e| anyhow!("signable request error: {e}"))?;
-
-    // 7) Build signing params
+    // 6) Build signing params (shared across attempts)
     let credentials =
         Credentials::new(auth.access_key.clone(), secret_key.to_string(), None, None, "static");
     let identity: Identity = credentials.into();
@@ -559,16 +579,95 @@ pub fn verify_sigv4_header_only(
         .map_err(|e| anyhow!("failed building signing params: {e}"))?
         .into();
 
-    // 8) Compute signature and compare with client signature
-    let (_instructions, our_sig) = aws_sigv4::http_request::sign(signable, &signing_params)
-        .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
-        .into_parts();
+    // 7) Try the original headers first; on mismatch, retry with a few host-header
+    // variants. AWS SigV4 doesn't standardize whether the default port appears in
+    // the canonical `host` value. Different clients disagree (Go's net/http strips
+    // `:80`/`:443`; some Java/Cyberduck-derived clients keep it). Accept either.
+    let host_variants = host_header_variants(&header_storage);
+    let mut last_err: Option<anyhow::Error> = None;
 
-    if !constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
-        return Err(anyhow!("signature mismatch"));
+    for variant in host_variants {
+        let attempt = match variant {
+            None => header_storage.clone(),
+            Some(new_host) => {
+                let mut hs = header_storage.clone();
+                if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
+                    slot.1 = new_host;
+                }
+                hs
+            }
+        };
+
+        let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+        let signable =
+            match SignableRequest::new(method, path_and_query, header_iter, body.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(anyhow!("signable request error: {e}"));
+                    continue;
+                }
+            };
+
+        let our_sig = match aws_sigv4::http_request::sign(signable, &signing_params) {
+            Ok(out) => out.into_parts().1,
+            Err(e) => {
+                last_err = Some(anyhow!("sigv4 sign error: {e}"));
+                continue;
+            }
+        };
+
+        if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
+            return Ok(());
+        }
     }
 
-    Ok(())
+    Err(last_err.unwrap_or_else(|| anyhow!("signature mismatch")))
+}
+
+/// Produce the set of `host` header values to try when verifying SigV4.
+/// Returns `None` for the original (unmodified) value, plus any port-toggled
+/// alternatives. Order: original first, then variants.
+fn host_header_variants(headers: &[(String, String)]) -> Vec<Option<String>> {
+    let mut out = vec![None];
+
+    let host_val = match headers.iter().find(|(k, _)| k == "host") {
+        Some((_, v)) => v.as_str(),
+        None => return out,
+    };
+
+    // Parse "name[:port]". IPv6 literals "[::1]:443" need bracket handling.
+    let (name, port) = if let Some(rest) = host_val.strip_prefix('[') {
+        match rest.split_once("]:") {
+            Some((n, p)) => (format!("[{n}]"), Some(p.to_string())),
+            None => (host_val.to_string(), None),
+        }
+    } else if let Some((n, p)) = host_val.rsplit_once(':') {
+        // Avoid mistaking an IPv6 address with no brackets/no port for "name:port"
+        if n.contains(':') {
+            (host_val.to_string(), None)
+        } else {
+            (n.to_string(), Some(p.to_string()))
+        }
+    } else {
+        (host_val.to_string(), None)
+    };
+
+    match port.as_deref() {
+        Some("80") | Some("443") => {
+            // Client kept default port; also try without it.
+            out.push(Some(name));
+        }
+        Some(_) => {
+            // Non-default port: signing must include it. No alternatives.
+        }
+        None => {
+            // Client dropped the port; also try with default ports added.
+            out.push(Some(format!("{name}:443")));
+            out.push(Some(format!("{name}:80")));
+        }
+    }
+
+    out
 }
 
 fn parse_amz_date(amz_date: &str) -> Result<(OffsetDateTime, String, SystemTime)> {
