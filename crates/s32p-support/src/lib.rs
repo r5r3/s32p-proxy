@@ -407,6 +407,14 @@ pub fn verify_sigv4_presigned_url(
         tried.push((attempted_host, our_sig.to_string()));
     }
 
+    let presign_auth = SigV4Auth {
+        access_key:     auth.access_key.clone(),
+        scope_date:     auth.scope_date.clone(),
+        region:         auth.region.clone(),
+        service:        auth.service.clone(),
+        signed_headers: auth.signed_headers.clone(),
+        signature:      auth.signature.clone(),
+    };
     Err(anyhow!(
         "signature mismatch ({})",
         sigv4_mismatch_diagnostic(
@@ -414,7 +422,8 @@ pub fn verify_sigv4_presigned_url(
             &unsigned_uri,
             &header_storage,
             &auth.signed_headers,
-            &auth.signature,
+            &presign_auth,
+            "UNSIGNED-PAYLOAD",
             &tried,
         )
     ))
@@ -528,6 +537,7 @@ pub fn verify_sigv4_header_only(
     // NOTE: Some clients may use streaming payload modes.
     // If you want to avoid spawning workers for those, reject here.
     // For now, we accept UNSIGNED-PAYLOAD and hex hashes.
+    let payload_hash_for_log = payload_hash.clone();
     let body = if payload_hash == "UNSIGNED-PAYLOAD" {
         SignableBody::UnsignedPayload
     } else {
@@ -633,25 +643,33 @@ pub fn verify_sigv4_header_only(
             path_and_query,
             &header_storage,
             &auth.signed_headers,
-            &auth.signature,
+            auth,
+            &payload_hash_for_log,
             &tried,
         )
     ))
 }
 
-/// Build a one-line diagnostic string describing inputs to SigV4 verification.
-/// Emitted only on mismatch — keeps the happy path hot. Header values are quoted
-/// with backslash escapes so trailing whitespace and embedded `;` survive logging.
+/// Build a multi-field diagnostic string describing inputs to SigV4 verification.
+/// Emitted only on mismatch. Includes the canonical request string we computed —
+/// compare with the client's canonical request to localize the divergence in one read.
 fn sigv4_mismatch_diagnostic(
     method: &str,
     path_and_query: &str,
     headers: &[(String, String)],
     signed_headers: &str,
-    client_signature: &str,
+    auth: &SigV4Auth,
+    payload_hash: &str,
     tried: &[(String, String)],
 ) -> String {
+    let canonical = build_canonical_request(method, path_and_query, headers, signed_headers, payload_hash);
     let mut out = String::new();
-    let _ = write!(out, "method={method} path_and_query={path_and_query:?} signed_headers={signed_headers:?} headers=[");
+    let _ = write!(
+        out,
+        "method={method} path_and_query={path_and_query:?} signed_headers={signed_headers:?} \
+         scope_date={:?} region={:?} service={:?} access_key={:?} headers=[",
+        auth.scope_date, auth.region, auth.service, auth.access_key,
+    );
     for (i, (k, v)) in headers.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
@@ -659,8 +677,7 @@ fn sigv4_mismatch_diagnostic(
         let _ = write!(out, "{k}={v:?}");
     }
     out.push_str("] client_sig=");
-    // Show first 8 hex chars only — full signatures are sensitive enough to keep short.
-    out.push_str(&truncate_sig(client_signature));
+    out.push_str(&truncate_sig(&auth.signature));
     out.push_str(" tried=[");
     for (i, (h, s)) in tried.iter().enumerate() {
         if i > 0 {
@@ -669,7 +686,61 @@ fn sigv4_mismatch_diagnostic(
         let _ = write!(out, "host={h:?}->{}", truncate_sig(s));
     }
     out.push(']');
+    out.push_str(" canonical_request=");
+    let _ = write!(out, "{canonical:?}");
     out
+}
+
+/// Construct the canonical request string per AWS SigV4 spec
+/// (https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html#create-canonical-request).
+/// This is for diagnostic logging only — the actual verification uses aws-sigv4 internally.
+fn build_canonical_request(
+    method: &str,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    signed_headers: &str,
+    payload_hash: &str,
+) -> String {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path_and_query, ""),
+    };
+
+    // Canonical query string: split, sort by key (then value), join with &
+    let mut q_parts: Vec<(String, String)> = Vec::new();
+    if !query.is_empty() {
+        for seg in query.split('&') {
+            let (k, v) = seg.split_once('=').unwrap_or((seg, ""));
+            q_parts.push((k.to_string(), v.to_string()));
+        }
+        q_parts.sort();
+    }
+    let canonical_query = q_parts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    // Canonical headers: sorted by lowercase name, "name:trimmed_value\n"
+    let signed_set: Vec<&str> = signed_headers.split(';').map(|s| s.trim()).collect();
+    let mut hpairs: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| signed_set.iter().any(|s| s.eq_ignore_ascii_case(k)))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    hpairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let canonical_headers: String = hpairs.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+
+    let signed_headers_str = {
+        let mut v: Vec<String> =
+            signed_set.iter().map(|s| s.to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+        v.sort();
+        v.join(";")
+    };
+
+    format!(
+        "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
+    )
 }
 
 fn truncate_sig(s: &str) -> String {
