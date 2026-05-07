@@ -19,9 +19,10 @@ WorkingDirectory=/etc/s32p
 ExecStart=/usr/local/bin/s32p-proxy --config /etc/s32p/s32p-proxy.yaml
 
 # Workers and restricted-exec inherit the proxy's stderr, so a single sink
-# captures all three. systemd creates /var/log/s32p/ for us.
-LogsDirectory=s32p
-LogsDirectoryMode=0750
+# captures all three. We create /var/log/s32p/ via ExecStartPre because
+# systemd opens StandardOutput= *before* it would create LogsDirectory=,
+# which would fail with ENOENT at step STDOUT.
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0750 /var/log/s32p
 StandardOutput=append:/var/log/s32p/s32p.log
 StandardError=append:/var/log/s32p/s32p.log
 
