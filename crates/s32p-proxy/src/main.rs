@@ -75,6 +75,17 @@ impl ProxyHttp for S3ProxyApp {
 
         let start = Instant::now();
 
+        // HTTP/2 sends authority in `:authority` instead of a `Host` header.
+        // SigV4 always signs `host` (it's the canonical name for the authority),
+        // so synthesize a `Host` header from `:authority` if missing — otherwise
+        // verification fails with "signed header 'host' missing in request".
+        if session.req_header().headers.get("host").is_none()
+            && let Some(authority) = session.req_header().uri.authority()
+        {
+            let v = authority.as_str().to_string();
+            session.req_header_mut().insert_header("host", &v)?;
+        }
+
         // IMPORTANT: clone header so we don't hold an immutable borrow of `session`
         let req: RequestHeader = session.req_header().clone();
 
