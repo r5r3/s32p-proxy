@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -372,44 +373,51 @@ pub fn verify_sigv4_presigned_url(
     // 8) Try the original headers first; on mismatch, retry with default-port toggles
     // on the `host` header (see verify_sigv4_header_only for rationale).
     let host_variants = host_header_variants(&header_storage);
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut tried: Vec<(String, String)> = Vec::new();
 
-    for variant in host_variants {
+    for variant in &host_variants {
         let attempt = match variant {
             None => header_storage.clone(),
             Some(new_host) => {
                 let mut hs = header_storage.clone();
                 if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
-                    slot.1 = new_host;
+                    slot.1 = new_host.clone();
                 }
                 hs
             }
         };
+        let attempted_host = attempt
+            .iter()
+            .find(|(k, _)| k == "host")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
 
         let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-        let signable =
-            match SignableRequest::new(method, &unsigned_uri, header_iter, body.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(anyhow!("signable request error: {e}"));
-                    continue;
-                }
-            };
+        let signable = SignableRequest::new(method, &unsigned_uri, header_iter, body.clone())
+            .map_err(|e| anyhow!("signable request error: {e}"))?;
 
-        let our_sig = match aws_sigv4::http_request::sign(signable, &signing_params) {
-            Ok(out) => out.into_parts().1,
-            Err(e) => {
-                last_err = Some(anyhow!("sigv4 sign error: {e}"));
-                continue;
-            }
-        };
+        let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
+            .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
+            .into_parts()
+            .1;
 
         if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
             return Ok(());
         }
+        tried.push((attempted_host, our_sig.to_string()));
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("signature mismatch")))
+    Err(anyhow!(
+        "signature mismatch ({})",
+        sigv4_mismatch_diagnostic(
+            method,
+            &unsigned_uri,
+            &header_storage,
+            &auth.signed_headers,
+            &auth.signature,
+            &tried,
+        )
+    ))
 }
 
 pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
@@ -584,44 +592,94 @@ pub fn verify_sigv4_header_only(
     // the canonical `host` value. Different clients disagree (Go's net/http strips
     // `:80`/`:443`; some Java/Cyberduck-derived clients keep it). Accept either.
     let host_variants = host_header_variants(&header_storage);
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut tried: Vec<(String, String)> = Vec::new(); // (host_value_used, our_sig)
 
-    for variant in host_variants {
+    for variant in &host_variants {
         let attempt = match variant {
             None => header_storage.clone(),
             Some(new_host) => {
                 let mut hs = header_storage.clone();
                 if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
-                    slot.1 = new_host;
+                    slot.1 = new_host.clone();
                 }
                 hs
             }
         };
+        let attempted_host = attempt
+            .iter()
+            .find(|(k, _)| k == "host")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
 
         let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-        let signable =
-            match SignableRequest::new(method, path_and_query, header_iter, body.clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(anyhow!("signable request error: {e}"));
-                    continue;
-                }
-            };
+        let signable = SignableRequest::new(method, path_and_query, header_iter, body.clone())
+            .map_err(|e| anyhow!("signable request error: {e}"))?;
 
-        let our_sig = match aws_sigv4::http_request::sign(signable, &signing_params) {
-            Ok(out) => out.into_parts().1,
-            Err(e) => {
-                last_err = Some(anyhow!("sigv4 sign error: {e}"));
-                continue;
-            }
-        };
+        let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
+            .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
+            .into_parts()
+            .1;
 
         if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
             return Ok(());
         }
+        tried.push((attempted_host, our_sig.to_string()));
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("signature mismatch")))
+    Err(anyhow!(
+        "signature mismatch ({})",
+        sigv4_mismatch_diagnostic(
+            method,
+            path_and_query,
+            &header_storage,
+            &auth.signed_headers,
+            &auth.signature,
+            &tried,
+        )
+    ))
+}
+
+/// Build a one-line diagnostic string describing inputs to SigV4 verification.
+/// Emitted only on mismatch — keeps the happy path hot. Header values are quoted
+/// with backslash escapes so trailing whitespace and embedded `;` survive logging.
+fn sigv4_mismatch_diagnostic(
+    method: &str,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    signed_headers: &str,
+    client_signature: &str,
+    tried: &[(String, String)],
+) -> String {
+    let mut out = String::new();
+    let _ = write!(out, "method={method} path_and_query={path_and_query:?} signed_headers={signed_headers:?} headers=[");
+    for (i, (k, v)) in headers.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{k}={v:?}");
+    }
+    out.push_str("] client_sig=");
+    // Show first 8 hex chars only — full signatures are sensitive enough to keep short.
+    out.push_str(&truncate_sig(client_signature));
+    out.push_str(" tried=[");
+    for (i, (h, s)) in tried.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "host={h:?}->{}", truncate_sig(s));
+    }
+    out.push(']');
+    out
+}
+
+fn truncate_sig(s: &str) -> String {
+    let n = s.len().min(8);
+    let mut out = String::with_capacity(n + 3);
+    out.push_str(&s[..n]);
+    if s.len() > n {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Produce the set of `host` header values to try when verifying SigV4.
