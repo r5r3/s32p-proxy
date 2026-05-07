@@ -13,7 +13,7 @@ use pingora::{
     http::{RequestHeader, ResponseHeader, StatusCode},
     listeners::tls::TlsSettings,
     proxy::{ProxyHttp, Session, http_proxy_service},
-    server::Server,
+    server::{Server, configuration::ServerConf},
     upstreams::peer::{HttpPeer, PeerOptions},
 };
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -500,7 +500,11 @@ fn main() -> Result<()> {
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
     };
 
-    let mut server = Server::new(None)?;
+    let pingora_conf = ServerConf {
+        grace_period_seconds: Some(cfg.server.shutdown_grace_period_secs),
+        ..ServerConf::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(None, pingora_conf);
     server.bootstrap();
 
     let mut proxy = http_proxy_service(&server.configuration, app);

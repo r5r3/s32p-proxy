@@ -34,6 +34,12 @@ LimitMEMLOCK=infinity
 Restart=on-failure
 RestartSec=5s
 
+# On SIGTERM, Pingora drains in-flight requests for ServerConf.grace_period_seconds
+# (we set 10s via server.shutdown_grace_period_secs in s32p-proxy.yaml), then has
+# up to ~5s to shut down its tokio runtimes. 30s gives comfortable headroom and
+# avoids the 90s default that previously ended in SIGKILL.
+TimeoutStopSec=30s
+
 # Kernel must allow io_uring (RHEL: sysctl kernel.io_uring_disabled=0).
 
 [Install]

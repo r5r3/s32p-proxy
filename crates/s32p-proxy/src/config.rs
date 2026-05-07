@@ -26,6 +26,14 @@ pub struct ServerConfig {
     pub region:                  String,
     /// e.g. "info", "debug", or "s32p_proxy=debug"
     pub log_level:               Option<String>,
+    /// Pingora's grace period on SIGTERM, in seconds. The proxy stops
+    /// accepting new connections, broadcasts shutdown, then sleeps this
+    /// long (uninterruptible) to let in-flight requests drain. Defaults
+    /// to 10s; set higher if you have slow large-object PUTs.
+    /// Pingora's own default is 300s, which is too long for `systemctl
+    /// stop` (TimeoutStopSec=30s in the shipped unit).
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    pub shutdown_grace_period_secs: u64,
     /// Host suffixes for virtual-hosted-style bucket detection.
     /// If a request's Host header ends with one of these suffixes and has exactly one additional component,
     /// it will be treated as virtual-hosted-style (bucket in host, key in path).
@@ -88,6 +96,10 @@ pub struct OpenBaoAuthConfig {
 
 fn default_approle_mount() -> String {
     "approle".to_string()
+}
+
+fn default_shutdown_grace_period_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Deserialize)]
