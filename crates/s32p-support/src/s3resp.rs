@@ -378,6 +378,7 @@ pub fn list_objects_v2(
     continuation_token: Option<&str>,
     next_continuation_token: Option<&str>,
     start_after: Option<&str>,
+    encoding_type: Option<&str>,
     contents: &[s3xml::ListObjectInfo],
     common_prefixes: &[String],
 ) -> HttpResponse {
@@ -391,6 +392,7 @@ pub fn list_objects_v2(
         continuation_token,
         next_continuation_token,
         start_after,
+        encoding_type,
         contents,
         common_prefixes,
     )

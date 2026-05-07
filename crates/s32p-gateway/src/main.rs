@@ -1224,19 +1224,35 @@ async fn handle_list_objects_v2(
     let continuation_token_in = class.query.first("continuation-token").map(|s| s.to_string());
     let start_after = class.query.first("start-after").map(|s| s.to_string());
 
+    // EncodingType=url support: when requested, percent-encode all key/prefix
+    // strings in the response (Key, CommonPrefixes/Prefix, echoed Prefix,
+    // Delimiter, StartAfter) per AWS S3 conventions.
+    let url_encode = matches!(class.query.first("encoding-type"), Some("url"));
+    let enc = |s: &str| -> String {
+        if url_encode {
+            s32p_support::uri_encoding::s3_url_encode(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let encoding_type_resp = if url_encode { Some("url") } else { None };
+
     // check the prefix, we don't list multipart upload dirs
     if !prefix.is_empty() && is_reserved_first_segment(&prefix, cfg.mpu_dir_name.as_str()) {
         // behave as if it doesn't exist
+        let prefix_enc = enc(&prefix);
+        let start_after_enc = start_after.as_deref().map(enc);
         return s32p_support::s3resp::list_objects_v2(
             bucket,
-            Some(&prefix),
+            Some(&prefix_enc),
             if recursive { None } else { Some("/") },
             0,
             max_keys,
             false,
             continuation_token_in.as_deref(),
             None,
-            start_after.as_deref(),
+            start_after_enc.as_deref(),
+            encoding_type_resp,
             &[],
             &[],
         );
@@ -1252,16 +1268,19 @@ async fn handle_list_objects_v2(
 
     // If the *prefix directory* doesn't exist (but bucket exists), return an empty listing.
     if !start_dir_fs.exists() || !start_dir_fs.is_dir() {
+        let prefix_enc = enc(&prefix);
+        let start_after_enc = start_after.as_deref().map(enc);
         return s32p_support::s3resp::list_objects_v2(
             bucket,
-            Some(&prefix),
+            Some(&prefix_enc),
             if recursive { None } else { Some("/") },
             0,
             max_keys,
             false,
             continuation_token_in.as_deref(),
             None,
-            start_after.as_deref(),
+            start_after_enc.as_deref(),
+            encoding_type_resp,
             &[],
             &[],
         );
@@ -1459,18 +1478,44 @@ async fn handle_list_objects_v2(
         None
     };
 
+    // Apply EncodingType=url to the response (echoed prefix/start-after, Contents.Key,
+    // CommonPrefixes/Prefix). Continuation tokens are already URL-safe (base64url),
+    // and `Delimiter` is always `/` here so it round-trips fine either way — we still
+    // pass the raw `/` because `s3_url_encode("/")` would yield `%2F` which AWS's own
+    // responses also produce when EncodingType=url, but matching v1 behavior we keep
+    // the delimiter unencoded for compatibility with naive clients.
+    let prefix_enc = enc(&prefix);
+    let start_after_enc = start_after.as_deref().map(enc);
+    let contents_enc: Vec<s32p_support::s3xml::ListObjectInfo> = if url_encode {
+        contents
+            .iter()
+            .map(|c| s32p_support::s3xml::ListObjectInfo {
+                key:           enc(&c.key),
+                last_modified: c.last_modified.clone(),
+                etag:          c.etag.clone(),
+                size:          c.size,
+                owner:         c.owner.clone(),
+            })
+            .collect()
+    } else {
+        contents
+    };
+    let common_prefixes_enc: Vec<String> =
+        if url_encode { common_prefixes.iter().map(|p| enc(p)).collect() } else { common_prefixes };
+
     s32p_support::s3resp::list_objects_v2(
         bucket,
-        Some(&prefix),
+        Some(&prefix_enc),
         if recursive { None } else { Some("/") },
         key_count,
         max_keys,
         is_truncated && next_token.is_some(),
         continuation_token_in.as_deref(),
         next_token.as_deref(),
-        start_after.as_deref(),
-        &contents,
-        &common_prefixes,
+        start_after_enc.as_deref(),
+        encoding_type_resp,
+        &contents_enc,
+        &common_prefixes_enc,
     )
 }
 
@@ -1530,16 +1575,26 @@ async fn handle_list_objects_v1(
         .unwrap_or(1000)
         .min(1000);
 
+    let url_encode = matches!(class.query.first("encoding-type"), Some("url"));
+    let enc = |s: &str| -> String {
+        if url_encode {
+            s32p_support::uri_encoding::s3_url_encode(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let encoding_type_resp = if url_encode { Some("url") } else { None };
+
     if !prefix.is_empty() && is_reserved_first_segment(&prefix, cfg.mpu_dir_name.as_str()) {
         return s32p_support::s3resp::list_objects_v1(
             bucket,
-            &prefix,
+            &enc(&prefix),
             if recursive { None } else { Some("/") },
-            &marker,
+            &enc(&marker),
             None,
             max_keys,
             false,
-            None,
+            encoding_type_resp,
             &[],
             &[],
         );
@@ -1555,13 +1610,13 @@ async fn handle_list_objects_v1(
     if !start_dir_fs.exists() || !start_dir_fs.is_dir() {
         return s32p_support::s3resp::list_objects_v1(
             bucket,
-            &prefix,
+            &enc(&prefix),
             if recursive { None } else { Some("/") },
-            &marker,
+            &enc(&marker),
             None,
             max_keys,
             false,
-            None,
+            encoding_type_resp,
             &[],
             &[],
         );
@@ -1687,17 +1742,37 @@ async fn handle_list_objects_v1(
     // marker. We always emit it on truncation for consistency.
     let next_marker = if is_truncated { last_emitted } else { None };
 
+    let prefix_enc = enc(&prefix);
+    let marker_enc = enc(&marker);
+    let next_marker_enc = next_marker.as_deref().map(enc);
+    let contents_enc: Vec<s32p_support::s3xml::ListObjectInfo> = if url_encode {
+        contents
+            .iter()
+            .map(|c| s32p_support::s3xml::ListObjectInfo {
+                key:           enc(&c.key),
+                last_modified: c.last_modified.clone(),
+                etag:          c.etag.clone(),
+                size:          c.size,
+                owner:         c.owner.clone(),
+            })
+            .collect()
+    } else {
+        contents
+    };
+    let common_prefixes_enc: Vec<String> =
+        if url_encode { common_prefixes.iter().map(|p| enc(p)).collect() } else { common_prefixes };
+
     s32p_support::s3resp::list_objects_v1(
         bucket,
-        &prefix,
+        &prefix_enc,
         if recursive { None } else { Some("/") },
-        &marker,
-        next_marker.as_deref(),
+        &marker_enc,
+        next_marker_enc.as_deref(),
         max_keys,
         is_truncated,
-        None, // EncodingType: not echoed; we don't actually URL-encode keys (matches v2 behavior).
-        &contents,
-        &common_prefixes,
+        encoding_type_resp,
+        &contents_enc,
+        &common_prefixes_enc,
     )
 }
 

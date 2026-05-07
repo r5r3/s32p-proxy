@@ -142,6 +142,7 @@ pub fn list_objects_v2_body(
     continuation_token: Option<&str>,
     next_continuation_token: Option<&str>,
     start_after: Option<&str>,
+    encoding_type: Option<&str>,
     contents: &[ListObjectInfo],
     common_prefixes: &[String],
 ) -> Result<Vec<u8>> {
@@ -156,6 +157,7 @@ pub fn list_objects_v2_body(
         continuation_token: continuation_token.map(|s| s.to_string()),
         next_continuation_token: next_continuation_token.map(|s| s.to_string()),
         start_after: start_after.map(|s| s.to_string()),
+        encoding_type: encoding_type.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         contents: contents
             .iter()
             .map(|o| ContentsV2 {
@@ -596,6 +598,9 @@ struct ListBucketResultV2 {
 
     #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
     start_after: Option<String>,
+
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    encoding_type: Option<String>,
 
     #[serde(rename = "Contents", default, skip_serializing_if = "Vec::is_empty")]
     contents: Vec<ContentsV2>,
