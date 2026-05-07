@@ -642,6 +642,10 @@ fn parse_bucket_key_auto(
 
         // Check if host ends with any of the configured suffixes
         for suffix in virtual_hosted_suffixes {
+            // Skip empty suffix: ends_with("") is always true and would mis-classify every host.
+            if suffix.is_empty() {
+                continue;
+            }
             if host_without_port.ends_with(suffix) {
                 // Extract the part before the suffix
                 let prefix = host_without_port.trim_end_matches(suffix);

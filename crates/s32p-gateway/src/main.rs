@@ -133,9 +133,18 @@ fn load_cfg() -> Result<Cfg> {
     #[allow(unused_variables)]
     let lustre_max_stripe_count = env_usize("S32P_LUSTRE_MAX_STRIPE_COUNT", 4).max(1) as u32;
 
-    // Load virtual hosted suffixes from environment variable
-    let virtual_hosted_suffixes = std::env::var("S32P_VIRTUAL_HOSTED_SUFFIXES")
-        .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+    // Load virtual hosted suffixes from environment variable.
+    // An unset OR empty env var, or a value of only commas/whitespace, must yield an empty Vec —
+    // a bare "".split(',') returns vec![""], and an empty suffix matches every host
+    // (host.ends_with("") is always true), which would mis-classify all path-style requests.
+    let virtual_hosted_suffixes: Vec<String> = std::env::var("S32P_VIRTUAL_HOSTED_SUFFIXES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     Ok(Cfg {
