@@ -95,8 +95,10 @@ pub struct UpstreamConfig {
     /// "tcp" or "uds"
     pub kind: UpstreamKind,
 
-    /// Base directory for per-uid UDS run dirs. Required when kind=uds.
+    /// Base directory for per-uid UDS run dirs. Used when kind=uds.
     /// Sockets will be created under: <uds_run_dir>/<uid>/<profile>.sock
+    /// If unset, defaults to `/run/s32p` when the proxy runs as root
+    /// (euid == 0), otherwise `$XDG_RUNTIME_DIR/s32p`.
     pub uds_run_dir: Option<String>,
 }
 
@@ -110,6 +112,32 @@ pub enum UpstreamKind {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self { kind: UpstreamKind::Tcp, uds_run_dir: None }
+    }
+}
+
+/// Resolve the default base directory for UDS run dirs based on the
+/// proxy's effective uid:
+/// - euid == 0 (e.g. systemd service): `/run/s32p`
+/// - euid != 0: `$XDG_RUNTIME_DIR/s32p`
+fn default_uds_run_dir() -> Result<String> {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        Ok("/run/s32p".to_string())
+    } else {
+        let xdg = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+            anyhow!(
+                "XDG_RUNTIME_DIR is not set; either set it, run as root, or set \
+                 workers.profiles.<name>.upstream.uds_run_dir explicitly"
+            )
+        })?;
+        let xdg = xdg.trim_end_matches('/');
+        if xdg.is_empty() {
+            return Err(anyhow!(
+                "XDG_RUNTIME_DIR is empty; either set it to a valid path, run as root, \
+                 or set workers.profiles.<name>.upstream.uds_run_dir explicitly"
+            ));
+        }
+        Ok(format!("{xdg}/s32p"))
     }
 }
 
@@ -183,9 +211,35 @@ impl Config {
     }
 
     pub fn from_str(yaml: &str) -> Result<Self> {
-        let cfg: Config = serde_yaml::from_str(yaml).context("failed to parse YAML")?;
+        let mut cfg: Config = serde_yaml::from_str(yaml).context("failed to parse YAML")?;
+        cfg.normalize_defaults()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Fill in runtime-derived defaults for fields the user may omit.
+    fn normalize_defaults(&mut self) -> Result<()> {
+        for (name, profile) in self.workers.profiles.iter_mut() {
+            if !matches!(profile.upstream.kind, UpstreamKind::Uds) {
+                continue;
+            }
+            let already_set = profile
+                .upstream
+                .uds_run_dir
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if already_set {
+                continue;
+            }
+            profile.upstream.uds_run_dir = Some(default_uds_run_dir().with_context(|| {
+                format!(
+                    "workers.profiles.{name}.upstream.uds_run_dir is unset and no default \
+                     could be derived"
+                )
+            })?);
+        }
+        Ok(())
     }
 
     /// Resolve placeholders in the launcher path.
@@ -301,7 +355,8 @@ impl Config {
                     let dir = profile.upstream.uds_run_dir.as_deref().unwrap_or("").trim();
                     if dir.is_empty() {
                         return Err(anyhow!(
-                            "workers.profile.upstream.uds_run_dir must be set when kind=uds"
+                            "workers.profile.upstream.uds_run_dir is empty after default \
+                             resolution (this should not happen — please report)"
                         ));
                     }
                 }
