@@ -395,16 +395,17 @@ async fn validate_sigv4_header_only_or_reject(
         Some(req.uri.path()),
     ) {
         Ok(()) => Ok(false),
-        Err(resp) => {
+        Err(rej) => {
             tracing::debug!(
                 method = req.method.as_str(),
                 path = req.uri.path(),
                 query = req.uri.query().unwrap_or(""),
                 username = user.username.as_str(),
-                status = resp.status().as_u16(),
+                status = rej.response.status().as_u16(),
+                reason = %rej.reason,
                 "proxy sigv4 verification rejected request (pre-spawn gate)"
             );
-            responses::respond_hyper(session, resp, /* close = */ true).await?;
+            responses::respond_hyper(session, rej.response, /* close = */ true).await?;
             Ok(true)
         }
     }

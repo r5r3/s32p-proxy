@@ -249,14 +249,16 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
 
     // All actions require authentication
     let cfg = app.cfg.clone();
-    if let Err(resp) = require_sigv4(&req, &cfg) {
+    if let Err(rej) = require_sigv4(&req, &cfg) {
         tracing::debug!(
             method = %method,
             uri = %uri_log,
-            status = resp.status().as_u16(),
+            host = %host_log,
+            status = rej.response.status().as_u16(),
+            reason = %rej.reason,
             "sigv4 verification failed"
         );
-        return Ok(resp);
+        return Ok(rej.response);
     }
 
     let resp = match &class.op {
@@ -306,7 +308,10 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     Ok(resp)
 }
 
-fn require_sigv4(req: &Request<Incoming>, cfg: &Cfg) -> std::result::Result<(), Resp> {
+fn require_sigv4(
+    req: &Request<Incoming>,
+    cfg: &Cfg,
+) -> std::result::Result<(), s32p_support::SigV4Rejection> {
     s32p_support::verify_sigv4_request_any(
         req.method().as_str(),
         req.uri(),

@@ -74,27 +74,36 @@ pub fn verify_sigv4_request_any(
     expected_access_key: Option<&str>,
     secret_key: &str,
     resource: Option<&str>,
-) -> std::result::Result<(), crate::s3resp::HttpResponse> {
+) -> std::result::Result<(), SigV4Rejection> {
     // Header-style SigV4
     if headers.get("authorization").is_some() {
         let auth = match parse_authorization(headers) {
             Ok(a) => a,
             Err(e) => {
-                return Err(crate::s3resp::access_denied(
-                    &format!("bad Authorization: {e}"),
-                    resource,
-                ));
+                let reason = format!("bad Authorization: {e}");
+                return Err(SigV4Rejection {
+                    response: crate::s3resp::access_denied(&reason, resource),
+                    reason,
+                });
             }
         };
 
         if let Some(exp) = expected_access_key {
             if auth.access_key != exp {
-                return Err(crate::s3resp::access_denied("unknown access key", resource));
+                let reason = "unknown access key".to_string();
+                return Err(SigV4Rejection {
+                    response: crate::s3resp::access_denied(&reason, resource),
+                    reason,
+                });
             }
         }
 
         if let Err(e) = verify_sigv4_header_only(method, uri, headers, &auth, secret_key) {
-            return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
+            let reason = e.to_string();
+            return Err(SigV4Rejection {
+                response: crate::s3resp::signature_does_not_match(&reason, resource),
+                reason,
+            });
         }
 
         return Ok(());
@@ -104,27 +113,48 @@ pub fn verify_sigv4_request_any(
     let auth = match parse_presigned_query(uri) {
         Ok(Some(a)) => a,
         Ok(None) => {
-            return Err(crate::s3resp::access_denied(
-                "missing Authorization and missing presign params",
-                resource,
-            ));
+            let reason = "missing Authorization and missing presign params".to_string();
+            return Err(SigV4Rejection {
+                response: crate::s3resp::access_denied(&reason, resource),
+                reason,
+            });
         }
         Err(e) => {
-            return Err(crate::s3resp::access_denied(&format!("bad presign params: {e}"), resource));
+            let reason = format!("bad presign params: {e}");
+            return Err(SigV4Rejection {
+                response: crate::s3resp::access_denied(&reason, resource),
+                reason,
+            });
         }
     };
 
     if let Some(exp) = expected_access_key {
         if auth.access_key != exp {
-            return Err(crate::s3resp::access_denied("unknown access key", resource));
+            let reason = "unknown access key".to_string();
+            return Err(SigV4Rejection {
+                response: crate::s3resp::access_denied(&reason, resource),
+                reason,
+            });
         }
     }
 
     if let Err(e) = verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key) {
-        return Err(crate::s3resp::signature_does_not_match(&e.to_string(), resource));
+        let reason = e.to_string();
+        return Err(SigV4Rejection {
+            response: crate::s3resp::signature_does_not_match(&reason, resource),
+            reason,
+        });
     }
 
     Ok(())
+}
+
+/// Why a SigV4 verification was rejected, paired with the S3-XML response to send back.
+/// `reason` is the underlying error message (suitable for logging); `response` is what the
+/// caller should write to the wire.
+pub struct SigV4Rejection {
+    pub response: crate::s3resp::HttpResponse,
+    pub reason:   String,
 }
 
 /// Parse SigV4 presign params from the URI query string.
