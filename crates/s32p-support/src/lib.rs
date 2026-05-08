@@ -81,7 +81,8 @@ pub fn verify_sigv4_request_any(
     // requests, signed-header lists, or signature bytes into responses.
     const CLIENT_MSG_BAD_AUTH: &str = "invalid Authorization";
     const CLIENT_MSG_BAD_KEY: &str = "access denied";
-    const CLIENT_MSG_BAD_SIG: &str = "the request signature we calculated does not match the signature you provided";
+    const CLIENT_MSG_BAD_SIG: &str =
+        "the request signature we calculated does not match the signature you provided";
     const CLIENT_MSG_NO_AUTH: &str = "request is missing authentication information";
 
     // Header-style SigV4
@@ -663,7 +664,8 @@ fn sigv4_mismatch_diagnostic(
     payload_hash: &str,
     tried: &[(String, String)],
 ) -> String {
-    let canonical = build_canonical_request(method, path_and_query, headers, signed_headers, payload_hash);
+    let canonical =
+        build_canonical_request(method, path_and_query, headers, signed_headers, payload_hash);
     let mut out = String::new();
     let _ = write!(
         out,
@@ -716,11 +718,8 @@ fn build_canonical_request(
         }
         q_parts.sort();
     }
-    let canonical_query = q_parts
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
+    let canonical_query =
+        q_parts.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
 
     // Canonical headers: sorted by lowercase name, "name:trimmed_value\n"
     let signed_set: Vec<&str> = signed_headers.split(';').map(|s| s.trim()).collect();
@@ -733,8 +732,11 @@ fn build_canonical_request(
     let canonical_headers: String = hpairs.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
 
     let signed_headers_str = {
-        let mut v: Vec<String> =
-            signed_set.iter().map(|s| s.to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+        let mut v: Vec<String> = signed_set
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
         v.sort();
         v.join(";")
     };

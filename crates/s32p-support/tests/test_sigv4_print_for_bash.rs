@@ -1,6 +1,8 @@
 // Print one signature for a fixed input so we can cross-check the openssl
 // reproduction in test-env/sigv4-cross-check.sh.
 
+use std::time::{Duration, UNIX_EPOCH};
+
 use aws_credential_types::Credentials;
 use aws_sigv4::{
     http_request::{
@@ -10,7 +12,6 @@ use aws_sigv4::{
     sign::v4,
 };
 use aws_smithy_runtime_api::client::identity::Identity;
-use std::time::{Duration, UNIX_EPOCH};
 use time::macros::format_description;
 
 #[test]
@@ -31,9 +32,7 @@ fn print_signature_for_bash_cross_check() {
 
     let dt = OffsetDateTime::from_unix_timestamp(unix as i64).unwrap();
     let amz_date_str = dt
-        .format(format_description!(
-            "[year][month][day]T[hour][minute][second]Z"
-        ))
+        .format(format_description!("[year][month][day]T[hour][minute][second]Z"))
         .unwrap();
     let date_str = dt.format(format_description!("[year][month][day]")).unwrap();
     println!("SCOPE_DATE={date_str}");
@@ -41,10 +40,7 @@ fn print_signature_for_bash_cross_check() {
 
     let headers: Vec<(String, String)> = vec![
         ("host".to_string(), "example.com".to_string()),
-        (
-            "x-amz-content-sha256".to_string(),
-            "UNSIGNED-PAYLOAD".to_string(),
-        ),
+        ("x-amz-content-sha256".to_string(), "UNSIGNED-PAYLOAD".to_string()),
         ("x-amz-date".to_string(), amz_date_str.clone()),
     ];
 

@@ -15,17 +15,17 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// e.g. "0.0.0.0:9000"
-    pub listen:                  String,
+    pub listen:                     String,
     /// "http" in dev, "https" behind TLS termination
-    pub public_scheme:           String,
+    pub public_scheme:              String,
     /// Path to TLS certificate (full chain)
-    pub tls_cert_path:           Option<String>,
+    pub tls_cert_path:              Option<String>,
     /// Path to TLS private key (in PEM format)
-    pub tls_key_path:            Option<String>,
+    pub tls_key_path:               Option<String>,
     /// Bucket region returned by GetBucketLocation (e.g. "eu-central-1"). Use "us-east-1" for the classic default.
-    pub region:                  String,
+    pub region:                     String,
     /// e.g. "info", "debug", or "s32p_proxy=debug"
-    pub log_level:               Option<String>,
+    pub log_level:                  Option<String>,
     /// Pingora's grace period on SIGTERM, in seconds. The proxy stops
     /// accepting new connections, broadcasts shutdown, then sleeps this
     /// long (uninterruptible) to let in-flight requests drain. Defaults
@@ -39,7 +39,7 @@ pub struct ServerConfig {
     /// it will be treated as virtual-hosted-style (bucket in host, key in path).
     /// Example: ["s3.example.com", "s3.internal.example.com"]
     #[serde(default)]
-    pub virtual_hosted_suffixes: Vec<String>,
+    pub virtual_hosted_suffixes:    Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,8 +259,8 @@ impl Config {
     pub fn resolve_placeholders(&mut self, install_bin_dir: &str) -> Result<()> {
         // Resolve {{install_bin_dir}} in launcher path
         if self.workers.launcher.path.contains("{{install_bin_dir}}") {
-            self.workers.launcher.path = self.workers.launcher.path
-                .replace("{{install_bin_dir}}", install_bin_dir);
+            self.workers.launcher.path =
+                self.workers.launcher.path.replace("{{install_bin_dir}}", install_bin_dir);
         }
 
         // Resolve {{install_bin_dir}} in worker profiles

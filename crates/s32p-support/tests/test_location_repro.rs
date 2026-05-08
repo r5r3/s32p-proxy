@@ -1,5 +1,5 @@
 use http::{HeaderMap, HeaderValue, Uri};
-use s32p_support::classifier::{classify_with_headers, ReadOp, S3Op};
+use s32p_support::classifier::{ReadOp, S3Op, classify_with_headers};
 
 #[test]
 fn get_bucket_location_with_trailing_slash_and_remote_host() {

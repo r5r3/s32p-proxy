@@ -1,7 +1,4 @@
-use std::{
-    ffi::CStr,
-    ptr,
-};
+use std::{ffi::CStr, ptr};
 
 use anyhow::{Result, anyhow};
 use libc::{c_char, uid_t};

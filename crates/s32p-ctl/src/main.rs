@@ -832,8 +832,7 @@ async fn main() -> Result<()> {
                     let path = require_yaml_path(&yaml_path)?;
                     let mut doc = load_yaml_or_default(&path)?;
                     let file = parse_versity_iam_file(args.json.to_str().unwrap())?;
-                    let (users, report) =
-                        versity_iam_to_user_docs(&file, &filter, on_missing)?;
+                    let (users, report) = versity_iam_to_user_docs(&file, &filter, on_missing)?;
                     for u in users {
                         yaml_user_upsert(&mut doc, u);
                     }

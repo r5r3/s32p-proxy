@@ -3,14 +3,15 @@ pub mod openbao_client;
 
 // Existing re-exports
 // Shared helpers / DTOs
-pub use directory::file::{
-    DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
-    render_directory_yaml_string, save_directory_yaml_file,
-};
 // layout.rs API (so admin can import from s32p_directory::DirectoryLayout etc if you want)
 pub use directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
 pub use directory::{
-    Directory, file, layout, openbao, posix_groups, posix_users, types,
+    Directory, file,
+    file::{
+        DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
+        render_directory_yaml_string, save_directory_yaml_file,
+    },
+    layout, openbao, posix_groups, posix_users, types,
     types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc},
     yaml,
 };

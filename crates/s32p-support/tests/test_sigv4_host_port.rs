@@ -4,6 +4,8 @@
 // vice versa. This was triggered by Mountain Duck/Cyberduck-derived clients
 // that keep `:443` in the canonical `host` value while mcli/Go strips it.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use aws_credential_types::Credentials;
 use aws_sigv4::{
     http_request::{
@@ -15,7 +17,6 @@ use aws_sigv4::{
 use aws_smithy_runtime_api::client::identity::Identity;
 use http::{HeaderMap, HeaderValue, Uri};
 use s32p_support::{SigV4Auth, verify_sigv4_header_only};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ACCESS_KEY: &str = "AKIATESTKEY";
 const SECRET_KEY: &str = "topsecret";
@@ -75,15 +76,19 @@ fn sign_with_host(host: &str, path_and_query: &str) -> String {
         .unwrap()
         .into();
 
-    aws_sigv4::http_request::sign(signable, &params).unwrap().into_parts().1.to_string()
+    aws_sigv4::http_request::sign(signable, &params)
+        .unwrap()
+        .into_parts()
+        .1
+        .to_string()
 }
 
 fn build_auth(signature: String) -> SigV4Auth {
     SigV4Auth {
-        access_key:     ACCESS_KEY.to_string(),
-        scope_date:     scope_date_str(),
-        region:         REGION.to_string(),
-        service:        SERVICE.to_string(),
+        access_key: ACCESS_KEY.to_string(),
+        scope_date: scope_date_str(),
+        region: REGION.to_string(),
+        service: SERVICE.to_string(),
         signed_headers: "host;x-amz-content-sha256;x-amz-date".to_string(),
         signature,
     }

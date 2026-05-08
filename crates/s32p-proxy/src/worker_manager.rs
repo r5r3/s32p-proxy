@@ -313,8 +313,8 @@ impl WorkerManager {
                     anyhow!("workers.upstream.uds_run_dir missing (required for uds)")
                 })?;
 
-                let sock_path =
-                    uds_socket_path(base, user.uid, user.gid, profile_name).with_context(|| {
+                let sock_path = uds_socket_path(base, user.uid, user.gid, profile_name)
+                    .with_context(|| {
                         format!(
                             "failed to build uds socket path for uid={} profile={profile_name}",
                             user.uid

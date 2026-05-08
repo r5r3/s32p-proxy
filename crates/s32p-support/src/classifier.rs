@@ -383,11 +383,7 @@ pub fn classify_with_headers(
     // No special query marker — v1 is the default behavior of a bucket GET in S3.
     // We get here only after multipart/versioning/object-lock/location/HeadBucket/V2
     // have all been ruled out, so accepting any remaining bucket-level GET is safe.
-    if method == "GET"
-        && bucket.is_some()
-        && key.is_none()
-        && query.validate_xid("ListObjects")
-    {
+    if method == "GET" && bucket.is_some() && key.is_none() && query.validate_xid("ListObjects") {
         return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListObjectsV1) };
     }
 

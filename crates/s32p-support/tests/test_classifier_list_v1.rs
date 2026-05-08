@@ -19,14 +19,8 @@ fn list_objects_v1_plain_get_bucket() {
 fn list_objects_v1_mountain_duck_query_shape() {
     // Mountain Duck:
     //   GET /s3test/?encoding-type=url&max-keys=1000&prefix=&delimiter=%2F
-    let op = classify(
-        "GET",
-        "/s3test/?encoding-type=url&max-keys=1000&prefix=&delimiter=%2F",
-    );
-    assert!(
-        matches!(op, S3Op::Read(ReadOp::ListObjectsV1)),
-        "expected ListObjectsV1, got {op:?}"
-    );
+    let op = classify("GET", "/s3test/?encoding-type=url&max-keys=1000&prefix=&delimiter=%2F");
+    assert!(matches!(op, S3Op::Read(ReadOp::ListObjectsV1)), "expected ListObjectsV1, got {op:?}");
 }
 
 #[test]
@@ -38,10 +32,7 @@ fn list_objects_v1_with_marker_and_prefix() {
 #[test]
 fn list_objects_v2_still_takes_precedence() {
     // V1 fallback must NOT swallow V2 — list-type=2 still routes to V2.
-    let op = classify(
-        "GET",
-        "/s3test/?list-type=2&prefix=foo&continuation-token=abc",
-    );
+    let op = classify("GET", "/s3test/?list-type=2&prefix=foo&continuation-token=abc");
     assert!(matches!(op, S3Op::Read(ReadOp::ListObjectsV2)));
 }
 

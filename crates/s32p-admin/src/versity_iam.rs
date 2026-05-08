@@ -84,8 +84,7 @@ pub fn versity_iam_to_user_docs(
     let mut seen: HashSet<String> = HashSet::new();
     for (outer_key, acct) in &file.access_accounts {
         let inner = acct.access.trim();
-        let effective =
-            if inner.is_empty() { outer_key.clone() } else { inner.to_string() };
+        let effective = if inner.is_empty() { outer_key.clone() } else { inner.to_string() };
 
         if !inner.is_empty() && inner != outer_key {
             tracing::warn!(
@@ -169,8 +168,8 @@ pub fn versity_iam_to_user_docs(
             access_key: access_key.clone(),
             secret_key: secret.to_string(),
             username,
-            uid:        acct.user_id,
-            gid:        acct.group_id,
+            uid: acct.user_id,
+            gid: acct.group_id,
         });
         report.imported.push(access_key);
     }

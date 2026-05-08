@@ -127,7 +127,8 @@ pub fn format_s3_time_system(st: SystemTime) -> String {
     let dt = match OffsetDateTime::from(st) {
         dt => dt.to_offset(UtcOffset::UTC),
     };
-    let fmt = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+    let fmt =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
     dt.format(&fmt).unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 

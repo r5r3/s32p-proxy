@@ -2,8 +2,7 @@
 // list-response XML carries `<EncodingType>url</EncodingType>` plus encoded
 // Key/Prefix values when requested.
 
-use s32p_support::s3xml;
-use s32p_support::uri_encoding::s3_url_encode;
+use s32p_support::{s3xml, uri_encoding::s3_url_encode};
 
 #[test]
 fn unreserved_chars_pass_through_unchanged() {
@@ -58,11 +57,7 @@ fn round_trip_through_percent_decode() {
     for orig in originals {
         let enc = s3_url_encode(orig);
         let dec = percent_encoding::percent_decode_str(&enc).decode_utf8().unwrap();
-        assert_eq!(
-            dec.as_ref(),
-            orig,
-            "round-trip failed for {orig:?} → {enc} → {dec}"
-        );
+        assert_eq!(dec.as_ref(), orig, "round-trip failed for {orig:?} → {enc} → {dec}");
     }
 }
 
@@ -95,10 +90,7 @@ fn list_objects_v1_xml_carries_encoding_type_when_requested() {
     .unwrap();
     let s = std::str::from_utf8(&bytes).unwrap();
 
-    assert!(
-        s.contains("<EncodingType>url</EncodingType>"),
-        "missing EncodingType: {s}"
-    );
+    assert!(s.contains("<EncodingType>url</EncodingType>"), "missing EncodingType: {s}");
     assert!(s.contains("space%20file.txt"), "key not encoded: {s}");
     assert!(s.contains("foo%20bar%2F"), "common prefix not encoded: {s}");
 }
@@ -138,15 +130,25 @@ fn list_objects_v2_xml_carries_encoding_type_when_requested() {
 #[test]
 fn list_objects_xml_without_encoding_type_omits_element() {
     // When encoding-type isn't requested, the EncodingType element must not appear.
-    let bytes = s3xml::list_objects_v1_body(
-        "bucket", "", None, "", None, 1000, false, None, &[], &[],
-    )
-    .unwrap();
+    let bytes =
+        s3xml::list_objects_v1_body("bucket", "", None, "", None, 1000, false, None, &[], &[])
+            .unwrap();
     let s = std::str::from_utf8(&bytes).unwrap();
     assert!(!s.contains("EncodingType"), "EncodingType element leaked when not requested: {s}");
 
     let bytes = s3xml::list_objects_v2_body(
-        "bucket", None, None, 0, 1000, false, None, None, None, None, &[], &[],
+        "bucket",
+        None,
+        None,
+        0,
+        1000,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
     )
     .unwrap();
     let s = std::str::from_utf8(&bytes).unwrap();

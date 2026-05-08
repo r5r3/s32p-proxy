@@ -362,7 +362,10 @@ async fn handle_create_mpu(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -436,7 +439,10 @@ async fn handle_list_uploads(req: Request<Incoming>, app: Arc<crate::App>, bucke
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));

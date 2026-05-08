@@ -139,12 +139,7 @@ fn load_cfg() -> Result<Cfg> {
     // (host.ends_with("") is always true), which would mis-classify all path-style requests.
     let virtual_hosted_suffixes: Vec<String> = std::env::var("S32P_VIRTUAL_HOSTED_SUFFIXES")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
+        .map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
 
     Ok(Cfg {
@@ -704,7 +699,10 @@ async fn handle_get_object(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -1185,7 +1183,10 @@ async fn handle_list_objects_v2(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -1229,11 +1230,7 @@ async fn handle_list_objects_v2(
     // Delimiter, StartAfter) per AWS S3 conventions.
     let url_encode = matches!(class.query.first("encoding-type"), Some("url"));
     let enc = |s: &str| -> String {
-        if url_encode {
-            s32p_support::uri_encoding::s3_url_encode(s)
-        } else {
-            s.to_string()
-        }
+        if url_encode { s32p_support::uri_encoding::s3_url_encode(s) } else { s.to_string() }
     };
     let encoding_type_resp = if url_encode { Some("url") } else { None };
 
@@ -1545,7 +1542,10 @@ async fn handle_list_objects_v1(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -1577,11 +1577,7 @@ async fn handle_list_objects_v1(
 
     let url_encode = matches!(class.query.first("encoding-type"), Some("url"));
     let enc = |s: &str| -> String {
-        if url_encode {
-            s32p_support::uri_encoding::s3_url_encode(s)
-        } else {
-            s.to_string()
-        }
+        if url_encode { s32p_support::uri_encoding::s3_url_encode(s) } else { s.to_string() }
     };
     let encoding_type_resp = if url_encode { Some("url") } else { None };
 
@@ -1870,7 +1866,10 @@ async fn handle_put_object(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -2016,7 +2015,10 @@ async fn handle_copy_object(
     match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -2047,7 +2049,10 @@ async fn handle_copy_object(
     match bucket_exists_dir(&cfg.posix_root, &src_bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -2278,7 +2283,10 @@ async fn handle_rename_object(
     match bucket_exists_dir(&cfg.posix_root, dst_bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -2455,7 +2463,10 @@ async fn handle_delete_object(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -2600,7 +2611,10 @@ async fn handle_delete_objects(
     match bucket_exists_dir(&cfg.posix_root, bucket) {
         Ok(true) => {}
         Ok(false) => {
-            return s32p_support::s3resp::no_such_bucket("bucket not found", Some(req.uri().path()));
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
