@@ -15,6 +15,54 @@ pub fn s3_url_encode(input: &str) -> String {
     utf8_percent_encode(input, S3_URL_ENCODE_SET).to_string()
 }
 
+/// Canonicalize a URI path for AWS SigV4 verification.
+///
+/// Returns the path with all bytes outside the unreserved set (`A-Za-z0-9-._~`)
+/// and `/` percent-encoded, while leaving existing well-formed `%XX` sequences
+/// intact (and upper-casing their hex digits).
+///
+/// Why this exists: with `PercentEncodingMode::Single`, aws-sigv4 uses the wire
+/// URI path verbatim as the canonical URI. But several SDKs (boto3, aws-cli,
+/// AWS Java SDK, minio-go in some paths) leave sub-delim characters like
+/// `(`, `)`, `*`, `'`, `!`, `:`, `@` unencoded on the wire while still
+/// percent-encoding them when computing the SigV4 canonical request, per the
+/// AWS spec ("URI encode every byte except the unreserved characters"). The
+/// resulting wire-vs-canonical divergence breaks signature verification unless
+/// we re-encode the wire path the same way the client did.
+pub fn canonicalize_uri_path_for_sigv4(path: &str) -> String {
+    fn is_unreserved_or_slash(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/')
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push(bytes[i + 1].to_ascii_uppercase() as char);
+            out.push(bytes[i + 2].to_ascii_uppercase() as char);
+            i += 3;
+            continue;
+        }
+        if is_unreserved_or_slash(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Percent-decode a path-like string **segment-by-segment** (splitting on '/'),
 /// while preserving '/' as a delimiter.
 ///

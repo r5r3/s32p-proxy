@@ -373,40 +373,45 @@ pub fn verify_sigv4_presigned_url(
         .into();
 
     // 8) Try the original headers first; on mismatch, retry with default-port toggles
-    // on the `host` header (see verify_sigv4_header_only for rationale).
+    // on the `host` header (see verify_sigv4_header_only for rationale) and a
+    // re-encoded path variant for clients that leave sub-delim chars literal on
+    // the wire but encode them in the canonical URI.
     let host_variants = host_header_variants(&header_storage);
+    let path_variants = path_variants_for_sigv4(&unsigned_uri);
     let mut tried: Vec<(String, String)> = Vec::new();
 
-    for variant in &host_variants {
-        let attempt = match variant {
-            None => header_storage.clone(),
-            Some(new_host) => {
-                let mut hs = header_storage.clone();
-                if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
-                    slot.1 = new_host.clone();
+    for path_variant in &path_variants {
+        for host_variant in &host_variants {
+            let attempt = match host_variant {
+                None => header_storage.clone(),
+                Some(new_host) => {
+                    let mut hs = header_storage.clone();
+                    if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
+                        slot.1 = new_host.clone();
+                    }
+                    hs
                 }
-                hs
+            };
+            let attempted_host = attempt
+                .iter()
+                .find(|(k, _)| k == "host")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+
+            let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            let signable = SignableRequest::new(method, path_variant, header_iter, body.clone())
+                .map_err(|e| anyhow!("signable request error: {e}"))?;
+
+            let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
+                .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
+                .into_parts()
+                .1;
+
+            if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
+                return Ok(());
             }
-        };
-        let attempted_host = attempt
-            .iter()
-            .find(|(k, _)| k == "host")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-
-        let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-        let signable = SignableRequest::new(method, &unsigned_uri, header_iter, body.clone())
-            .map_err(|e| anyhow!("signable request error: {e}"))?;
-
-        let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
-            .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
-            .into_parts()
-            .1;
-
-        if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
-            return Ok(());
+            tried.push((attempted_host, our_sig.to_string()));
         }
-        tried.push((attempted_host, our_sig.to_string()));
     }
 
     let presign_auth = SigV4Auth {
@@ -603,39 +608,45 @@ pub fn verify_sigv4_header_only(
     // variants. AWS SigV4 doesn't standardize whether the default port appears in
     // the canonical `host` value. Different clients disagree (Go's net/http strips
     // `:80`/`:443`; some Java/Cyberduck-derived clients keep it). Accept either.
+    // We also try the original wire path first, then a re-encoded variant for
+    // clients (boto3, aws-cli, AWS Java SDK) that send sub-delim chars like
+    // `(`, `)` literally on the wire but encode them in the canonical URI.
     let host_variants = host_header_variants(&header_storage);
+    let path_variants = path_variants_for_sigv4(path_and_query);
     let mut tried: Vec<(String, String)> = Vec::new(); // (host_value_used, our_sig)
 
-    for variant in &host_variants {
-        let attempt = match variant {
-            None => header_storage.clone(),
-            Some(new_host) => {
-                let mut hs = header_storage.clone();
-                if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
-                    slot.1 = new_host.clone();
+    for path_variant in &path_variants {
+        for host_variant in &host_variants {
+            let attempt = match host_variant {
+                None => header_storage.clone(),
+                Some(new_host) => {
+                    let mut hs = header_storage.clone();
+                    if let Some(slot) = hs.iter_mut().find(|(k, _)| k == "host") {
+                        slot.1 = new_host.clone();
+                    }
+                    hs
                 }
-                hs
+            };
+            let attempted_host = attempt
+                .iter()
+                .find(|(k, _)| k == "host")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+
+            let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            let signable = SignableRequest::new(method, path_variant, header_iter, body.clone())
+                .map_err(|e| anyhow!("signable request error: {e}"))?;
+
+            let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
+                .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
+                .into_parts()
+                .1;
+
+            if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
+                return Ok(());
             }
-        };
-        let attempted_host = attempt
-            .iter()
-            .find(|(k, _)| k == "host")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-
-        let header_iter = attempt.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-        let signable = SignableRequest::new(method, path_and_query, header_iter, body.clone())
-            .map_err(|e| anyhow!("signable request error: {e}"))?;
-
-        let our_sig = aws_sigv4::http_request::sign(signable, &signing_params)
-            .map_err(|e| anyhow!("sigv4 sign error: {e}"))?
-            .into_parts()
-            .1;
-
-        if constant_time_eq(our_sig.as_bytes(), auth.signature.as_bytes()) {
-            return Ok(());
+            tried.push((attempted_host, our_sig.to_string()));
         }
-        tried.push((attempted_host, our_sig.to_string()));
     }
 
     Err(anyhow!(
@@ -752,6 +763,28 @@ fn truncate_sig(s: &str) -> String {
     out.push_str(&s[..n]);
     if s.len() > n {
         out.push_str("...");
+    }
+    out
+}
+
+/// Build the set of path-and-query variants to try when verifying SigV4.
+/// Returns the original first; if its path component differs from the AWS
+/// SigV4 canonical form (unreserved + `/`, others percent-encoded), also
+/// returns the canonicalized form. The query string is preserved verbatim;
+/// query canonicalization is handled separately by aws-sigv4.
+fn path_variants_for_sigv4(path_and_query: &str) -> Vec<String> {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+    let canonical = uri_encoding::canonicalize_uri_path_for_sigv4(path);
+    let mut out = vec![path_and_query.to_string()];
+    if canonical != path {
+        let rebuilt = match query {
+            Some(q) => format!("{canonical}?{q}"),
+            None => canonical,
+        };
+        out.push(rebuilt);
     }
     out
 }
