@@ -1417,6 +1417,34 @@ async fn handle_list_objects_v2(
                 continue;
             }
 
+            // Recursive mode: surface leaf-empty directories as 0-byte
+            // directory-marker objects (key ends in '/'). Without this, a
+            // recursive ListObjects walk descends into an empty dir and
+            // produces no Contents, so clients that delete-by-listing
+            // (iOS S3 apps, mc rm --recursive, aws s3 rm --recursive) can't
+            // reach the dir to remove it. We only mark *leaf-empty* dirs;
+            // for non-empty parents, prune_empty_parents collapses the
+            // chain after the leaf marker is deleted.
+            let dir_is_empty = std::fs::read_dir(&it.path)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(false);
+
+            if dir_is_empty {
+                if let Some(stx) = statx_info(&it.path) {
+                    let key = format!("{}{}{}", top.dir_key, it.name, "/");
+                    if key.starts_with(&prefix) {
+                        contents.push(s32p_support::s3xml::ListObjectInfo {
+                            key,
+                            last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
+                            etag: format!("\"{}\"", stx.ino),
+                            size: 0,
+                            owner: if fetch_owner { Some(owner_info(stx.uid)) } else { None },
+                        });
+                    }
+                }
+                continue;
+            }
+
             // recursive: descend
             let child_key = format!("{}{}{}", top.dir_key, it.name, "/");
             stack.push(RuntimeFrame {
@@ -1690,6 +1718,29 @@ async fn handle_list_objects_v1(
                 let cp = format!("{}{}{}", top.dir_key, it.name, "/");
                 last_emitted = Some(cp.clone());
                 common_prefixes.push(cp);
+                continue;
+            }
+
+            // Surface leaf-empty directories as 0-byte directory markers in
+            // recursive listings — see the matching v2 handler for rationale.
+            let dir_is_empty = std::fs::read_dir(&it.path)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(false);
+
+            if dir_is_empty {
+                if let Some(stx) = statx_info(&it.path) {
+                    let key = format!("{}{}{}", top.dir_key, it.name, "/");
+                    if key.starts_with(&prefix) {
+                        last_emitted = Some(key.clone());
+                        contents.push(s32p_support::s3xml::ListObjectInfo {
+                            key,
+                            last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
+                            etag: format!("\"{}\"", stx.ino),
+                            size: 0,
+                            owner: Some(owner_info(stx.uid)),
+                        });
+                    }
+                }
                 continue;
             }
 
@@ -2478,6 +2529,53 @@ async fn handle_delete_object(
         Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
     };
 
+    // Directory-marker delete: a key ending in '/' addresses an (expected
+    // leaf-empty) filesystem directory. We rmdir it and let prune_empty_parents
+    // collapse the chain upward. We deliberately skip the conditional-header
+    // machinery — clients don't send If-Match on dir markers, and the
+    // precondition path below assumes a regular file (etag-from-inode, etc.).
+    if key.ends_with('/') {
+        match std::fs::remove_dir(&obj_path) {
+            Ok(()) => {
+                if let (Ok(bucket_root), Some(parent)) =
+                    (bucket_root_path(&cfg.posix_root, bucket), obj_path.parent())
+                {
+                    prune_empty_parents(&bucket_root, parent.to_path_buf());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // S3 DELETE is idempotent: missing target is still success.
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY)) => {
+                tracing::debug!(
+                    "DELETE on directory marker {} rejected: directory not empty",
+                    obj_path.display()
+                );
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::CONFLICT,
+                    "BucketNotEmpty",
+                    "directory not empty",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return s32p_support::s3resp::access_denied(
+                    "permission denied",
+                    Some(req.uri().path()),
+                );
+            }
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        }
+        return s32p_support::s3resp::delete_object_no_content();
+    }
+
     // check preconditions
     let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
@@ -2703,7 +2801,15 @@ async fn handle_delete_objects(
             }
         };
 
-        match std::fs::remove_file(&obj_path) {
+        // Directory-marker delete: a key ending in '/' is rmdir-ed instead of
+        // unlinked. Mirrors handle_delete_object's branch.
+        let res = if key.ends_with('/') {
+            std::fs::remove_dir(&obj_path)
+        } else {
+            std::fs::remove_file(&obj_path)
+        };
+
+        match res {
             Ok(()) => {
                 if let Some(parent) = obj_path.parent() {
                     prune_empty_parents(&bucket_root, parent.to_path_buf());
@@ -2717,6 +2823,13 @@ async fn handle_delete_objects(
                 if !quiet {
                     deleted.push(key);
                 }
+            }
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY)) => {
+                errors.push(s32p_support::s3xml::DeleteErrorInfo {
+                    key,
+                    code: "BucketNotEmpty".to_string(),
+                    message: "directory not empty".to_string(),
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 errors.push(s32p_support::s3xml::DeleteErrorInfo {
