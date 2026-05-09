@@ -14,7 +14,7 @@ aws-credential-types = "1.2"
 aws-smithy-runtime-api = "1.9"
 
 constant_time_eq = "0.4"
-time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
+time = { workspace = true }
 
 # shared classifier parses query params
 url = "2"
