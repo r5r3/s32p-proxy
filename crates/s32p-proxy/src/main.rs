@@ -317,7 +317,7 @@ impl ProxyHttp for S3ProxyApp {
 
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PResult<()>
@@ -327,6 +327,24 @@ impl ProxyHttp for S3ProxyApp {
         // IMPORTANT for SigV4: do NOT let Host change when proxying to 127.0.0.1:PORT
         if let Some(host) = ctx.orig_host.as_deref() {
             upstream_request.insert_header("Host", host)?;
+        }
+
+        // Stamp client IP onto the upstream request so the gateway can log it.
+        // We *replace* any client-supplied X-Forwarded-For — clients shouldn't
+        // be sending it, and trusting it would let them spoof the peer. Safe
+        // for SigV4: AWS SDKs don't include x-forwarded-for in SignedHeaders,
+        // so the worker's re-validation is unaffected.
+        if let Some(addr) = session.client_addr() {
+            // SocketAddr's Display includes the port for Inet variants ("ip:port");
+            // strip it so the header is just the IP. Pingora's wrapper covers
+            // both inet and unix; for unix sockets we just record "unix".
+            let ip = addr
+                .as_inet()
+                .map(|sa| sa.ip().to_string())
+                .unwrap_or_else(|| "unix".to_string());
+            upstream_request.insert_header("X-Forwarded-For", ip)?;
+        } else {
+            upstream_request.remove_header("x-forwarded-for");
         }
 
         // Remove hop-by-hop headers (safe: usually not in SignedHeaders)
@@ -368,9 +386,14 @@ impl ProxyHttp for S3ProxyApp {
         ctx: &mut Self::CTX,
     ) {
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
+        let client = session
+            .client_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
 
         if let Some(err) = e {
             tracing::warn!(
+                client = %client,
                 uid = ctx.uid.unwrap_or(0),
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
@@ -381,6 +404,7 @@ impl ProxyHttp for S3ProxyApp {
             );
         } else {
             tracing::info!(
+                client = %client,
                 uid = ctx.uid.unwrap_or(0),
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
@@ -407,7 +431,12 @@ async fn validate_sigv4_header_only_or_reject(
     ) {
         Ok(()) => Ok(false),
         Err(rej) => {
+            let client = session
+                .client_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
             tracing::debug!(
+                client = %client,
                 method = req.method.as_str(),
                 path = req.uri.path(),
                 query = req.uri.query().unwrap_or(""),

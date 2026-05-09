@@ -40,6 +40,31 @@ use s32p_support::{
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, UnixListener};
 
+/// Direct connection peer captured at accept time. Used to (a) decide whether
+/// to trust the `X-Forwarded-For` stamped by s32p-proxy (only when the peer is
+/// loopback or UDS) and (b) provide a usable client identity in standalone
+/// deployments where no proxy fronts the gateway.
+#[derive(Debug, Clone)]
+enum PeerAddr {
+    Tcp(std::net::SocketAddr),
+    Unix,
+}
+
+impl PeerAddr {
+    fn is_local(&self) -> bool {
+        match self {
+            PeerAddr::Tcp(sa) => sa.ip().is_loopback(),
+            PeerAddr::Unix => true,
+        }
+    }
+    fn client_label(&self) -> String {
+        match self {
+            PeerAddr::Tcp(sa) => sa.ip().to_string(),
+            PeerAddr::Unix => "unix".to_string(),
+        }
+    }
+}
+
 #[cfg(feature = "lustre")]
 use crate::fs_helpers::stripe_count_for_size;
 use crate::{
@@ -215,7 +240,11 @@ async fn read_small(
     Ok(Bytes::from_owner(SliceOwner::new(pooled, 0, n)))
 }
 
-async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallible> {
+async fn handle(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    peer: Option<PeerAddr>,
+) -> Result<Resp, Infallible> {
     let method = req.method().clone();
     let uri_log = req.uri().to_string();
     let host_log = req
@@ -224,6 +253,17 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
+    // Pick the "client IP" to log:
+    //   - direct peer is loopback (or UDS) → trust X-Forwarded-For from the
+    //     fronting s32p-proxy, fall back to the peer label if it's missing
+    //   - direct peer is a real network address → use the peer; ignore XFF
+    //     (a direct client could otherwise spoof their source)
+    let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_log = match peer.as_ref() {
+        Some(p) if p.is_local() => xff.map(str::to_string).unwrap_or_else(|| p.client_label()),
+        Some(p) => p.client_label(),
+        None => xff.unwrap_or("<unknown>").to_string(),
+    };
 
     let class = s32p_support::classifier::classify_with_headers(
         req.method().as_str(),
@@ -233,6 +273,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     );
 
     tracing::debug!(
+        client = %client_log,
         method = %method,
         uri = %uri_log,
         host = %host_log,
@@ -246,6 +287,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     let cfg = app.cfg.clone();
     if let Err(rej) = require_sigv4(&req, &cfg) {
         tracing::debug!(
+            client = %client_log,
             method = %method,
             uri = %uri_log,
             host = %host_log,
@@ -297,6 +339,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Resp, Infallibl
     };
 
     tracing::debug!(
+        client = %client_log,
         method = %method,
         uri = %uri_log,
         status = resp.status().as_u16(),
@@ -2899,10 +2942,12 @@ async fn main() -> Result<()> {
         loop {
             let (stream, _addr) = listener.accept().await?;
             let app2 = app.clone();
+            let peer = PeerAddr::Unix;
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc = service_fn(move |req| handle(req, app2.clone()));
+                let svc =
+                    service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
@@ -2927,13 +2972,15 @@ async fn main() -> Result<()> {
         );
 
         loop {
-            let (stream, _peer) = listener.accept().await?;
+            let (stream, peer_sa) = listener.accept().await?;
             stream.set_nodelay(true)?;
             let app2 = app.clone();
+            let peer = PeerAddr::Tcp(peer_sa);
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc = service_fn(move |req| handle(req, app2.clone()));
+                let svc =
+                    service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
