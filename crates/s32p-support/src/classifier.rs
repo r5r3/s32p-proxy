@@ -108,6 +108,10 @@ pub enum ReadOp {
     /// object lock, V2 listing). v1 query params (`prefix`, `delimiter`, `marker`,
     /// `max-keys`, `encoding-type`) are all optional.
     ListObjectsV1,
+    /// GET /{bucket}/{key}?acl
+    GetObjectAcl,
+    /// GET /{bucket}?acl
+    GetBucketAcl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +291,20 @@ pub fn classify_with_headers(
     // but multipart routing is usually clearer).
     if let Some(op) = classify_multipart(method, &bucket, &key, &query) {
         return S3RequestClass { bucket, key, query, op: S3Op::Multipart(op) };
+    }
+
+    // ACL sub-resource (`?acl`) takes precedence over versioning detection so
+    // a request like `?acl&versionId=...` is recognized as GetObjectAcl rather
+    // than getting hijacked by `classify_versioning` (which would map any
+    // request with versionId to the Versioning class — currently routed to
+    // not_implemented). We ignore versionId because versioning isn't supported.
+    if method == "GET" && bucket.is_some() && query.has("acl") {
+        if key.is_some() && query.validate_xid("GetObjectAcl") {
+            return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetObjectAcl) };
+        }
+        if key.is_none() && query.validate_xid("GetBucketAcl") {
+            return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetBucketAcl) };
+        }
     }
 
     if let Some(op) = classify_versioning(method, &bucket, &key, &query) {

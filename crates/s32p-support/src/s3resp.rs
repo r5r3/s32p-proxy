@@ -236,6 +236,30 @@ pub fn list_buckets_paginated(
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
+/// Convenience: GetObjectAcl / GetBucketAcl success (200) with synthetic ACL body.
+/// See `s3xml::get_acl_body` for body shape; we mirror AWS's
+/// "bucket-owner-enforced" response and optionally tack on an `AllUsers/READ`
+/// grant when the file is world-readable in POSIX.
+pub fn get_acl(owner_id: &str, owner_display_name: &str, world_readable: bool) -> HttpResponse {
+    let body = s3xml::get_acl_body(owner_id, owner_display_name, world_readable).unwrap_or_else(
+        |_| {
+            // Minimal fallback (still valid for clients): owner-only FULL_CONTROL.
+            format!(
+                "<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                <Owner><ID>{owner_id}</ID><DisplayName>{owner_display_name}</DisplayName></Owner>\
+                <AccessControlList><Grant>\
+                <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+                xsi:type=\"CanonicalUser\"><ID>{owner_id}</ID>\
+                <DisplayName>{owner_display_name}</DisplayName></Grantee>\
+                <Permission>FULL_CONTROL</Permission>\
+                </Grant></AccessControlList></AccessControlPolicy>"
+            )
+            .into_bytes()
+        },
+    );
+    response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+
 /// Convenience: GetBucketLocation success (200).
 pub fn get_bucket_location(region: &str) -> HttpResponse {
     let body = s3xml::get_bucket_location_body(region).unwrap_or_else(|_| {

@@ -318,6 +318,12 @@ async fn handle(
         s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::ListObjectsV1) => {
             handle_list_objects_v1(req, app, &class).await
         }
+        s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::GetObjectAcl) => {
+            handle_get_object_acl(req, app, &class).await
+        }
+        s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::GetBucketAcl) => {
+            handle_get_bucket_acl(req, app, &class).await
+        }
         s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
         }
@@ -660,6 +666,108 @@ async fn handle_get_bucket_location(
         }
         Err(e) => s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path())),
     }
+}
+
+async fn handle_get_object_acl(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::not_implemented(
+            "missing bucket or key",
+            Some(req.uri().path()),
+        );
+    }
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    // statx the object (follow symlinks like GetObject does, then fall back to
+    // NOFOLLOW via the helper) to get uid + mode bits.
+    let m = match std::fs::metadata(&obj_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key(
+                "object not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let uid = std::os::unix::fs::MetadataExt::uid(&m);
+    let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
+    let owner = owner_info(uid);
+
+    s32p_support::s3resp::get_acl(&owner.id, &owner.display_name, (mode & 0o004) != 0)
+}
+
+async fn handle_get_bucket_acl(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s32p_support::s3resp::not_implemented("missing bucket", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
+        Ok(p) => p,
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let m = match std::fs::metadata(&bucket_root) {
+        Ok(m) => m,
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let uid = std::os::unix::fs::MetadataExt::uid(&m);
+    let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
+    let owner = owner_info(uid);
+
+    s32p_support::s3resp::get_acl(&owner.id, &owner.display_name, (mode & 0o004) != 0)
 }
 
 async fn handle_head_bucket(

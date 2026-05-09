@@ -122,6 +122,64 @@ pub fn get_bucket_location_body(region: &str) -> Result<Vec<u8>> {
     Ok(xml.into_bytes())
 }
 
+/// Build XML body for GetObjectAcl / GetBucketAcl.
+///
+/// Mirrors the response AWS S3 emits in `bucket-owner-enforced` ownership mode
+/// (ACLs disabled): a single `FULL_CONTROL` grant for the owner. Real
+/// authorization in s32p comes from the proxy's directory ACL plus POSIX
+/// permissions, not from S3 ACL state, so this is informational metadata only.
+///
+/// When `world_readable` is true, an additional `READ` grant for the canonical
+/// `Group: AllUsers` URI is appended — this is the one POSIX-mode bit (`o+r`)
+/// that translates losslessly into a standard S3 ACL grantee, so clients that
+/// inspect ACLs see a truthful "this object is publicly readable" signal.
+/// Group-readable POSIX bits have no S3 equivalent and are intentionally
+/// dropped on the floor.
+pub fn get_acl_body(
+    owner_id: &str,
+    owner_display_name: &str,
+    world_readable: bool,
+) -> Result<Vec<u8>> {
+    const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+    const ALL_USERS_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
+
+    let mut grants = vec![Grant {
+        grantee:    Grantee {
+            xmlns_xsi:    XSI_NS,
+            xsi_type:     "CanonicalUser",
+            id:           Some(owner_id.to_string()),
+            display_name: Some(owner_display_name.to_string()),
+            uri:          None,
+        },
+        permission: "FULL_CONTROL",
+    }];
+
+    if world_readable {
+        grants.push(Grant {
+            grantee:    Grantee {
+                xmlns_xsi:    XSI_NS,
+                xsi_type:     "Group",
+                id:           None,
+                display_name: None,
+                uri:          Some(ALL_USERS_URI.to_string()),
+            },
+            permission: "READ",
+        });
+    }
+
+    let doc = AccessControlPolicyDoc {
+        xmlns: S3_XMLNS,
+        owner: AclOwner {
+            id:           owner_id.to_string(),
+            display_name: owner_display_name.to_string(),
+        },
+        access_control_list: AccessControlList { grant: grants },
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
 /// Format SystemTime into S3 list time format (UTC with trailing Z).
 pub fn format_s3_time_system(st: SystemTime) -> String {
     let dt = match OffsetDateTime::from(st) {
@@ -548,6 +606,55 @@ struct LocationConstraintDoc {
     // quick-xml/serde text node
     #[serde(rename = "$text", skip_serializing_if = "Option::is_none")]
     value: Option<String>,
+}
+
+// --- internal DTOs for GetObjectAcl / GetBucketAcl ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "AccessControlPolicy")]
+struct AccessControlPolicyDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Owner")]
+    owner: AclOwner,
+    #[serde(rename = "AccessControlList")]
+    access_control_list: AccessControlList,
+}
+
+#[derive(Debug, Serialize)]
+struct AclOwner {
+    #[serde(rename = "ID")]
+    id:           String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessControlList {
+    #[serde(rename = "Grant")]
+    grant: Vec<Grant>,
+}
+
+#[derive(Debug, Serialize)]
+struct Grant {
+    #[serde(rename = "Grantee")]
+    grantee:    Grantee,
+    #[serde(rename = "Permission")]
+    permission: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct Grantee {
+    #[serde(rename = "@xmlns:xsi")]
+    xmlns_xsi:    &'static str,
+    #[serde(rename = "@xsi:type")]
+    xsi_type:     &'static str,
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    id:           Option<String>,
+    #[serde(rename = "DisplayName", skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(rename = "URI", skip_serializing_if = "Option::is_none")]
+    uri:          Option<String>,
 }
 
 // --- public DTOs for ListObjectsV2 ---
