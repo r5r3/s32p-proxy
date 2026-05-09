@@ -2083,6 +2083,76 @@ async fn handle_put_object(
         Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
     };
 
+    // Directory-marker PUT: a key ending in '/' addresses a filesystem
+    // directory (the same shape that listing emits for empty leaves and
+    // that handle_delete_object rmdir-s). We mkdir_p and return success,
+    // skipping the conditional-header / streaming machinery — clients
+    // don't send If-Match on dir markers, and the precondition path below
+    // assumes a regular file (etag-from-inode, etc.).
+    if key.ends_with('/') {
+        // Markers are 0-byte by S3 convention. Require an explicit
+        // Content-Length: 0 and reject anything else rather than silently
+        // dropping a body the client thought we'd store.
+        let claimed_len = req
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        match claimed_len {
+            Some(0) => {}
+            Some(_) => {
+                return s32p_support::s3resp::invalid_request(
+                    "directory-marker PUT must have zero length",
+                    Some(req.uri().path()),
+                );
+            }
+            None => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_REQUEST,
+                    "missing Content-Length",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&obj_path) {
+            tracing::warn!(
+                "directory-marker PUT create_dir_all {} failed: {e}",
+                obj_path.display()
+            );
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                return s32p_support::s3resp::access_denied(
+                    "permission denied",
+                    Some(req.uri().path()),
+                );
+            }
+            return s32p_support::s3resp::internal_error(
+                "failed to create directory marker",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        let meta = match std::fs::metadata(&obj_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "directory-marker PUT stat after create failed for {}: {e}",
+                    obj_path.display()
+                );
+                return s32p_support::s3resp::internal_error(
+                    "failed to stat directory marker",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+        let etag = format!("\"{}\"", meta.ino());
+        return s32p_support::s3resp::put_object_ok(&etag);
+    }
+
     // pick decoded length for streaming payloads
     let (is_streaming_sigv4, logical_len) = match compute_logical_len(req.headers()) {
         Ok(v) => v,
@@ -2289,6 +2359,48 @@ async fn handle_copy_object(
     };
 
     if src_meta.is_dir() {
+        // Directory-marker copy: only valid when both source and destination
+        // are directory-style keys (ending with '/'). The iOS Files / S3
+        // app uses this to "rename" a folder marker. We skip the conditional
+        // / streaming machinery for the same reason DELETE does on markers.
+        if src_key.ends_with('/') && dst_key.ends_with('/') {
+            if let Err(e) = std::fs::create_dir_all(&dst_path) {
+                tracing::warn!(
+                    "CopyObject directory-marker create_dir_all {} failed: {e}",
+                    dst_path.display()
+                );
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    return s32p_support::s3resp::access_denied(
+                        "permission denied",
+                        Some(req.uri().path()),
+                    );
+                }
+                return s32p_support::s3resp::internal_error(
+                    "failed to create directory marker",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            let dst_meta = match std::fs::metadata(&dst_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        "CopyObject directory-marker stat after create failed for {}: {e}",
+                        dst_path.display()
+                    );
+                    return s32p_support::s3resp::internal_error(
+                        "failed to stat directory marker",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+            };
+            let etag = format!("\"{}\"", dst_meta.ino());
+            let last_modified = s32p_support::s3xml::format_s3_time_system(
+                dst_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            );
+            return s32p_support::s3resp::copy_object_ok(&etag, &last_modified);
+        }
         return s32p_support::s3resp::no_such_key("not found", None);
     }
 
