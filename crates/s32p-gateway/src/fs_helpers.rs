@@ -377,15 +377,31 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
     let mask: libc::c_uint =
         (libc::STATX_INO | libc::STATX_SIZE | libc::STATX_MTIME | libc::STATX_UID) as libc::c_uint;
 
-    let rc = unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            libc::AT_STATX_DONT_SYNC,
-            mask,
-            &mut stx as *mut libc::statx,
-        )
+    // Two-stage stat for symlink-friendly listings:
+    //   1. follow the link (default) — gives the target's size/mtime, which is
+    //      the data clients care about when the symlink resolves.
+    //   2. if that fails (target unreachable from the gateway worker, broken
+    //      link, etc.), retry with AT_SYMLINK_NOFOLLOW so the entry still
+    //      appears in `ListObjectsV1/V2`. Otherwise the symlink would vanish
+    //      from listings and `aws s3 rm --recursive` (and similar) would never
+    //      issue a DELETE for it. GetObject still follows via open();
+    //      DeleteObject still calls unlink(2), which targets the symlink
+    //      itself, never the resolved file.
+    let mut do_statx = |flags: libc::c_int| -> i32 {
+        unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                flags,
+                mask,
+                &mut stx as *mut libc::statx,
+            )
+        }
     };
+    let mut rc = do_statx(libc::AT_STATX_DONT_SYNC);
+    if rc != 0 {
+        rc = do_statx(libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW);
+    }
     if rc != 0 {
         return None;
     }
