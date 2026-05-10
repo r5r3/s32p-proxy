@@ -13,7 +13,8 @@ use pingora::{
     http::{RequestHeader, ResponseHeader, StatusCode},
     listeners::tls::TlsSettings,
     proxy::{ProxyHttp, Session, http_proxy_service},
-    server::{Server, configuration::ServerConf},
+    server::{Server, ShutdownWatch, configuration::ServerConf},
+    services::background::{BackgroundService, background_service},
     upstreams::peer::{HttpPeer, PeerOptions},
 };
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -38,6 +39,28 @@ struct S3ProxyApp {
     workers:                 Arc<WorkerManager>,
     routing:                 config::RoutingConfig,
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
+}
+
+/// Pingora background service that terminates worker processes on graceful
+/// shutdown. Pingora flips its `ShutdownWatch` to `true` when SIGTERM/SIGQUIT
+/// arrives; we await that, kill every worker, and let the grace period run
+/// down on the now-empty slot map. SIGINT (fast shutdown) doesn't broadcast,
+/// so this future never wakes — `kill_on_drop(true)` on the spawn `Command`
+/// is what catches that path during runtime teardown.
+struct WorkerShutdownService {
+    workers: Arc<WorkerManager>,
+}
+
+#[async_trait]
+impl BackgroundService for WorkerShutdownService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+        tracing::info!("graceful shutdown received; terminating worker processes");
+        self.workers.shutdown().await;
+        tracing::info!("all worker processes terminated");
+    }
 }
 
 #[derive(Clone, Default)]
@@ -557,7 +580,7 @@ fn main() -> Result<()> {
 
     let app = S3ProxyApp {
         directory,
-        workers,
+        workers: workers.clone(),
         routing: cfg.routing.clone(),
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
     };
@@ -586,5 +609,9 @@ fn main() -> Result<()> {
     }
 
     server.add_service(proxy);
+    server.add_service(background_service(
+        "worker-shutdown",
+        WorkerShutdownService { workers },
+    ));
     server.run_forever();
 }

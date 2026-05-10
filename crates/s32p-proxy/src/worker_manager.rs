@@ -161,24 +161,28 @@ impl WorkerManager {
     }
 
     /// Returns Some(handle) if the worker is running and alive; otherwise None.
+    ///
+    /// Only `Running` slots are inspected. `Starting` slots (a concurrent
+    /// `ensure_running` is mid-spawn) and `Stopped` slots are left alone —
+    /// touching them here used to race with the spawning task and orphan
+    /// freshly-spawned worker processes.
     pub async fn get_running(&self, access_key: &str, profile: &str) -> Option<Arc<WorkerHandle>> {
         let key = WorkerKey::new(access_key, profile);
         let slot = self.slots.get(&key)?;
-        let maybe = {
+        let h = {
             let state = slot.state.lock().await;
             match &*state {
-                SlotState::Running(h) => Some(Arc::clone(h)),
-                _ => None,
+                SlotState::Running(h) => Arc::clone(h),
+                _ => return None,
             }
         };
 
-        if let Some(h) = maybe {
-            if h.is_alive().await {
-                return Some(h);
-            }
+        if h.is_alive().await {
+            return Some(h);
         }
 
-        // Worker died; remove slot.
+        // Worker confirmed dead — kill any lingering descendants and remove the slot.
+        h.terminate().await;
         drop(slot);
         self.slots.remove(&key);
         None
@@ -358,7 +362,11 @@ impl WorkerManager {
             .args(rendered_args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // If the proxy ever drops the WorkerHandle without going through
+            // terminate() (panic, shutdown, slot eviction race, ...), make
+            // sure the OS process dies with it instead of being orphaned.
+            .kill_on_drop(true);
 
         for (k, v) in rendered_env {
             cmd.env(k, v);
@@ -405,6 +413,10 @@ impl WorkerManager {
 
             // Remove dead workers
             if !h.is_alive().await {
+                // Defensive terminate: kills any re-exec'd descendant the
+                // wait(2) machinery may have lost track of. No-op if the
+                // process is already gone.
+                h.terminate().await;
                 drop(slot);
                 self.slots.remove(&key);
                 continue;
@@ -422,6 +434,34 @@ impl WorkerManager {
                 drop(slot);
                 self.slots.remove(&key);
             }
+        }
+    }
+
+    /// Terminate every running worker and remove all slots.
+    ///
+    /// Wired into Pingora's graceful-shutdown broadcast (SIGTERM/SIGQUIT) by
+    /// `WorkerShutdownService` in `main.rs`. SIGINT (fast shutdown) skips the
+    /// broadcast — that path relies on `kill_on_drop(true)` on the spawn
+    /// `Command` to clean up during runtime teardown.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
+
+        for key in keys {
+            let Some(slot) = self.slots.get(&key) else { continue };
+
+            let handle = {
+                let state = slot.state.lock().await;
+                match &*state {
+                    SlotState::Running(h) => Some(Arc::clone(h)),
+                    _ => None,
+                }
+            };
+
+            if let Some(h) = handle {
+                h.terminate().await;
+            }
+            drop(slot);
+            self.slots.remove(&key);
         }
     }
 }
