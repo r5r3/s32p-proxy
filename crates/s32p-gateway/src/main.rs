@@ -324,6 +324,12 @@ async fn handle(
         s32p_support::classifier::S3Op::Read(s32p_support::classifier::ReadOp::GetBucketAcl) => {
             handle_get_bucket_acl(req, app, &class).await
         }
+        s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutObjectAcl) => {
+            handle_put_object_acl(req, app, &class).await
+        }
+        s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutBucketAcl) => {
+            handle_put_bucket_acl(req, app, &class).await
+        }
         s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutObject) => {
             handle_put_object(req, app, &class).await
         }
@@ -768,6 +774,227 @@ async fn handle_get_bucket_acl(
     let owner = owner_info(uid);
 
     s32p_support::s3resp::get_acl(&owner.id, &owner.display_name, (mode & 0o004) != 0)
+}
+
+/// Determine whether the requested ACL grants public read access (POSIX
+/// `o+r`). Mirrors the get-side logic: only the `Group: AllUsers` grant with
+/// `READ` / `FULL_CONTROL` maps to a real bit; everything else is treated as
+/// "no public read".
+///
+/// Precedence: `x-amz-acl` canned header → individual `x-amz-grant-*`
+/// headers → XML body. AWS rejects combinations; for a no-op check we
+/// honor whichever was specified first and ignore the rest.
+fn acl_request_world_readable_intent(
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> std::result::Result<bool, String> {
+    if let Some(canned) = headers.get("x-amz-acl").and_then(|v| v.to_str().ok()) {
+        let v = canned.trim().to_ascii_lowercase();
+        return match v.as_str() {
+            "private"
+            | "bucket-owner-read"
+            | "bucket-owner-full-control"
+            | "aws-exec-read"
+            | "log-delivery-write"
+            | "authenticated-read" => Ok(false),
+            "public-read" | "public-read-write" => Ok(true),
+            other => Err(format!("unknown canned ACL: {other}")),
+        };
+    }
+
+    let grant_headers = [
+        "x-amz-grant-read",
+        "x-amz-grant-write",
+        "x-amz-grant-read-acp",
+        "x-amz-grant-write-acp",
+        "x-amz-grant-full-control",
+    ];
+    let any_grant_header = grant_headers.iter().any(|h| headers.contains_key(*h));
+    if any_grant_header {
+        let mentions_all_users = |hname: &str| {
+            headers
+                .get(hname)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|s| s.contains("AllUsers"))
+        };
+        return Ok(mentions_all_users("x-amz-grant-read")
+            || mentions_all_users("x-amz-grant-full-control"));
+    }
+
+    s32p_support::s3xml::parse_put_acl_request_world_readable(body).map_err(|e| e.to_string())
+}
+
+async fn handle_put_object_acl(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    let m = match std::fs::metadata(&obj_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key(
+                "object not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let current = (std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o004) != 0;
+
+    let (parts, body) = req.into_parts();
+    let collected = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            return s32p_support::s3resp::invalid_request(
+                &format!("failed to read body: {e}"),
+                Some(parts.uri.path()),
+            );
+        }
+    };
+
+    let requested = match acl_request_world_readable_intent(&parts.headers, &collected) {
+        Ok(b) => b,
+        Err(reason) => {
+            tracing::debug!("PutObjectAcl invalid: {reason}");
+            return s32p_support::s3resp::invalid_request(
+                "invalid ACL request",
+                Some(parts.uri.path()),
+            );
+        }
+    };
+
+    if requested == current {
+        s32p_support::s3resp::put_acl_ok()
+    } else {
+        tracing::debug!(
+            requested_world_readable = requested,
+            current_world_readable = current,
+            "PutObjectAcl rejected: would change effective access"
+        );
+        s32p_support::s3resp::not_implemented(
+            "PutObjectAcl is accepted only when it matches the current effective access",
+            Some(parts.uri.path()),
+        )
+    }
+}
+
+async fn handle_put_bucket_acl(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    if bucket.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
+        Ok(p) => p,
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let m = match std::fs::metadata(&bucket_root) {
+        Ok(m) => m,
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let current = (std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o004) != 0;
+
+    let (parts, body) = req.into_parts();
+    let collected = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            return s32p_support::s3resp::invalid_request(
+                &format!("failed to read body: {e}"),
+                Some(parts.uri.path()),
+            );
+        }
+    };
+
+    let requested = match acl_request_world_readable_intent(&parts.headers, &collected) {
+        Ok(b) => b,
+        Err(reason) => {
+            tracing::debug!("PutBucketAcl invalid: {reason}");
+            return s32p_support::s3resp::invalid_request(
+                "invalid ACL request",
+                Some(parts.uri.path()),
+            );
+        }
+    };
+
+    if requested == current {
+        s32p_support::s3resp::put_acl_ok()
+    } else {
+        tracing::debug!(
+            requested_world_readable = requested,
+            current_world_readable = current,
+            "PutBucketAcl rejected: would change effective access"
+        );
+        s32p_support::s3resp::not_implemented(
+            "PutBucketAcl is accepted only when it matches the current effective access",
+            Some(parts.uri.path()),
+        )
+    }
 }
 
 async fn handle_head_bucket(

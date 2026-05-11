@@ -260,6 +260,15 @@ pub fn get_acl(owner_id: &str, owner_display_name: &str, world_readable: bool) -
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
+/// Convenience: PutObjectAcl / PutBucketAcl success (200, empty body).
+/// s32p does not store S3 ACL state — this response is only returned when
+/// the requested ACL matches the effective POSIX state (no-op accept).
+pub fn put_acl_ok() -> HttpResponse {
+    let mut resp = response_bytes(StatusCode::OK, "application/xml", Vec::new(), []);
+    resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
+    resp
+}
+
 /// Convenience: GetBucketLocation success (200).
 pub fn get_bucket_location(region: &str) -> HttpResponse {
     let body = s3xml::get_bucket_location_body(region).unwrap_or_else(|_| {

@@ -126,6 +126,10 @@ pub enum WriteOp {
     DeleteObject,
     /// POST /{bucket}?delete
     DeleteObjects,
+    /// PUT /{bucket}/{key}?acl
+    PutObjectAcl,
+    /// PUT /{bucket}?acl
+    PutBucketAcl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +308,20 @@ pub fn classify_with_headers(
         }
         if key.is_none() && query.validate_xid("GetBucketAcl") {
             return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetBucketAcl) };
+        }
+    }
+
+    // PUT ?acl: clients issuing a rename/copy often follow up with a
+    // PutObjectAcl that mirrors the source's ACL. Classifying it as Write
+    // (instead of falling through to Other → versitygw → 501) lets the
+    // gateway accept it as a no-op when the requested ACL matches the
+    // current POSIX state.
+    if method == "PUT" && bucket.is_some() && query.has("acl") {
+        if key.is_some() && query.validate_xid("PutObjectAcl") {
+            return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::PutObjectAcl) };
+        }
+        if key.is_none() && query.validate_xid("PutBucketAcl") {
+            return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::PutBucketAcl) };
         }
     }
 
