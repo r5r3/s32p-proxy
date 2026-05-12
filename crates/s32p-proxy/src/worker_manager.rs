@@ -303,19 +303,6 @@ impl WorkerManager {
             );
         }
 
-        if self.cfg.launcher.landlock {
-            cmd.arg("--rw").arg(&staged_root);
-            for b in buckets {
-                cmd.arg("--rw").arg(&b.data_path);
-            }
-            cmd.arg("--resolve-libs");
-            cmd.arg("--allow-nss");
-            tracing::debug!(
-                buckets = buckets.len(),
-                "landlock enabled: --rw staged_root + bucket data_paths, --resolve-libs, --allow-nss"
-            );
-        }
-
         let endpoint = match profile.upstream.kind {
             crate::config::UpstreamKind::Tcp => {
                 let port = pick_free_port().context("failed to pick a free local port")?;
@@ -344,6 +331,25 @@ impl WorkerManager {
                 WorkerEndpoint::Uds(sock_path)
             }
         };
+
+        if self.cfg.launcher.landlock {
+            cmd.arg("--rw").arg(&staged_root);
+            for b in buckets {
+                cmd.arg("--rw").arg(&b.data_path);
+            }
+            // UDS workers need to bind(2) a new socket in the per-uid run dir.
+            if let WorkerEndpoint::Uds(sock_path) = &endpoint {
+                if let Some(parent) = sock_path.parent() {
+                    cmd.arg("--rw").arg(parent);
+                }
+            }
+            cmd.arg("--resolve-libs");
+            cmd.arg("--allow-nss");
+            tracing::debug!(
+                buckets = buckets.len(),
+                "landlock enabled: --rw staged_root + bucket data_paths (+ uds parent), --resolve-libs, --allow-nss"
+            );
+        }
 
         let virtual_hosted_suffixes_str = if self.server_cfg.virtual_hosted_suffixes.is_empty() {
             String::new()
