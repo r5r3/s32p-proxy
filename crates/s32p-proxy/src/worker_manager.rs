@@ -303,6 +303,19 @@ impl WorkerManager {
             );
         }
 
+        if self.cfg.launcher.landlock {
+            cmd.arg("--rw").arg(&staged_root);
+            for b in buckets {
+                cmd.arg("--rw").arg(&b.data_path);
+            }
+            cmd.arg("--resolve-libs");
+            cmd.arg("--allow-nss");
+            tracing::debug!(
+                buckets = buckets.len(),
+                "landlock enabled: --rw staged_root + bucket data_paths, --resolve-libs, --allow-nss"
+            );
+        }
+
         let endpoint = match profile.upstream.kind {
             crate::config::UpstreamKind::Tcp => {
                 let port = pick_free_port().context("failed to pick a free local port")?;

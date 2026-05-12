@@ -102,6 +102,10 @@ fn default_shutdown_grace_period_secs() -> u64 {
     10
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpstreamConfig {
     /// "tcp" or "uds"
@@ -169,6 +173,8 @@ pub struct WorkersConfig {
 pub struct LauncherConfig {
     pub path:                   String,
     pub pass_user_flag_if_root: bool,
+    #[serde(default = "default_true")]
+    pub landlock:               bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

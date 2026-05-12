@@ -32,6 +32,7 @@ workers:
   launcher:
     path: "{{install_bin_dir}}/restricted-exec"
     pass_user_flag_if_root: true
+    landlock: true
 
   lifecycle:
     idle_timeout_secs: 600
