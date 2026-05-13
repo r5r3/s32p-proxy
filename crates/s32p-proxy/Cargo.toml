@@ -13,7 +13,7 @@ s32p-directory = { path = "../s32p-directory" }
 s32p-support = { path = "../s32p-support" }
 
 # Pingora stack
-pingora = { version = "0.6.0", features = ["proxy", "rustls"] }
+pingora = { version = "0.8.0", features = ["proxy", "rustls"] }
 rustls = { workspace = true }
 bytes = "1"
 
