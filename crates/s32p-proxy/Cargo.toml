@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-mimalloc = "*"
+mimalloc = { workspace = true }
 
 # Local crates
 s32p-directory = { path = "../s32p-directory" }
@@ -15,34 +15,34 @@ s32p-support = { path = "../s32p-support" }
 # Pingora stack
 pingora = { version = "0.8.0", features = ["proxy", "rustls"] }
 rustls = { workspace = true }
-bytes = "1"
+bytes = { workspace = true }
 
 # HTTP types
-http = "1"
-http-body-util = "0.1"
+http = { workspace = true }
+http-body-util = { workspace = true }
 
 # Time and parsing
 time = { workspace = true }
 
 # Error handling, async traits
-anyhow = "1"
-async-trait = "0.1"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 
 # CLI parsing
 clap = { workspace = true }
 
 # Logging
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 # worker management
 dashmap = "6"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "sync"] }
-libc = "0.2"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time", "net", "sync"] }
+libc = { workspace = true }
 tempfile = "3"
 
 # responses and config
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-quick-xml = { version = "0.39", features = ["serialize"] }
-url = "2"
+quick-xml = { workspace = true }
+url = { workspace = true }

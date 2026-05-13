@@ -6,12 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-anyhow = "1"
-async-trait = "0.1"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"] }
-libc = "0.2"
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
+libc = { workspace = true }
 s32p-support = { path = "../s32p-support" }
 
 # OpenBao/Vault HTTP API

@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
-use quick_xml::{Reader, events::Event, se::to_string as to_xml_string};
+use quick_xml::{Reader, XmlVersion, events::Event, se::to_string as to_xml_string};
 use serde::Serialize;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 
@@ -919,7 +919,7 @@ pub fn parse_delete_objects_request(xml: &[u8]) -> Result<(bool, Vec<String>)> {
             }
             Ok(Event::Text(t)) => {
                 let s = t
-                    .xml_content()
+                    .xml_content(XmlVersion::Implicit1_0)
                     .map_err(|e| anyhow!("xml text decode error: {e}"))?
                     .into_owned();
                 if in_key {
@@ -969,7 +969,7 @@ pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
             Ok(Event::Text(t)) => {
                 if in_part_number {
                     let s = t
-                        .xml_content()
+                        .xml_content(XmlVersion::Implicit1_0)
                         .map_err(|e| anyhow!("xml text decode error: {e}"))?
                         .into_owned();
                     let pn: u32 =
@@ -1060,7 +1060,7 @@ pub fn parse_put_acl_request_world_readable(xml: &[u8]) -> Result<bool> {
             }
             Ok(Event::Text(t)) => {
                 let s = t
-                    .xml_content()
+                    .xml_content(XmlVersion::Implicit1_0)
                     .map_err(|e| anyhow!("xml text decode error: {e}"))?
                     .into_owned();
                 if in_uri {
