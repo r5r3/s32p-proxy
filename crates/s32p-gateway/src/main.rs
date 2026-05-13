@@ -1450,7 +1450,17 @@ fn read_dir_sorted(dir_fs: &Path) -> Result<Vec<DirItem>> {
             continue;
         }
 
-        let is_dir = ft.is_dir();
+        // For symlinks, follow to determine whether the target is a directory
+        // so they list as folders (CommonPrefixes / trailing-slash key) rather
+        // than as plain files. Broken/unreachable links fall back to file so
+        // they still appear in the listing — `aws s3 rm --recursive` (and
+        // similar) need to see them to issue a DELETE. Mirrors the
+        // follow-then-fall-back pattern used by statx_info().
+        let is_dir = if ft.is_symlink() {
+            fs::metadata(ent.path()).map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            ft.is_dir()
+        };
         let sort_key = if is_dir { format!("{name}/") } else { name.clone() };
         out.push(DirItem { name, sort_key, is_dir, path: ent.path() });
     }
