@@ -11,12 +11,17 @@ description = "Integration tests for s32p-proxy. Spawns the real proxy + workers
 #   pixi run test
 #   pixi run test -k multipart
 #   pixi run test --clients=boto3
+#
+# `build` shells out to cargo from the repo root (cwd=".."). The `test*` tasks
+# depend on it so a fresh clone is one command from green. Cargo's no-op
+# rebuild is fast enough that the always-on dependency isn't worth shaving.
 [tasks]
-test         = { cmd = "pytest" }
-test-fast    = { cmd = "pytest -m 'not slow and not requires_lustre and not requires_openbao and not multi_uid_only'" }
-test-multi-uid = { cmd = "pytest --mode=multi-uid" }
-test-openbao = { cmd = "pytest -m requires_openbao" }
-lint         = { cmd = "ruff check . && mypy s32p_test", depends-on = [] }
+build        = { cmd = "cargo build --bin s32p-proxy --bin s32p-gateway --bin s32p-ctl --bin restricted-exec", cwd = ".." }
+test         = { cmd = "pytest", depends-on = ["build"] }
+test-fast    = { cmd = "pytest -m 'not slow and not requires_lustre and not requires_openbao and not multi_uid_only'", depends-on = ["build"] }
+test-multi-uid = { cmd = "pytest --mode=multi-uid", depends-on = ["build"] }
+test-openbao = { cmd = "pytest -m requires_openbao", depends-on = ["build"] }
+lint         = { cmd = "ruff check . && mypy s32p_test" }
 format       = { cmd = "ruff format ." }
 
 [dependencies]

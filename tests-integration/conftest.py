@@ -203,9 +203,13 @@ def endpoint(request, proxy_harness) -> Endpoint:
     )
 
 
-# Lease counter shared across tests in a single pytest worker. Pool sizing
-# in proxy_harness must be >= max parallel tests per worker; today we run
-# serially within a worker so the modulo is enough.
+# Lease counter for bucket fixture. xdist note: this module-global is
+# intentional — under xdist each worker is its own Python process, so it
+# gets its own counter, its own proxy_harness, its own session_dir, its
+# own listen port, and its own bucket pool. Don't "fix" this with
+# multiprocessing locks or a shared file: there is nothing shared to
+# coordinate. The only constraint is BUCKET_POOL_SIZE >= max sequential
+# bucket uses per single test (today: 1).
 _bucket_counter = 0
 
 
