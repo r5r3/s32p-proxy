@@ -38,9 +38,17 @@ def test_put_get_head_delete_roundtrip(client, bucket):
 
 
 @pytest.mark.requires_capability(Capability.METADATA)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "s32p-gateway does not store object-level metadata by design "
+        "(POSIX-interop; see README 'Notes / behavior'). XPASS means the "
+        "design changed — remove this marker rather than weakening the test."
+    ),
+)
 def test_user_metadata_roundtrip(client, bucket):
-    """x-amz-meta-* round-trip; capability-gated because not every client
-    surfaces user metadata cleanly (e.g. a future shell-only adapter)."""
+    """x-amz-meta-* round-trip. Currently expected to fail because the
+    gateway drops user metadata on PUT (filesystem-as-source-of-truth)."""
     key = "smoke/with-meta.bin"
     body = b"\x00" * 16
     meta = {"author": "alice", "purpose": "interop-test"}

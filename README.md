@@ -170,6 +170,7 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
     - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S32P_LUSTRE_MAX_STRIPE_COUNT`
     - individual part files are striped like serial uploads.
 - `ETag` for final objects is generated from the inode number.
+- **No object-level metadata storage.** `s32p-gateway` does not persist `x-amz-meta-*` headers or a client-supplied `Content-Type`; PUT silently drops them and HEAD/GET return only what can be derived from the file (size, inode-as-ETag, mtime). This is by design — the bidirectional POSIX interop story (a POSIX user creates a file under `bucket.data_path` and an S3 client reads it intact) breaks if metadata lives in xattrs or sidecars, since POSIX-created files would then be "incomplete" and `mv`/`cp` could orphan sidecars. Same principle as `PutObjectAcl` being a no-op when the requested ACL matches current POSIX state.
 
 ### Multipart upload (`s32p-gateway`) — server-side assembly algorithm
 
