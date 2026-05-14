@@ -40,6 +40,10 @@ pub struct WorkerManager {
     server_cfg:      ServerConfig,
     slots:           DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
     sweeper_started: AtomicBool,
+    /// Random per-proxy-process suffix used to disambiguate UDS run dirs.
+    /// Multiple proxy instances on the same host would otherwise collide on
+    /// `<uds_run_dir>/<uid>/` when they share a worker uid.
+    instance_id:     String,
 }
 
 struct WorkerSlot {
@@ -121,6 +125,13 @@ impl WorkerHandle {
             let _ = dir.close(); // ignore error; best-effort cleanup
         }
 
+        // Best-effort: remove the UDS socket file. The per-instance run dir
+        // itself is reused across profiles for the same uid and is cleaned up
+        // by WorkerManager::shutdown() after all workers have terminated.
+        if let WorkerEndpoint::Uds(sock_path) = &self.endpoint {
+            let _ = std::fs::remove_file(sock_path);
+        }
+
         tracing::debug!(
             "worker process terminated and resources cleaned up (unix_user={}, access_key={})",
             self.username,
@@ -131,11 +142,14 @@ impl WorkerHandle {
 
 impl WorkerManager {
     pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig) -> Arc<Self> {
+        let instance_id = gen_instance_id();
+        tracing::info!(instance_id = %instance_id, "worker manager instance id");
         Arc::new(Self {
             cfg,
             server_cfg,
             slots: DashMap::new(),
             sweeper_started: AtomicBool::new(false),
+            instance_id,
         })
     }
 
@@ -317,13 +331,14 @@ impl WorkerManager {
                     anyhow!("workers.upstream.uds_run_dir missing (required for uds)")
                 })?;
 
-                let sock_path = uds_socket_path(base, user.uid, user.gid, profile_name)
-                    .with_context(|| {
-                        format!(
-                            "failed to build uds socket path for uid={} profile={profile_name}",
-                            user.uid
-                        )
-                    })?;
+                let sock_path =
+                    uds_socket_path(base, user.uid, user.gid, &self.instance_id, profile_name)
+                        .with_context(|| {
+                            format!(
+                                "failed to build uds socket path for uid={} profile={profile_name}",
+                                user.uid
+                            )
+                        })?;
 
                 // Remove stale socket file from a previous crash/restart
                 let _ = std::fs::remove_file(&sock_path);
@@ -474,6 +489,8 @@ impl WorkerManager {
     pub async fn shutdown(self: &Arc<Self>) {
         let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
 
+        let mut uds_run_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
         for key in keys {
             let Some(slot) = self.slots.get(&key) else { continue };
 
@@ -486,10 +503,28 @@ impl WorkerManager {
             };
 
             if let Some(h) = handle {
+                if let WorkerEndpoint::Uds(sock_path) = &h.endpoint {
+                    if let Some(parent) = sock_path.parent() {
+                        uds_run_dirs.insert(parent.to_path_buf());
+                    }
+                }
                 h.terminate().await;
             }
             drop(slot);
             self.slots.remove(&key);
+        }
+
+        // After all workers are terminated and their socket files removed by
+        // terminate(), try to rmdir each per-instance run dir. Best-effort:
+        // ENOTEMPTY (someone else left a file in there) just leaves it alone.
+        for dir in uds_run_dirs {
+            if let Err(e) = std::fs::remove_dir(&dir) {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "could not remove per-instance uds run dir (will be left in place)"
+                );
+            }
         }
     }
 }
@@ -710,14 +745,53 @@ fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Create /run/s32p/<uid>/ and return the socket path <profile>.sock.
+/// Create /run/s32p/<uid>-<instance_id>/ and return the socket path <profile>.sock.
 /// The directory must be writable by the worker user because the worker creates/binds the socket file.
 /// When the proxy is root, we chown the per-uid dir to (uid, gid) so the worker (which restricted-exec
 /// switches into) can bind. When the proxy is not root, the dir is created as the proxy's own uid
 /// (which is also the worker's uid in that mode), so chown is a no-op.
-fn uds_socket_path(base: &str, uid: u32, gid: u32, profile: &str) -> Result<PathBuf> {
-    let dir = Path::new(base).join(uid.to_string());
+///
+/// The `<instance_id>` suffix is a per-proxy-process random string so that multiple proxy
+/// instances on the same host (sharing the same worker uid) don't collide on the run dir.
+fn uds_socket_path(
+    base: &str,
+    uid: u32,
+    gid: u32,
+    instance_id: &str,
+    profile: &str,
+) -> Result<PathBuf> {
+    let dir = Path::new(base).join(format!("{uid}-{instance_id}"));
     ensure_dir(&dir, 0o700)?;
     chown_if_root(&dir, uid, gid)?;
     Ok(dir.join(format!("{profile}.sock")))
+}
+
+/// 8-char lowercase-hex random suffix from `getrandom(2)`, with a deterministic
+/// fallback (PID + boot-time nanos) if the syscall is unavailable. The fallback
+/// is good enough for uniqueness among concurrently running proxies on the same
+/// host, which is what this suffix is for.
+fn gen_instance_id() -> String {
+    let mut buf = [0u8; 4];
+    let rc = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    if rc == buf.len() as isize {
+        return hex_lower(&buf);
+    }
+
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mixed = pid ^ nanos;
+    hex_lower(&mixed.to_le_bytes())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }

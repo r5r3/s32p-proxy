@@ -112,7 +112,9 @@ pub struct UpstreamConfig {
     pub kind: UpstreamKind,
 
     /// Base directory for per-uid UDS run dirs. Used when kind=uds.
-    /// Sockets will be created under: <uds_run_dir>/<uid>/<profile>.sock
+    /// Sockets are created under: <uds_run_dir>/<uid>-<instance_id>/<profile>.sock
+    /// where <instance_id> is a per-proxy-process random suffix so that multiple
+    /// proxy instances on the same host (sharing a worker uid) don't collide.
     /// If unset, defaults to `/run/s32p` when the proxy runs as root
     /// (euid == 0), otherwise `$XDG_RUNTIME_DIR/s32p`.
     pub uds_run_dir: Option<String>,

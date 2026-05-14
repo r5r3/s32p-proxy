@@ -535,10 +535,7 @@ fn main() -> Result<()> {
         s32p_support::utils::local_utc_offset(),
         time::format_description::well_known::Rfc3339,
     );
-    tracing_subscriber::fmt()
-        .with_timer(timer)
-        .with_env_filter(log_filter)
-        .init();
+    tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter).init();
 
     // Build directory backend
     let directory: Arc<dyn Directory> = match cfg.auth.backend {
@@ -605,9 +602,6 @@ fn main() -> Result<()> {
     }
 
     server.add_service(proxy);
-    server.add_service(background_service(
-        "worker-shutdown",
-        WorkerShutdownService { workers },
-    ));
+    server.add_service(background_service("worker-shutdown", WorkerShutdownService { workers }));
     server.run_forever();
 }
