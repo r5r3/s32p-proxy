@@ -38,6 +38,7 @@ from .capabilities import Capability
 _STATUS_FROM_CODE: dict[str, int] = {
     "NoSuchKey": 404,
     "NoSuchBucket": 404,
+    "NoSuchUpload": 404,
     "AccessDenied": 403,
     "SignatureDoesNotMatch": 403,
     "InvalidAccessKeyId": 403,
@@ -47,6 +48,11 @@ _STATUS_FROM_CODE: dict[str, int] = {
     "MalformedXML": 400,
     "BucketAlreadyExists": 409,
     "BucketNotEmpty": 409,
+    "InvalidRange": 416,
+    "PreconditionFailed": 412,
+    "EntityTooLarge": 413,
+    "InvalidPart": 400,
+    "InvalidPartOrder": 400,
 }
 
 _ERROR_RE = re.compile(
