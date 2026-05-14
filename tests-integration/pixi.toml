@@ -1,0 +1,40 @@
+[workspace]
+authors = ["Robert Redl <robert.redl@lmu.de>"]
+channels = ["conda-forge"]
+name = "tests-integration"
+platforms = ["linux-64"]
+version = "0.1.0"
+description = "Integration tests for s32p-proxy. Spawns the real proxy + workers and drives them through a matrix of S3 clients (boto3, aws-cli, mcli, ...)."
+
+# Tasks. Run with `pixi run <name>`. The `--` separator forwards extra args to pytest.
+# Examples:
+#   pixi run test
+#   pixi run test -k multipart
+#   pixi run test --clients=boto3
+[tasks]
+test         = { cmd = "pytest" }
+test-fast    = { cmd = "pytest -m 'not slow and not requires_lustre and not requires_openbao and not multi_uid_only'" }
+test-multi-uid = { cmd = "pytest --mode=multi-uid" }
+test-openbao = { cmd = "pytest -m requires_openbao" }
+lint         = { cmd = "ruff check . && mypy s32p_test", depends-on = [] }
+format       = { cmd = "ruff format ." }
+
+[dependencies]
+python = ">=3.12"
+pytest = ">=9.0.3,<10"
+pytest-xdist = ">=3.8.0,<4"        # parallel test execution (-n auto)
+pytest-timeout = ">=2.4.0,<3"       # per-test timeout, kills hung workers
+boto3 = ">=1.43.7,<2"               # primary S3 SDK
+pyyaml = ">=6.0.3,<7"               # build/edit directory.yaml
+requests = ">=2.34.1,<3"            # raw HTTP for SigV4 / presign tests
+awscli = ">=2.34.46,<3"             # backs the aws-cli client adapter
+
+[feature.dev.dependencies]
+ruff = "*"
+mypy = "*"
+
+[environments]
+# `pixi run` defaults to the `default` env (test deps only); use
+# `pixi shell -e dev` (or `pixi run -e dev <task>`) when you want lint/format tools.
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
