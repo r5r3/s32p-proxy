@@ -96,7 +96,7 @@ This repository is a Rust workspace with multiple crates:
 
 ---
 
-## Current Status (February 2026)
+## Current Status
 
 ### Proxy / request flow
 
@@ -109,12 +109,12 @@ This repository is a Rust workspace with multiple crates:
   - Shared by proxy + gateway (single source of truth for routing decisions)
   - Parses path + query parameters (and selected headers where needed, e.g. `x-amz-copy-source`)
   - Produces a high-level operation class key:
-    - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV2`, `ListBuckets`, `GetBucketLocation`, `HeadBucket`)
-    - `write` (e.g. `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`)
+    - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV1`/`V2`, `ListBuckets`, `GetBucketLocation`, `HeadBucket`, `GetObjectAcl`, `GetBucketAcl`)
+    - `write` (e.g. `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `RenameObject`, `PutObjectAcl`, `PutBucketAcl`)
     - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
     - `versioning` (detected, but not implemented yet)
     - `object_lock` (detected, but not implemented yet)
-    - `bucket_admin` (`CreateBucket`/`DeleteBucket`; detected, but not implemented yet)
+    - `bucket_admin` (`CreateBucket`/`DeleteBucket`; detected and routed to NotImplemented — bucket lifecycle is operator-only via `s32p-ctl`)
     - `other`
 
 - **Config-driven routing** (`etc/s32p-proxy.yaml`)
@@ -136,12 +136,13 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
   - `HeadBucket`
   - `ListBuckets`
   - `GetBucketLocation`
-  - `ListObjectsV2`
+  - `ListObjectsV1` (`GET /{bucket}`, legacy form) and `ListObjectsV2` (`GET /{bucket}?list-type=2`)
 - **Write**
   - `PutObject` (streaming upload)
   - `CopyObject` (server-side copy; size-limited by configuration)
   - `DeleteObject`
   - `DeleteObjects` (`POST /?delete`)
+  - `RenameObject` (`PUT ?renameObject` with `x-amz-rename-source`; same-bucket only)
 - **Multipart**
   - `CreateMultipartUpload` (`POST ?uploads`)
   - `UploadPart` (`PUT ?partNumber=N&uploadId=...`)
@@ -149,18 +150,21 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
   - `ListMultipartUploads` (`GET /bucket?uploads`)
   - `CompleteMultipartUpload` (`POST ?uploadId=...`)
   - `AbortMultipartUpload` (`DELETE ?uploadId=...`)
+- **ACL**
+  - `GetObjectAcl`, `GetBucketAcl` (`GET ?acl`)
+  - `PutObjectAcl`, `PutBucketAcl` (`PUT ?acl`) — accepted as a no-op when the requested ACL matches the current POSIX state; mismatches are rejected. The directory ACLs in `s32p-ctl` remain authoritative.
 
 #### Notes / behavior:
 
 - Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
 - Rejects most query parameters for now, except those required for:
-  - `?location`, `?list-type=2`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
-- **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as “effective” query parameters for routing/handling.
+  - `?location`, `?list-type=2`, `?delete`, `?acl`, `?renameObject`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
+- **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as "effective" query parameters for routing/handling. A small fixed set of other keys is also treated as non-effective: `x-id`, `content-type`, `cache-control`, `content-encoding`, `content-disposition`, `expires`, `x-amz-storage-class`.
 - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
 - When built with `--features lustre`, the gateway creates new files with Lustre striping via `llapi_file_create()`.
   - Config: `S32P_LUSTRE_MAX_STRIPE_COUNT` (default: `4`) caps the stripe count.
   - **Serial uploads** (`PutObject`, `CopyObject`, and any temp/staging files):
-    - `stripe_size = S32P_CHUNK_SIZE_MB`
+    - `stripe_size = S32P_CHUNK_SIZE_MB × 1 MiB` (env var is in MiB; default `4` → 4 MiB)
     - `stripe_count = ceil(file_size / stripe_size)`, capped by `S32P_LUSTRE_MAX_STRIPE_COUNT`
   - **Multipart uploads**:
     - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S32P_LUSTRE_MAX_STRIPE_COUNT`
@@ -293,9 +297,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
 
 #### Local responses (no proxying)
 
-- Shared response helpers in `src/responses.rs`
-  - S3 REST-XML errors (e.g. `AccessDenied`, `SignatureDoesNotMatch`, `NotImplemented`)
-  - General `respond_bytes()` helper for header/body responses
+- Shared S3 REST-XML helpers live in `crates/s32p-support/src/s3resp.rs` and `crates/s32p-support/src/s3xml.rs` (errors like `AccessDenied`, `SignatureDoesNotMatch`, `NotImplemented`, plus body builders); proxy-side glue (`respond_bytes()` and friends) is in `crates/s32p-proxy/src/responses.rs`.
 
 ### SigV4 validation behavior
 
@@ -316,23 +318,40 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - allows routing different command classes to different worker profiles per access key
 - Workers are started via a configurable launcher (default: `restricted-exec`)
   - If running as root and `pass_user_flag_if_root=true`, the proxy passes `--user <username>`
-  - The launcher path supports placeholders like `{{install_bin_dir}}` to dynamically resolve the executable directory.
+  - When `workers.launcher.landlock` is enabled (default `true`), the proxy also passes `--rw <posix_root>`, `--rw <bucket.data_path>` for each accessible bucket, `--resolve-libs`, and `--allow-nss` so the launcher confines the worker to those paths.
 - Upstream bind (per worker):
   - TCP loopback: `127.0.0.1:<port>`
-  - Unix domain socket: `/run/s32p/<uid>/worker.sock` (example; configurable)
+  - Unix domain socket: `<uds_run_dir>/<uid>-<instance_id>/<profile>.sock`
+    - `<uds_run_dir>` defaults to `/run/s32p` (root) or `$XDG_RUNTIME_DIR/s32p` (non-root); override per profile via `workers.profiles.<name>.upstream.uds_run_dir`.
+    - `<instance_id>` is a per-proxy-process random suffix so multiple proxy instances on one host don't collide.
+    - One socket file per worker profile under the per-uid run dir.
 - Readiness probing: connect loop until port is reachable
 - Idle shutdown after `idle_timeout_secs`
 - Sweeper removes dead/idle workers periodically (`sweep_interval_secs`)
 - **Staged posix_root**
-  - On each worker start, the proxy creates a **fresh temp directory** under `workers.runtime_root`
+  - On each worker start, the proxy creates a **fresh temp directory** under `workers.posix_root`
   - Creates symlinks for all buckets visible to the access key:
     - `<temp>/<bucket_name>` → `<bucket.data_path>`
   - Passes that temp directory as `{{posix_root}}` to the worker
   - When the worker stops, the temp directory is removed
 
-Worker args/env templates support placeholders such as:
-- `{{bind_addr}}`, `{{port}}`, `{{posix_root}}`, `{{access_key}}`, `{{secret_key}}`, `{{region}}`, `{{virtual_hosted_suffixes}}`, etc.
-- `{{install_bin_dir}}`: Resolves to the directory containing the `s32p-proxy` executable (e.g., `target/debug` or `/usr/local/bin`).
+Worker `args` / `env` templates are expanded per spawn by `worker_manager.rs::render_template`. Unknown tokens cause a hard error. Available tokens:
+
+| Token | Value |
+|---|---|
+| `{{username}}` | Unix username of the target user |
+| `{{uid}}` | numeric UID |
+| `{{gid}}` | numeric GID |
+| `{{access_key}}` | the SigV4 access key for this worker |
+| `{{secret_key}}` | matching secret key |
+| `{{posix_root}}` | the staged temp dir with bucket symlinks |
+| `{{bind_addr}}` | endpoint string (`host:port` for TCP, path for UDS) |
+| `{{bind_uds}}` | alias of `{{bind_addr}}` (use whichever reads better in your config) |
+| `{{region}}` | from `server.region` |
+| `{{virtual_hosted_suffixes}}` | comma-joined `server.virtual_hosted_suffixes` |
+| `{{log_level}}` | from `server.log_level` |
+
+Separately, `{{install_bin_dir}}` is a *config-load-time* placeholder resolved only inside `workers.launcher.path` and `workers.profiles.*.exec` (not in `args`/`env`). It expands to the directory containing the running `s32p-proxy` executable (e.g. `target/debug` in dev, `/usr/local/bin` after install).
 
 ---
 
@@ -342,14 +361,17 @@ Primary configuration: `etc/s32p-proxy.yaml`
 
 Key sections:
 
-- `server.listen` / `server.public_scheme`
+- `server.listen` / `server.public_scheme` (both required)
+- `server.region` (required; used as the SigV4 region and exposed to workers via `{{region}}`)
 - `server.log_level` (logging configuration, supports RUST_LOG format)
 - `server.virtual_hosted_suffixes` (virtual-hosted-style bucket detection)
+- `server.tls_cert_path` / `server.tls_key_path` (optional; enables HTTPS on the listen address)
+- `server.shutdown_grace_period_secs` (graceful-shutdown timeout, default 10s)
 - `auth.*` (directory backend selection and credentials)
-- `workers.runtime_root` (base dir for per-worker temp roots)
-- `workers.launcher.*`
-- `workers.lifecycle.*`
-- `workers.profiles.*` (worker templates)
+- `workers.posix_root` (base dir for per-worker temp roots)
+- `workers.launcher.*` (includes `path`, `pass_user_flag_if_root`, `landlock`)
+- `workers.lifecycle.*` (`idle_timeout_secs`, `sweep_interval_secs`)
+- `workers.profiles.*` (worker templates: `exec`, `args`, `env`, `upstream`)
 - `routing.class_map.*` (routes classifier classes to actions)
 
 ### Virtual-hosted-style bucket support
@@ -700,7 +722,7 @@ s32p-ctl --backend yaml --yaml-path /etc/s32p/directory.yaml \
 ```bash
 # Clone the repository with submodules
 git clone --recurse-submodules https://github.com/r5r3/s32p-proxy.git
-cd s32p
+cd s32p-proxy
 
 # If you already cloned without submodules, initialize them:
 git submodule update --init --recursive
@@ -737,13 +759,13 @@ server:
 
 The config file approach automatically forwards the log level to worker processes.
 
-The proxy binds to the address configured in `etc/s32p-proxy.yaml`, default:
+The proxy binds to the address configured under `server.listen` in `etc/s32p-proxy.yaml` (a required field — there is no compiled-in default). The shipped dev config listens on:
 
 ```
-http://localhost:9000
+http://0.0.0.0:9000
 ```
 
-Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`) or a per-UID Unix socket.
+Workers are launched on-demand and bind to loopback (`127.0.0.1:<port>`) or to a Unix socket under a per-uid (and per-proxy-instance) run dir, one socket per worker profile.
 
 ---
 
