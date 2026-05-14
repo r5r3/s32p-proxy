@@ -529,16 +529,12 @@ fn main() -> Result<()> {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
     };
 
-    // Local-time formatter; falls back to UTC if the local offset cannot be
-    // determined safely (which on Unix requires this call to happen before
-    // other threads spawn — main() is sync here, so we're fine).
-    let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::fmt::time::OffsetTime::new(
-                time::UtcOffset::UTC,
-                time::format_description::well_known::Rfc3339,
-            )
-        });
+    // Local-time formatter; offset is taken from libc's localtime_r so it
+    // works even if a background thread already exists (e.g. allocator).
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
+        s32p_support::utils::local_utc_offset(),
+        time::format_description::well_known::Rfc3339,
+    );
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_env_filter(log_filter)

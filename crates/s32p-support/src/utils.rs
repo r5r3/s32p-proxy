@@ -4,6 +4,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 
+/// Determine the local UTC offset via libc's `localtime_r`.
+///
+/// `time::UtcOffset::current_local_offset()` refuses to answer once any
+/// background thread has been spawned (the global allocator can do this
+/// before `main`), so logging falls back to UTC. `localtime_r` is the
+/// thread-safe variant and has no such restriction — `tm_gmtoff` carries
+/// the offset directly. Falls back to UTC only if the libc call itself fails.
+pub fn local_utc_offset() -> time::UtcOffset {
+    use std::mem::MaybeUninit;
+    // SAFETY: time(NULL) returns the current epoch seconds; localtime_r
+    // writes the broken-down local time into the provided buffer.
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm = MaybeUninit::<libc::tm>::uninit();
+    let res = unsafe { libc::localtime_r(&now, tm.as_mut_ptr()) };
+    if res.is_null() {
+        return time::UtcOffset::UTC;
+    }
+    let tm = unsafe { tm.assume_init() };
+    time::UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32).unwrap_or(time::UtcOffset::UTC)
+}
+
 /// A byte range for HTTP range requests.
 /// Represents a range [start, end_excl) where end_excl is exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

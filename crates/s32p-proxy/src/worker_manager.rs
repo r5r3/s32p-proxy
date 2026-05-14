@@ -391,6 +391,15 @@ impl WorkerManager {
             cmd.env(k, v);
         }
 
+        // The worker runs under landlock and can't read /etc/localtime, so
+        // pass our local UTC offset (seconds east of UTC) explicitly. The
+        // gateway uses it to format log timestamps in the same zone as the
+        // proxy.
+        cmd.env(
+            "S32P_LOG_UTC_OFFSET_SECS",
+            s32p_support::utils::local_utc_offset().whole_seconds().to_string(),
+        );
+
         // log command and env for debuuging
         tracing::debug!(command = ?cmd, "spawning worker");
 

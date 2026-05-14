@@ -3415,15 +3415,19 @@ fn main() -> Result<()> {
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".into());
 
-    // Capture the local UTC offset before tokio spawns its worker threads —
-    // `time` refuses to determine it once other threads exist.
-    let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::fmt::time::OffsetTime::new(
-                time::UtcOffset::UTC,
-                time::format_description::well_known::Rfc3339,
-            )
-        });
+    // Local-time formatter. Prefer the offset injected by the proxy via
+    // S32P_LOG_UTC_OFFSET_SECS: when launched under landlock the gateway has
+    // no access to /etc/localtime, so libc::localtime_r falls back to UTC.
+    // For standalone runs (no env var) we still try libc.
+    let offset = std::env::var("S32P_LOG_UTC_OFFSET_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .and_then(|s| time::UtcOffset::from_whole_seconds(s).ok())
+        .unwrap_or_else(s32p_support::utils::local_utc_offset);
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
+        offset,
+        time::format_description::well_known::Rfc3339,
+    );
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_env_filter(log_filter)
