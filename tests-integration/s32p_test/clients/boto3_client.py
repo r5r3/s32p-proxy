@@ -10,6 +10,7 @@ from botocore.exceptions import ClientError
 
 from .base import (
     Conditions,
+    CopyConditions,
     Endpoint,
     GetResult,
     ListResult,
@@ -198,14 +199,26 @@ class Boto3Client(S3Client):
             next_continuation_token=resp.get("NextContinuationToken"),
         )
 
-    def copy_object(self, src_bucket, src_key, dst_bucket, dst_key) -> PutResult:
-        resp = self._wrap(
-            lambda: self._s3.copy_object(
-                Bucket=dst_bucket,
-                Key=dst_key,
-                CopySource={"Bucket": src_bucket, "Key": src_key},
-            )
-        )
+    def copy_object(
+        self,
+        src_bucket: str,
+        src_key: str,
+        dst_bucket: str,
+        dst_key: str,
+        *,
+        conditions: CopyConditions | None = None,
+    ) -> PutResult:
+        kw: dict = {
+            "Bucket": dst_bucket,
+            "Key": dst_key,
+            "CopySource": {"Bucket": src_bucket, "Key": src_key},
+        }
+        if conditions is not None:
+            if conditions.source is not None:
+                kw.update(_copy_source_conditional_kwargs(conditions.source))
+            if conditions.destination is not None:
+                kw.update(_conditional_kwargs(conditions.destination))
+        resp = self._wrap(lambda: self._s3.copy_object(**kw))
         return PutResult(etag=resp["CopyObjectResult"]["ETag"].strip('"'))
 
     def delete_objects(self, bucket: str, keys: list[str]) -> list[str]:
@@ -293,6 +306,22 @@ def _conditional_kwargs(conditions: Conditions | None) -> dict:
         kw["IfModifiedSince"] = conditions.if_modified_since
     if conditions.if_unmodified_since is not None:
         kw["IfUnmodifiedSince"] = conditions.if_unmodified_since
+    return kw
+
+
+def _copy_source_conditional_kwargs(conditions: Conditions) -> dict:
+    """Source-side conditional kwargs for boto3 copy_object — these map to
+    the `x-amz-copy-source-if-*` headers, separate from the destination
+    `If-*` set above."""
+    kw: dict = {}
+    if conditions.if_match is not None:
+        kw["CopySourceIfMatch"] = _quote_etag(conditions.if_match)
+    if conditions.if_none_match is not None:
+        kw["CopySourceIfNoneMatch"] = _quote_etag(conditions.if_none_match)
+    if conditions.if_modified_since is not None:
+        kw["CopySourceIfModifiedSince"] = conditions.if_modified_since
+    if conditions.if_unmodified_since is not None:
+        kw["CopySourceIfUnmodifiedSince"] = conditions.if_unmodified_since
     return kw
 
 

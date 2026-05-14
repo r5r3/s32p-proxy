@@ -73,6 +73,19 @@ class Conditions:
     if_unmodified_since: datetime | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class CopyConditions:
+    """Conditional headers for CopyObject. S3 has two distinct sets:
+
+    - `source`: applied to the *source* object. On the wire these are
+      `x-amz-copy-source-if-{match,none-match,modified-since,unmodified-since}`.
+    - `destination`: PUT-style preconditions on the *destination*
+      (e.g. `If-None-Match: *` for "copy only if dest absent").
+    """
+    source: Conditions | None = None
+    destination: Conditions | None = None
+
+
 # ---------------------------------------------------------------- error type
 
 
@@ -203,7 +216,15 @@ class S3Client(ABC):
 
     # ----- capability-gated; default impls raise so the matrix fixture skips -----
 
-    def copy_object(self, src_bucket, src_key, dst_bucket, dst_key) -> PutResult:
+    def copy_object(
+        self,
+        src_bucket: str,
+        src_key: str,
+        dst_bucket: str,
+        dst_key: str,
+        *,
+        conditions: CopyConditions | None = None,
+    ) -> PutResult:
         raise NotImplementedError(f"{self.name}: COPY_OBJECT not implemented")
 
     def delete_objects(self, bucket: str, keys: list[str]) -> list[str]:

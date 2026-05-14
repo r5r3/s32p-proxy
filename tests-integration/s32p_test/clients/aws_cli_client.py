@@ -23,6 +23,7 @@ from typing import Any
 
 from .base import (
     Conditions,
+    CopyConditions,
     Endpoint,
     GetResult,
     ListResult,
@@ -273,13 +274,27 @@ class AwsCliClient(S3Client):
             next_continuation_token=result.get("NextContinuationToken"),
         )
 
-    def copy_object(self, src_bucket, src_key, dst_bucket, dst_key) -> PutResult:
-        result = self._run(
+    def copy_object(
+        self,
+        src_bucket: str,
+        src_key: str,
+        dst_bucket: str,
+        dst_key: str,
+        *,
+        conditions: CopyConditions | None = None,
+    ) -> PutResult:
+        args = [
             "copy-object",
             "--bucket", dst_bucket,
             "--key", dst_key,
             "--copy-source", f"{src_bucket}/{src_key}",
-        ) or {}
+        ]
+        if conditions is not None:
+            if conditions.source is not None:
+                args += _copy_source_conditional_args(conditions.source)
+            if conditions.destination is not None:
+                args += _conditional_args(conditions.destination)
+        result = self._run(*args) or {}
         return PutResult(etag=result["CopyObjectResult"]["ETag"].strip('"'))
 
     def delete_objects(self, bucket: str, keys: list[str]) -> list[str]:
@@ -362,6 +377,21 @@ def _conditional_args(conditions: Conditions | None) -> list[str]:
         out += ["--if-modified-since", conditions.if_modified_since.isoformat()]
     if conditions.if_unmodified_since is not None:
         out += ["--if-unmodified-since", conditions.if_unmodified_since.isoformat()]
+    return out
+
+
+def _copy_source_conditional_args(conditions: Conditions) -> list[str]:
+    """Source-side conditional flags for `aws s3api copy-object` — these
+    map to the `x-amz-copy-source-if-*` headers."""
+    out: list[str] = []
+    if conditions.if_match is not None:
+        out += ["--copy-source-if-match", _quote_etag(conditions.if_match)]
+    if conditions.if_none_match is not None:
+        out += ["--copy-source-if-none-match", _quote_etag(conditions.if_none_match)]
+    if conditions.if_modified_since is not None:
+        out += ["--copy-source-if-modified-since", conditions.if_modified_since.isoformat()]
+    if conditions.if_unmodified_since is not None:
+        out += ["--copy-source-if-unmodified-since", conditions.if_unmodified_since.isoformat()]
     return out
 
 

@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from s32p_test.clients.base import Conditions, S3Error
+from s32p_test.clients.base import Conditions, CopyConditions, S3Error
 from s32p_test.clients.capabilities import Capability
 
 
@@ -149,3 +149,122 @@ def test_get_if_unmodified_since_in_past_returns_412(client, bucket):
             bucket, "obj", conditions=Conditions(if_unmodified_since=long_ago)
         )
     assert exc.value.status == 412, f"expected 412, got {exc.value!r}"
+
+
+# ---------------------------------------------------------------- COPY / source preconditions
+#
+# Backed by `evaluate_copy_source_preconditions` in preconditions.rs and
+# wired in `handle_copy_object` (main.rs:2700-2716). These check the
+# *source* object's ETag/timestamp; on the wire they're the
+# `x-amz-copy-source-if-*` headers, distinct from PUT-style `If-*`.
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_source_if_match_matching_succeeds(client, bucket):
+    """CopySourceIfMatch=src_etag must allow the copy when the source's
+    ETag matches."""
+    src = client.put_object(bucket, "src", b"data")
+
+    client.copy_object(
+        bucket, "src", bucket, "dst",
+        conditions=CopyConditions(source=Conditions(if_match=src.etag)),
+    )
+    assert client.get_object(bucket, "dst").body == b"data"
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_source_if_match_mismatching_returns_412(client, bucket):
+    """CopySourceIfMatch=wrong-etag must fail with 412 — source doesn't
+    match what the caller expected."""
+    client.put_object(bucket, "src", b"data")
+
+    with pytest.raises(S3Error) as exc:
+        client.copy_object(
+            bucket, "src", bucket, "dst",
+            conditions=CopyConditions(source=Conditions(if_match="ffffffffffffffff")),
+        )
+    assert exc.value.status == 412, f"expected 412, got {exc.value!r}"
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_source_if_none_match_matching_returns_412(client, bucket):
+    """CopySourceIfNoneMatch=src_etag must fail with 412 — the source
+    DOES match the etag we said it shouldn't."""
+    src = client.put_object(bucket, "src", b"data")
+
+    with pytest.raises(S3Error) as exc:
+        client.copy_object(
+            bucket, "src", bucket, "dst",
+            conditions=CopyConditions(source=Conditions(if_none_match=src.etag)),
+        )
+    assert exc.value.status == 412, f"expected 412, got {exc.value!r}"
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_source_if_none_match_mismatching_succeeds(client, bucket):
+    """CopySourceIfNoneMatch=other-etag must succeed when the source
+    doesn't match the given etag."""
+    client.put_object(bucket, "src", b"data")
+
+    client.copy_object(
+        bucket, "src", bucket, "dst",
+        conditions=CopyConditions(source=Conditions(if_none_match="ffffffffffffffff")),
+    )
+    assert client.get_object(bucket, "dst").body == b"data"
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_source_if_unmodified_since_in_past_returns_412(client, bucket):
+    """CopySourceIfUnmodifiedSince=long-ago — source was created now, so
+    it has been modified since then; copy must 412."""
+    client.put_object(bucket, "src", b"data")
+    long_ago = datetime(2020, 1, 1, tzinfo=UTC)
+
+    with pytest.raises(S3Error) as exc:
+        client.copy_object(
+            bucket, "src", bucket, "dst",
+            conditions=CopyConditions(
+                source=Conditions(if_unmodified_since=long_ago)
+            ),
+        )
+    assert exc.value.status == 412, f"expected 412, got {exc.value!r}"
+
+
+# ---------------------------------------------------------------- COPY / destination preconditions
+#
+# Backed by `evaluate_write_preconditions` (same path as PUT), invoked at
+# main.rs:2741. Common idiom: `If-None-Match: *` for "copy only if
+# destination doesn't exist."
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_destination_if_none_match_star_when_present_returns_412(client, bucket):
+    """Conditional copy with destination If-None-Match=* must reject
+    when the destination already exists, and leave it untouched."""
+    client.put_object(bucket, "src", b"new content")
+    client.put_object(bucket, "dst", b"existing")
+
+    with pytest.raises(S3Error) as exc:
+        client.copy_object(
+            bucket, "src", bucket, "dst",
+            conditions=CopyConditions(
+                destination=Conditions(if_none_match="*")
+            ),
+        )
+    assert exc.value.status == 412, f"expected 412, got {exc.value!r}"
+
+    # The destination must still hold the original content.
+    assert client.get_object(bucket, "dst").body == b"existing"
+
+
+@pytest.mark.requires_capability(Capability.COPY_OBJECT)
+def test_copy_destination_if_none_match_star_when_absent_succeeds(client, bucket):
+    """Conditional copy with destination If-None-Match=* must succeed
+    when no object exists at the destination key."""
+    client.put_object(bucket, "src", b"copied")
+
+    client.copy_object(
+        bucket, "src", bucket, "dst",
+        conditions=CopyConditions(destination=Conditions(if_none_match="*")),
+    )
+    assert client.get_object(bucket, "dst").body == b"copied"
