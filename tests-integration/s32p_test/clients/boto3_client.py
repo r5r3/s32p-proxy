@@ -9,6 +9,7 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from .base import (
+    Conditions,
     Endpoint,
     GetResult,
     ListResult,
@@ -40,6 +41,7 @@ class Boto3Client(S3Client):
         Capability.PRESIGN_GET,
         Capability.PRESIGN_PUT,
         Capability.UNSIGNED_PAYLOAD,
+        Capability.CONDITIONAL_REQUESTS,
         # RENAME_OBJECT intentionally not advertised: boto3's S3Control client
         # has it for directory buckets but not for general S3; tests that want
         # rename should use the raw HTTP path or a future adapter.
@@ -101,12 +103,14 @@ class Boto3Client(S3Client):
         *,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        conditions: Conditions | None = None,
     ) -> PutResult:
         kw: dict = {"Bucket": bucket, "Key": key, "Body": body}
         if content_type is not None:
             kw["ContentType"] = content_type
         if metadata:
             kw["Metadata"] = metadata
+        kw.update(_conditional_kwargs(conditions))
         resp = self._wrap(lambda: self._s3.put_object(**kw))
         return PutResult(etag=resp["ETag"].strip('"'))
 
@@ -116,10 +120,12 @@ class Boto3Client(S3Client):
         key: str,
         *,
         range_: tuple[int, int] | None = None,
+        conditions: Conditions | None = None,
     ) -> GetResult:
         kw: dict = {"Bucket": bucket, "Key": key}
         if range_ is not None:
             kw["Range"] = f"bytes={range_[0]}-{range_[1]}"
+        kw.update(_conditional_kwargs(conditions))
         resp = self._wrap(lambda: self._s3.get_object(**kw))
         body = resp["Body"].read()
         return GetResult(
@@ -130,8 +136,16 @@ class Boto3Client(S3Client):
             metadata=dict(resp.get("Metadata", {})),
         )
 
-    def head_object(self, bucket: str, key: str) -> GetResult:
-        resp = self._wrap(lambda: self._s3.head_object(Bucket=bucket, Key=key))
+    def head_object(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        conditions: Conditions | None = None,
+    ) -> GetResult:
+        kw: dict = {"Bucket": bucket, "Key": key}
+        kw.update(_conditional_kwargs(conditions))
+        resp = self._wrap(lambda: self._s3.head_object(**kw))
         return GetResult(
             body=b"",
             etag=resp["ETag"].strip('"'),
@@ -255,6 +269,31 @@ class Boto3Client(S3Client):
                 Bucket=bucket, Key=key, UploadId=upload_id,
             )
         )
+
+
+def _quote_etag(value: str) -> str:
+    """S3 wants ETags quoted in conditional headers; '*' is special and
+    must NOT be quoted. Idempotent — won't double-quote."""
+    if value == "*":
+        return value
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    return f'"{value}"'
+
+
+def _conditional_kwargs(conditions: Conditions | None) -> dict:
+    if conditions is None:
+        return {}
+    kw: dict = {}
+    if conditions.if_match is not None:
+        kw["IfMatch"] = _quote_etag(conditions.if_match)
+    if conditions.if_none_match is not None:
+        kw["IfNoneMatch"] = _quote_etag(conditions.if_none_match)
+    if conditions.if_modified_since is not None:
+        kw["IfModifiedSince"] = conditions.if_modified_since
+    if conditions.if_unmodified_since is not None:
+        kw["IfUnmodifiedSince"] = conditions.if_unmodified_since
+    return kw
 
 
 def _obj_from_v1(o: dict) -> S3Object:

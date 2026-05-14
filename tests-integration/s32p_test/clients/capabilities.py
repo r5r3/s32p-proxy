@@ -35,3 +35,7 @@ class Capability(Enum):
     PRESIGN_GET = auto()
     PRESIGN_PUT = auto()
     UNSIGNED_PAYLOAD = auto()
+
+    # Conditional requests (If-Match / If-None-Match / If-Modified-Since /
+    # If-Unmodified-Since on GET/HEAD/PUT/COPY)
+    CONDITIONAL_REQUESTS = auto()

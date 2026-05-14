@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import ClassVar
 
 from .capabilities import Capability
@@ -56,6 +57,20 @@ class GetResult:
 @dataclass(slots=True)
 class PutResult:
     etag: str
+
+
+@dataclass(slots=True, frozen=True)
+class Conditions:
+    """HTTP conditional headers for GET/HEAD/PUT/COPY.
+
+    ETag values are passed unquoted; adapters add the surrounding quotes
+    that S3 wants on the wire. Use `if_none_match="*"` for "create only
+    if absent" semantics on PUT (S3 conditional create).
+    """
+    if_match: str | None = None
+    if_none_match: str | None = None
+    if_modified_since: datetime | None = None
+    if_unmodified_since: datetime | None = None
 
 
 # ---------------------------------------------------------------- error type
@@ -148,6 +163,7 @@ class S3Client(ABC):
         *,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        conditions: Conditions | None = None,
     ) -> PutResult: ...
 
     @abstractmethod
@@ -157,10 +173,17 @@ class S3Client(ABC):
         key: str,
         *,
         range_: tuple[int, int] | None = None,  # inclusive byte range
+        conditions: Conditions | None = None,
     ) -> GetResult: ...
 
     @abstractmethod
-    def head_object(self, bucket: str, key: str) -> GetResult:
+    def head_object(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        conditions: Conditions | None = None,
+    ) -> GetResult:
         """Like get_object() but body is b''."""
 
     @abstractmethod

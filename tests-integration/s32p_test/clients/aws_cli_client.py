@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import (
+    Conditions,
     Endpoint,
     GetResult,
     ListResult,
@@ -72,6 +73,7 @@ class AwsCliClient(S3Client):
         Capability.METADATA,
         Capability.UNSIGNED_PAYLOAD,
         Capability.MULTIPART,
+        Capability.CONDITIONAL_REQUESTS,
         # Skipped for now (each is a follow-up):
         # - VIRTUAL_HOSTED   needs ~/.aws/config addressing_style or env tweak
         # - OBJECT_ACL/BUCKET_ACL  can be added once we have a representative ACL doc shape
@@ -167,6 +169,7 @@ class AwsCliClient(S3Client):
         *,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        conditions: Conditions | None = None,
     ) -> PutResult:
         with self._tempfile_with(body) as body_path:
             args = [
@@ -181,6 +184,7 @@ class AwsCliClient(S3Client):
                 # aws-cli shorthand: Key1=Value1,Key2=Value2 (no commas/equals
                 # in values; tests control the input so this is fine).
                 args += ["--metadata", ",".join(f"{k}={v}" for k, v in metadata.items())]
+            args += _conditional_args(conditions)
             result = self._run(*args) or {}
         return PutResult(etag=result["ETag"].strip('"'))
 
@@ -190,11 +194,13 @@ class AwsCliClient(S3Client):
         key: str,
         *,
         range_: tuple[int, int] | None = None,
+        conditions: Conditions | None = None,
     ) -> GetResult:
         with self._tempfile_with() as out_path:
             args = ["get-object", "--bucket", bucket, "--key", key]
             if range_ is not None:
                 args += ["--range", f"bytes={range_[0]}-{range_[1]}"]
+            args += _conditional_args(conditions)
             args.append(str(out_path))
             result = self._run(*args) or {}
             body = out_path.read_bytes()
@@ -206,8 +212,16 @@ class AwsCliClient(S3Client):
             metadata=dict(result.get("Metadata", {})),
         )
 
-    def head_object(self, bucket: str, key: str) -> GetResult:
-        result = self._run("head-object", "--bucket", bucket, "--key", key) or {}
+    def head_object(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        conditions: Conditions | None = None,
+    ) -> GetResult:
+        args = ["head-object", "--bucket", bucket, "--key", key]
+        args += _conditional_args(conditions)
+        result = self._run(*args) or {}
         return GetResult(
             body=b"",
             etag=result["ETag"].strip('"'),
@@ -324,6 +338,31 @@ class AwsCliClient(S3Client):
             "--key", key,
             "--upload-id", upload_id,
         )
+
+
+def _quote_etag(value: str) -> str:
+    """S3 wants ETags quoted in conditional headers; '*' is special and
+    must NOT be quoted. Idempotent."""
+    if value == "*":
+        return value
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    return f'"{value}"'
+
+
+def _conditional_args(conditions: Conditions | None) -> list[str]:
+    if conditions is None:
+        return []
+    out: list[str] = []
+    if conditions.if_match is not None:
+        out += ["--if-match", _quote_etag(conditions.if_match)]
+    if conditions.if_none_match is not None:
+        out += ["--if-none-match", _quote_etag(conditions.if_none_match)]
+    if conditions.if_modified_since is not None:
+        out += ["--if-modified-since", conditions.if_modified_since.isoformat()]
+    if conditions.if_unmodified_since is not None:
+        out += ["--if-unmodified-since", conditions.if_unmodified_since.isoformat()]
+    return out
 
 
 def _object_from_aws(o: dict) -> S3Object:
