@@ -1048,6 +1048,49 @@ async fn handle_other(
     s32p_support::s3resp::not_implemented("only GET/HEAD /{bucket}/{key} is implemented", None)
 }
 
+// Build a HEAD response from `lstat(2)` metadata. Used when `open(2)` returns
+// ENOENT for a path that is itself a (broken) symlink, so HEAD agrees with the
+// listing view of the same key. Mirrors the precondition handling of the main
+// HEAD/GET path; the symlink's own inode/mtime/size feed ETag/Last-Modified/
+// Content-Length.
+fn head_response_from_lstat(req: &Request<Incoming>, lmeta: &std::fs::Metadata) -> Resp {
+    let size = lmeta.len();
+    let lm_st = lmeta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let last_modified = fmt_http_date(lm_st);
+    let etag_unquoted = lmeta.ino().to_string();
+    let etag = format!("\"{}\"", etag_unquoted);
+
+    let cond = match parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+    match evaluate_read_preconditions(&cond, &etag_unquoted, lm_st) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => {
+            return s32p_support::s3resp::not_modified(Some(&etag), Some(&last_modified));
+        }
+        PreconditionOutcome::PreconditionFailed => {
+            return s32p_support::s3resp::precondition_failed(
+                "GET/HEAD precondition failed",
+                Some(req.uri().path()),
+            );
+        }
+    }
+
+    s32p_support::s3resp::object_response(
+        StatusCode::OK,
+        s32p_support::s3resp::empty_body(),
+        "application/octet-stream",
+        size,
+        &etag,
+        &last_modified,
+        None,
+    )
+}
+
 async fn handle_get_object(
     req: Request<Incoming>,
     app: Arc<App>,
@@ -1100,6 +1143,19 @@ async fn handle_get_object(
                 let ioe = e.downcast_ref::<std::io::Error>();
                 match ioe.map(|x| x.kind()) {
                     Some(std::io::ErrorKind::NotFound) => {
+                        // Broken symlink: open() follows the link and fails with
+                        // ENOENT. Listings still surface the entry via lstat
+                        // fallback (statx_info), so HEAD must too — otherwise
+                        // LIST advertises a key that HEAD then denies. GET is
+                        // unchanged: there is no readable content, so 404 is
+                        // the only honest answer.
+                        if is_head_object {
+                            if let Ok(lmeta) = std::fs::symlink_metadata(&obj_path) {
+                                if lmeta.file_type().is_symlink() {
+                                    return head_response_from_lstat(&req, &lmeta);
+                                }
+                            }
+                        }
                         return s32p_support::s3resp::no_such_key("not found", None);
                     }
                     Some(std::io::ErrorKind::PermissionDenied) => {
