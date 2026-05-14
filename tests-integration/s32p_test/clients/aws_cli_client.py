@@ -65,9 +65,9 @@ class AwsCliClient(S3Client):
         Capability.DELETE_OBJECTS,
         Capability.METADATA,
         Capability.UNSIGNED_PAYLOAD,
+        Capability.MULTIPART,
         # Skipped for now (each is a follow-up):
         # - VIRTUAL_HOSTED   needs ~/.aws/config addressing_style or env tweak
-        # - MULTIPART        s3api low-level upload-part etc. is doable but verbose
         # - OBJECT_ACL/BUCKET_ACL  can be added once we have a representative ACL doc shape
         # - PRESIGN_GET      `aws s3 presign` (not s3api); separate code path
     }
@@ -270,6 +270,54 @@ class AwsCliClient(S3Client):
             "--delete", delete_doc,
         ) or {}
         return [d["Key"] for d in result.get("Deleted", [])]
+
+    # ----- multipart -----
+
+    def create_multipart(self, bucket: str, key: str) -> str:
+        result = self._run(
+            "create-multipart-upload", "--bucket", bucket, "--key", key
+        ) or {}
+        return result["UploadId"]
+
+    def upload_part(
+        self, bucket: str, key: str, upload_id: str, part_number: int, body: bytes
+    ) -> str:
+        with self._tempfile_with(body) as body_path:
+            result = self._run(
+                "upload-part",
+                "--bucket", bucket,
+                "--key", key,
+                "--upload-id", upload_id,
+                "--part-number", str(part_number),
+                "--body", str(body_path),
+            ) or {}
+        return result["ETag"].strip('"')
+
+    def complete_multipart(
+        self, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]
+    ) -> PutResult:
+        parts_doc = json.dumps({
+            "Parts": [
+                {"PartNumber": n, "ETag": f'"{e.strip(chr(34))}"'}
+                for n, e in sorted(parts)
+            ]
+        })
+        result = self._run(
+            "complete-multipart-upload",
+            "--bucket", bucket,
+            "--key", key,
+            "--upload-id", upload_id,
+            "--multipart-upload", parts_doc,
+        ) or {}
+        return PutResult(etag=result["ETag"].strip('"'))
+
+    def abort_multipart(self, bucket: str, key: str, upload_id: str) -> None:
+        self._run(
+            "abort-multipart-upload",
+            "--bucket", bucket,
+            "--key", key,
+            "--upload-id", upload_id,
+        )
 
 
 def _object_from_aws(o: dict) -> S3Object:

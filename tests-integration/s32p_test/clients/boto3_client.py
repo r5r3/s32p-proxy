@@ -210,6 +210,52 @@ class Boto3Client(S3Client):
             ExpiresIn=expires,
         )
 
+    # ----- multipart -----
+
+    def create_multipart(self, bucket: str, key: str) -> str:
+        resp = self._wrap(
+            lambda: self._s3.create_multipart_upload(Bucket=bucket, Key=key)
+        )
+        return resp["UploadId"]
+
+    def upload_part(
+        self, bucket: str, key: str, upload_id: str, part_number: int, body: bytes
+    ) -> str:
+        resp = self._wrap(
+            lambda: self._s3.upload_part(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+                PartNumber=part_number, Body=body,
+            )
+        )
+        return resp["ETag"].strip('"')
+
+    def complete_multipart(
+        self, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]
+    ) -> PutResult:
+        # S3 wants ETags quoted in the parts doc; we store them stripped on the
+        # way out and re-quote here. Sort by PartNumber to be safe — the spec
+        # requires monotonically increasing.
+        parts_doc = {
+            "Parts": [
+                {"PartNumber": n, "ETag": f'"{e.strip(chr(34))}"'}
+                for n, e in sorted(parts)
+            ]
+        }
+        resp = self._wrap(
+            lambda: self._s3.complete_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+                MultipartUpload=parts_doc,
+            )
+        )
+        return PutResult(etag=resp["ETag"].strip('"'))
+
+    def abort_multipart(self, bucket: str, key: str, upload_id: str) -> None:
+        self._wrap(
+            lambda: self._s3.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+            )
+        )
+
 
 def _obj_from_v1(o: dict) -> S3Object:
     return S3Object(
