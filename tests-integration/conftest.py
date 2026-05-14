@@ -4,23 +4,34 @@ Adds CLI options (`--clients`, `--mode`, `--proxy-url`, `--addressing`) and
 defines the parametrized `client` fixture that drives every test through
 each registered S3 client adapter.
 
-Heavyweight fixtures (proxy spawn, directory backend, bucket lifecycle)
-are stubbed here as `pytest.fixture` placeholders that raise NotImplementedError —
-the harness behind them is the next chunk of work, intentionally not in
-this sketch. Tests that don't need those fixtures (e.g. construction-only
-sanity checks) work today; the get/put/delete test below requires a
-running proxy and will skip until the harness lands.
+The proxy is spawned once per session (`proxy_harness`); the test user
+and a fixed pool of buckets are seeded once and reused. Per-test
+isolation is provided by the `bucket` fixture, which leases one bucket
+from the pool and wipes its data dir before yielding.
 """
 
 from __future__ import annotations
 
 import os
+import pwd
+import shutil
+import uuid
+from pathlib import Path
 
 import pytest
 
 from s32p_test.clients import S3Client, discover
 from s32p_test.clients.base import Endpoint
 from s32p_test.clients.capabilities import Capability
+from s32p_test.directory import Bucket, Grant, User
+from s32p_test.proxy import ProxyHarness
+
+
+# Fixed test credentials. Stable across runs so an interrupted test leaves
+# behind a reproducible footprint; the session_dir is fresh per run anyway.
+TEST_ACCESS_KEY = "TESTACCESSKEY123"
+TEST_SECRET_KEY = "TESTSECRETKEY456"  # noqa: S105 (test fixture, not a real secret)
+BUCKET_POOL_SIZE = 8
 
 
 # ----------------------------------------------------------------- CLI options
@@ -122,38 +133,99 @@ def client(_client_cls, _client_addressing, endpoint, request):
     return inst
 
 
-# ----------------------------------------------------------------- harness stubs
-# Replace these with the real ProxyHarness / BackendFs / directory builder.
+# ----------------------------------------------------------------- harness fixtures
 
 
 @pytest.fixture(scope="session")
-def endpoint(request) -> Endpoint:
-    """Return an Endpoint pointing at a running proxy.
+def proxy_harness(tmp_path_factory, request) -> ProxyHarness:
+    """Session-scoped: spawn one proxy, seed the directory, tear down at end.
 
-    Today: if --proxy-url is given, use it. Otherwise skip — the local
-    spawn-the-proxy harness is not implemented yet.
+    With --proxy-url, skip spawning entirely — the test runner targets the
+    given URL and the test user is expected to exist already (set
+    S32P_ACCESS_KEY/S32P_SECRET_KEY/S32P_TEST_BUCKETS).
     """
+    if request.config.getoption("--proxy-url"):
+        pytest.skip("--proxy-url path uses `endpoint` directly, no harness")
+
+    session_dir = tmp_path_factory.mktemp("s32p")
+    me = pwd.getpwuid(os.getuid())
+
+    harness = ProxyHarness(session_dir=session_dir)
+    harness.directory.add_user(User(
+        access_key=TEST_ACCESS_KEY,
+        secret_key=TEST_SECRET_KEY,
+        username=me.pw_name,
+        uid=me.pw_uid,
+        gid=me.pw_gid,
+    ))
+    # Pre-declare a pool of buckets. The bucket fixture leases one per test.
+    bucket_data_root = session_dir / "buckets"
+    for i in range(BUCKET_POOL_SIZE):
+        name = f"test-bucket-{i:03d}"
+        harness.directory.add_bucket(Bucket(
+            name=name,
+            data_path=bucket_data_root / name,
+            grants=(Grant("ak", TEST_ACCESS_KEY, "read_write"),),
+            bucket_id=f"bkt-{name}",
+        ))
+
+    harness.start()
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+@pytest.fixture(scope="session")
+def endpoint(request, proxy_harness) -> Endpoint:
+    """Endpoint to drive S3 clients against. Source: spawned proxy or
+    --proxy-url. The proxy_harness fixture handles the skip-when-external
+    branch."""
     url = request.config.getoption("--proxy-url")
-    if not url:
-        pytest.skip("no running proxy; pass --proxy-url or wait for ProxyHarness")
+    if url:
+        return Endpoint(
+            base_url=url,
+            region=os.environ.get("S32P_REGION", "us-east-1"),
+            access_key=os.environ["S32P_ACCESS_KEY"],
+            secret_key=os.environ["S32P_SECRET_KEY"],
+            virtual_hosted_suffix=os.environ.get("S32P_VHOST_SUFFIX"),
+        )
     return Endpoint(
-        base_url=url,
-        region=os.environ.get("S32P_REGION", "us-east-1"),
-        access_key=os.environ["S32P_ACCESS_KEY"],
-        secret_key=os.environ["S32P_SECRET_KEY"],
-        virtual_hosted_suffix=os.environ.get("S32P_VHOST_SUFFIX"),
+        base_url=proxy_harness.base_url,
+        region=proxy_harness.region,
+        access_key=TEST_ACCESS_KEY,
+        secret_key=TEST_SECRET_KEY,
+        virtual_hosted_suffix=(
+            proxy_harness.virtual_hosted_suffixes[0]
+            if proxy_harness.virtual_hosted_suffixes
+            else None
+        ),
     )
 
 
-@pytest.fixture
-def bucket(endpoint, request) -> str:
-    """Yield a fresh, empty bucket for the test.
+# Lease counter shared across tests in a single pytest worker. Pool sizing
+# in proxy_harness must be >= max parallel tests per worker; today we run
+# serially within a worker so the modulo is enough.
+_bucket_counter = 0
 
-    Today: returns a name from the env (S32P_TEST_BUCKET) for ad-hoc runs.
-    Real impl: ProvisionedBucket fixture that mints a bucket via s32p-ctl,
-    creates the data path, and tears down on test exit.
+
+@pytest.fixture
+def bucket(proxy_harness) -> str:
+    """Lease one bucket from the pool, wipe its data dir, return its name.
+
+    Cleanup-before-yield (not after) lets a failed test leave debris on
+    disk for inspection while still giving the next test a clean slate.
     """
-    name = os.environ.get("S32P_TEST_BUCKET")
-    if not name:
-        pytest.skip("no bucket fixture yet; set S32P_TEST_BUCKET for ad-hoc runs")
+    global _bucket_counter
+    idx = _bucket_counter % BUCKET_POOL_SIZE
+    _bucket_counter += 1
+    name = f"test-bucket-{idx:03d}"
+
+    data_dir = proxy_harness.session_dir / "buckets" / name
+    if data_dir.exists():
+        for child in data_dir.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
     return name
