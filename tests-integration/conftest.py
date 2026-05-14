@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from s32p_test.backend_fs import BackendFs
 from s32p_test.clients import S3Client, discover
 from s32p_test.clients.base import Endpoint
 from s32p_test.clients.capabilities import Capability
@@ -214,11 +215,13 @@ _bucket_counter = 0
 
 
 @pytest.fixture
-def bucket(proxy_harness) -> str:
-    """Lease one bucket from the pool, wipe its data dir, return its name.
+def _leased_bucket(proxy_harness) -> tuple[str, BackendFs]:
+    """Lease one bucket from the pool, wipe its data dir, return (name, fs).
 
     Cleanup-before-yield (not after) lets a failed test leave debris on
     disk for inspection while still giving the next test a clean slate.
+    Tests should depend on `bucket` and/or `bucket_fs` rather than this
+    fixture directly.
     """
     global _bucket_counter
     idx = _bucket_counter % BUCKET_POOL_SIZE
@@ -232,4 +235,25 @@ def bucket(proxy_harness) -> str:
                 shutil.rmtree(child)
             else:
                 child.unlink()
-    return name
+    else:
+        data_dir.mkdir(parents=True)
+
+    return name, BackendFs(root=data_dir)
+
+
+@pytest.fixture
+def bucket(_leased_bucket) -> str:
+    """The S3 bucket name for this test."""
+    return _leased_bucket[0]
+
+
+@pytest.fixture
+def bucket_fs(_leased_bucket) -> BackendFs:
+    """Direct POSIX access to the same bucket's backing data dir.
+
+    Use for interop tests that need to write/read/symlink/chmod on disk and
+    then assert what S3 sees (or vice versa). Both `bucket` and `bucket_fs`
+    refer to the *same* lease in a given test — pytest shares the
+    `_leased_bucket` instance across them.
+    """
+    return _leased_bucket[1]
