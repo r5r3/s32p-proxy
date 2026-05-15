@@ -319,7 +319,7 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - allows routing different command classes to different worker profiles per access key
 - Workers are started via a configurable launcher (default: `restricted-exec`)
   - If running as root and `pass_user_flag_if_root=true`, the proxy passes `--user <username>`
-  - When `workers.launcher.landlock` is enabled (default `true`), the proxy also passes `--rw <posix_root>`, `--rw <bucket.data_path>` for each accessible bucket, `--resolve-libs`, and `--allow-nss` so the launcher confines the worker to those paths.
+  - When `workers.launcher.landlock` is enabled (default `true`), the proxy also passes `--rw <posix_root>`, then per accessible bucket either `--rw <bucket.data_path>` (for `read_write` grants) or `--ro <bucket.data_path>` (for `read_only` grants), plus `--resolve-libs` and `--allow-nss`. Landlock therefore enforces the same ACL access level the gateway already checks (see §Security Notes), at the kernel layer.
 - Upstream bind (per worker):
   - TCP loopback: `127.0.0.1:<port>`
   - Unix domain socket: `<uds_run_dir>/<uid>-<instance_id>/<profile>.sock`

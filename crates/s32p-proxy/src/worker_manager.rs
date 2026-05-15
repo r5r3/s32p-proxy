@@ -349,8 +349,25 @@ impl WorkerManager {
 
         if self.cfg.launcher.landlock {
             cmd.arg("--rw").arg(&staged_root);
+            // Per-bucket landlock: read_only buckets get `--ro` so the kernel
+            // blocks writes even if a future bug let one slip past the
+            // gateway's S3-XML check (see `handle()` in s32p-gateway/main.rs).
+            // read_write buckets get `--rw` as before. This mirrors the
+            // ACL snapshot the proxy already ships in `S32P_BUCKET_ACL`.
+            let mut ro_count = 0usize;
+            let mut rw_count = 0usize;
             for b in buckets {
-                cmd.arg("--rw").arg(&b.data_path);
+                let flag = match b.access {
+                    AccessLevel::ReadOnly => {
+                        ro_count += 1;
+                        "--ro"
+                    }
+                    AccessLevel::ReadWrite => {
+                        rw_count += 1;
+                        "--rw"
+                    }
+                };
+                cmd.arg(flag).arg(&b.data_path);
             }
             // UDS workers need to bind(2) a new socket in the per-uid run dir.
             if let WorkerEndpoint::Uds(sock_path) = &endpoint {
@@ -361,8 +378,9 @@ impl WorkerManager {
             cmd.arg("--resolve-libs");
             cmd.arg("--allow-nss");
             tracing::debug!(
-                buckets = buckets.len(),
-                "landlock enabled: --rw staged_root + bucket data_paths (+ uds parent), --resolve-libs, --allow-nss"
+                buckets_ro = ro_count,
+                buckets_rw = rw_count,
+                "landlock enabled: --rw staged_root + per-bucket --ro/--rw data_paths (+ uds parent), --resolve-libs, --allow-nss"
             );
         }
 
