@@ -132,7 +132,7 @@ fn parens_unencoded_on_wire_but_encoded_in_canonical_uri() {
     let headers = build_headers(host);
     let uri: Uri = wire_path.parse().unwrap();
 
-    verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY).expect(
+    verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY, None).expect(
         "verification should accept boto3-style requests where the canonical URI \
          encodes sub-delim chars but the wire URI leaves them literal",
     );
@@ -153,7 +153,7 @@ fn fully_unencoded_parens_on_wire_and_in_canonical_uri() {
     let headers = build_headers(host);
     let uri: Uri = path.parse().unwrap();
 
-    verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY)
+    verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY, None)
         .expect("signing and verifying with the same literal-paren path must succeed");
 }
 
@@ -172,7 +172,7 @@ fn extra_subdelim_chars_get_canonicalized() {
     let headers = build_headers(host);
     let uri: Uri = wire_path.parse().unwrap();
 
-    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY).expect(
+    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None).expect(
         "verification should accept literal sub-delim chars on the wire when \
          the client's canonical URI percent-encodes them",
     );
@@ -193,6 +193,6 @@ fn rejects_genuinely_wrong_signature() {
     let headers = build_headers(host);
     let uri: Uri = wire_path.parse().unwrap();
 
-    let res = verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY);
+    let res = verify_sigv4_header_only("DELETE", &uri, &headers, &auth, SECRET_KEY, None);
     assert!(res.is_err(), "tampered signature must be rejected");
 }

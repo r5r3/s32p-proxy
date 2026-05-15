@@ -312,6 +312,8 @@ Group membership is resolved from the OS at runtime (username → gids → group
 
 - Workers (VersityGW or s32p-gateway) still validate SigV4 again (cannot be disabled).
 
+- **Clock-skew gate (header SigV4 only).** Header-signed requests whose `x-amz-date` differs from the server clock by more than 15 minutes (in either direction) are rejected with `RequestTimeTooSkewed` (HTTP 403). This matches AWS S3's documented window and exists so a captured signed request can't be replayed indefinitely. Presigned URLs have their own `X-Amz-Expires`-based check (rejected with `AccessDenied` / "Request has expired") and don't use this window. The 15-minute value is a constant in `s32p-support` (`HEADER_SIGV4_MAX_SKEW`).
+
 ### Worker lifecycle management (`src/worker_manager.rs`)
 
 - Workers are keyed by **(access_key, worker_profile)**

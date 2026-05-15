@@ -129,6 +129,21 @@ pub fn signature_does_not_match(message: &str, resource: Option<&str>) -> HttpRe
     )
 }
 
+/// Convenience: RequestTimeTooSkewed (403). Returned for header-style
+/// SigV4 requests whose `x-amz-date` falls outside the configured
+/// clock-skew window. AWS S3 uses this code (separate from
+/// SignatureDoesNotMatch) so clients know to re-sync their clock and
+/// re-sign rather than treat the request as unauthorized.
+pub fn request_time_too_skewed(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::FORBIDDEN,
+        s3xml::error_code::REQUEST_TIME_TOO_SKEWED,
+        message,
+        resource,
+        None,
+    )
+}
+
 /// Convenience: InvalidAccessKeyId (403).
 pub fn invalid_access_key_id(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(

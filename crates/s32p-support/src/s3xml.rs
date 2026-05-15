@@ -13,6 +13,7 @@ pub const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 pub mod error_code {
     pub const ACCESS_DENIED: &str = "AccessDenied";
     pub const SIGNATURE_DOES_NOT_MATCH: &str = "SignatureDoesNotMatch";
+    pub const REQUEST_TIME_TOO_SKEWED: &str = "RequestTimeTooSkewed";
     pub const INVALID_ACCESS_KEY_ID: &str = "InvalidAccessKeyId";
     pub const NOT_IMPLEMENTED: &str = "NotImplemented";
     pub const INVALID_REQUEST: &str = "InvalidRequest";

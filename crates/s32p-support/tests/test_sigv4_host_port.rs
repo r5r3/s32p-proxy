@@ -112,7 +112,7 @@ fn client_signs_with_443_server_receives_without_port() {
     let headers = build_headers("example.com");
     let uri: Uri = "/".parse().unwrap();
 
-    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY)
+    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None)
         .expect("verification should accept :443-signed request received without :443");
 }
 
@@ -126,7 +126,7 @@ fn client_signs_without_port_server_receives_with_443() {
     let headers = build_headers("example.com:443");
     let uri: Uri = "/".parse().unwrap();
 
-    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY)
+    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None)
         .expect("verification should accept port-stripped signature received with :443");
 }
 
@@ -137,7 +137,7 @@ fn client_signs_with_80_server_receives_without_port() {
     let headers = build_headers("example.com");
     let uri: Uri = "/".parse().unwrap();
 
-    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY)
+    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None)
         .expect("port 80 toggle should also be accepted");
 }
 
@@ -151,7 +151,7 @@ fn non_default_port_must_match_exactly() {
     let headers = build_headers("example.com:8080");
     let uri: Uri = "/".parse().unwrap();
 
-    let res = verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY);
+    let res = verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None);
     assert!(
         res.is_err(),
         "non-default port mismatch must reject (got {:?})",
@@ -167,7 +167,7 @@ fn matching_signature_still_works() {
     let headers = build_headers("example.com");
     let uri: Uri = "/".parse().unwrap();
 
-    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY)
+    verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None)
         .expect("identical host must verify on the first attempt");
 }
 
@@ -179,6 +179,6 @@ fn truly_bad_signature_is_still_rejected() {
     let headers = build_headers("example.com");
     let uri: Uri = "/".parse().unwrap();
 
-    let res = verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY);
+    let res = verify_sigv4_header_only("GET", &uri, &headers, &auth, SECRET_KEY, None);
     assert!(res.is_err(), "unrelated bad signature must remain rejected");
 }

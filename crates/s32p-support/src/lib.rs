@@ -61,6 +61,16 @@ pub struct PresignedSigV4Auth {
     pub security_token: Option<String>,
 }
 
+/// Maximum allowed skew between the client-supplied `x-amz-date` on a
+/// header-signed SigV4 request and the server clock. AWS S3's documented
+/// limit is 15 minutes either side; we match that. Presigned URLs are
+/// gated by their own `X-Amz-Expires` and don't use this constant.
+///
+/// A configurable max-skew can be plumbed through `verify_sigv4_header_only`
+/// later if a deployment needs tighter or looser bounds; today it's a fixed
+/// constant and `verify_sigv4_request_any` always passes it.
+pub const HEADER_SIGV4_MAX_SKEW: Duration = Duration::from_secs(15 * 60);
+
 /// Verify either:
 /// - standard SigV4 header Authorization, or
 /// - SigV4 presigned URL (query params)
@@ -88,6 +98,11 @@ pub fn verify_sigv4_request_any(
     // presigned URL — distinct from SignatureDoesNotMatch so clients know to
     // refresh the URL rather than re-sign.
     const CLIENT_MSG_EXPIRED: &str = "Request has expired";
+    // AWS S3 returns RequestTimeTooSkewed (also 403) for header-signed
+    // requests outside the 15-minute window. Generic message — verbose
+    // detail (computed skew, max) stays in `reason` for operator logs.
+    const CLIENT_MSG_SKEWED: &str =
+        "request time differs from server time by more than the allowed margin";
 
     // Header-style SigV4
     if headers.get("authorization").is_some() {
@@ -110,11 +125,25 @@ pub fn verify_sigv4_request_any(
             }
         }
 
-        if let Err(e) = verify_sigv4_header_only(method, uri, headers, &auth, secret_key) {
-            return Err(SigV4Rejection {
-                response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
-                reason:   e.to_string(),
-            });
+        if let Err(e) = verify_sigv4_header_only(
+            method,
+            uri,
+            headers,
+            &auth,
+            secret_key,
+            Some(HEADER_SIGV4_MAX_SKEW),
+        ) {
+            let reason = e.to_string();
+            // See CLIENT_MSG_SKEWED above. The marker string comes from
+            // verify_sigv4_header_only's skew error and is the only
+            // string-sniff-based dispatch on this path; everything else
+            // falls through to SignatureDoesNotMatch.
+            let response = if reason.contains("request time skewed") {
+                crate::s3resp::request_time_too_skewed(CLIENT_MSG_SKEWED, resource)
+            } else {
+                crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource)
+            };
+            return Err(SigV4Rejection { response, reason });
         }
 
         return Ok(());
@@ -520,12 +549,20 @@ pub fn extract_access_key(headers: &HeaderMap) -> Result<String> {
 
 /// Verify SigV4 *without reading the body*, using client x-amz-content-sha256.
 /// Use this ONLY to gate worker spawn (first request).
+///
+/// `max_skew`:
+/// - `Some(d)` — reject the request if `|now - x_amz_date|` exceeds `d`. Use
+///   [`HEADER_SIGV4_MAX_SKEW`] to match AWS S3's documented 15-minute window.
+/// - `None`   — skip the skew check. Useful for unit tests with fixed-date
+///   fixtures; production callers (the proxy gate and the worker) always
+///   pass `Some(_)`.
 pub fn verify_sigv4_header_only(
     method: &str,
     uri: &Uri,
     headers: &HeaderMap,
     auth: &SigV4Auth,
     secret_key: &str,
+    max_skew: Option<Duration>,
 ) -> Result<()> {
     // 1) Parse X-Amz-Date into signing time (SystemTime) and YYYYMMDD
     let x_amz_date = headers
@@ -540,6 +577,33 @@ pub fn verify_sigv4_header_only(
     // date in credential scope must match x-amz-date date
     if date_str != auth.scope_date {
         return Err(anyhow!("date mismatch: scope={} x-amz-date={}", auth.scope_date, date_str));
+    }
+
+    // Clock-skew gate: AWS S3 rejects header-signed requests whose
+    // `x-amz-date` differs from server time by more than ~15 minutes
+    // (either direction). Without this check a captured signed request
+    // stays replayable indefinitely. Presigned URLs have their own
+    // `X-Amz-Expires`-based check elsewhere, so this only applies here.
+    //
+    // The error string carries the literal "request time skewed" marker;
+    // `verify_sigv4_request_any` matches on it to map this to a
+    // `RequestTimeTooSkewed` S3 response (distinct from
+    // `SignatureDoesNotMatch`) so clients re-sync their clock instead of
+    // re-signing.
+    if let Some(max) = max_skew {
+        let now = SystemTime::now();
+        let skew = match (now.duration_since(signing_time), signing_time.duration_since(now)) {
+            (Ok(d), _) => d, // request is in the past
+            (_, Ok(d)) => d, // request is in the future
+            _ => Duration::ZERO,
+        };
+        if skew > max {
+            return Err(anyhow!(
+                "request time skewed: |now - x-amz-date| = {}s exceeds max {}s",
+                skew.as_secs(),
+                max.as_secs()
+            ));
+        }
     }
 
     // 2) Determine payload hash mode from x-amz-content-sha256
