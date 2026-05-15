@@ -138,4 +138,10 @@ def test_complete_with_part_gap_fails(client, bucket):
     finally:
         # Don't leave the partial upload around — the bucket fixture wipes
         # data dirs but doesn't clean up multipart state through s3api.
-        client.abort_multipart(bucket, key, upload_id)
+        # Some gateway revisions clean up after a failed completion, in
+        # which case the abort 404s; that's fine, swallow it.
+        try:
+            client.abort_multipart(bucket, key, upload_id)
+        except S3Error as cleanup_err:
+            if cleanup_err.status != 404:
+                raise

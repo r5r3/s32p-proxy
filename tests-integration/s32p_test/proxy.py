@@ -174,11 +174,28 @@ class ProxyHarness:
 
     # ----- lifecycle -----
 
-    def start(self, timeout: float = 15.0) -> None:
+    def start(self, timeout: float = 15.0, max_attempts: int = 3) -> None:
+        """Spawn the proxy; on early-exit (typical port-reuse race under
+        xdist), pick a new port and retry up to `max_attempts` times."""
         if self._proc is not None:
             raise RuntimeError("ProxyHarness.start() called twice")
-        self.write_config()
 
+        last_reason = ""
+        for attempt in range(1, max_attempts + 1):
+            outcome = self._spawn_attempt(timeout)
+            if outcome is None:
+                return  # success
+            last_reason = outcome
+            if attempt < max_attempts:
+                self.listen_port = _alloc_port(self.listen_host)
+        self._fail(
+            f"proxy did not start after {max_attempts} attempts; last: {last_reason}"
+        )
+
+    def _spawn_attempt(self, timeout: float) -> str | None:
+        """One spawn attempt. Returns None on success, an error reason
+        string on failure (caller decides whether to retry)."""
+        self.write_config()
         self._log_fh = self.log_path.open("ab", buffering=0)
         self._proc = subprocess.Popen(
             [str(proxy_binary()), "--config", str(self.config_path)],
@@ -190,11 +207,33 @@ class ProxyHarness:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
-                self._fail(f"proxy exited early (rc={self._proc.returncode})")
+                rc = self._proc.returncode
+                self._tear_down_attempt()
+                return f"proxy exited early (rc={rc})"
             if _port_open(self.listen_host, self.listen_port):
-                return
+                return None
             time.sleep(0.05)
-        self._fail(f"proxy did not start listening on {self.listen_host}:{self.listen_port} within {timeout}s")
+        # Deadline expired without the port opening — kill, return reason.
+        self._tear_down_attempt()
+        return (
+            f"proxy did not start listening on "
+            f"{self.listen_host}:{self.listen_port} within {timeout}s"
+        )
+
+    def _tear_down_attempt(self) -> None:
+        """Clean up an attempt that didn't reach 'listening' state, so
+        start() can retry on a fresh port without leaking the process."""
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(2.0)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+        self._proc = None
+        if self._log_fh is not None:
+            self._log_fh.close()
+            self._log_fh = None
 
     def stop(self, timeout: float = 5.0) -> None:
         if self._proc is None:

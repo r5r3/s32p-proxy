@@ -84,6 +84,38 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_single)
 
 
+# ----------------------------------------------------------------- failure log capture
+
+# Bytes of the proxy log to attach to a failed test. 32 KiB is enough to
+# cover a few worker spawns and a typical request/response cycle without
+# drowning the report.
+_PROXY_LOG_TAIL_BYTES = 32 * 1024
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """When a test fails, attach the tail of the proxy log to its report.
+
+    The proxy is shared across the whole session, so this is a *tail*, not
+    a per-test slice — but it's still the single most useful artifact for
+    diagnosing harness/gateway failures. Stored as a `sections` entry so
+    pytest renders it with `-ra` / `--tb=short`.
+    """
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when != "call" or not rep.failed:
+        return
+    harness = getattr(item.session, "_s32p_harness", None)
+    if harness is None:
+        return
+    try:
+        log_bytes = harness.log_path.read_bytes()
+    except OSError:
+        return
+    tail = log_bytes[-_PROXY_LOG_TAIL_BYTES:].decode("utf-8", "replace")
+    rep.sections.append((f"proxy log tail ({harness.log_path})", tail))
+
+
 # ----------------------------------------------------------------- client matrix
 
 
@@ -171,6 +203,9 @@ def proxy_harness(tmp_path_factory, request) -> ProxyHarness:
         ))
 
     harness.start()
+    # Stash on session so pytest_runtest_makereport can attach the proxy
+    # log tail to any failed test report without needing the fixture.
+    request.session._s32p_harness = harness
     try:
         yield harness
     finally:
@@ -209,19 +244,27 @@ def endpoint(request, proxy_harness) -> Endpoint:
 # gets its own counter, its own proxy_harness, its own session_dir, its
 # own listen port, and its own bucket pool. Don't "fix" this with
 # multiprocessing locks or a shared file: there is nothing shared to
-# coordinate. The only constraint is BUCKET_POOL_SIZE >= max sequential
-# bucket uses per single test (today: 1).
+# coordinate.
+#
+# Constraint: BUCKET_POOL_SIZE must be >= the number of *concurrent* bucket
+# leases per test (today: 1, enforced by pytest's per-name fixture caching
+# — `bucket` and `bucket_fs` share one `_leased_bucket` instance). If a
+# future test introduces a second-bucket factory fixture, raise the pool
+# size accordingly: the modulo in `_leased_bucket` would otherwise let two
+# concurrent leases collide on the same data dir.
 _bucket_counter = 0
 
 
 @pytest.fixture
 def _leased_bucket(proxy_harness) -> tuple[str, BackendFs]:
-    """Lease one bucket from the pool, wipe its data dir, return (name, fs).
+    """Lease one bucket from the pool, wipe its *contents*, return (name, fs).
 
-    Cleanup-before-yield (not after) lets a failed test leave debris on
-    disk for inspection while still giving the next test a clean slate.
-    Tests should depend on `bucket` and/or `bucket_fs` rather than this
-    fixture directly.
+    The data dir itself is preserved (it was created at session start by
+    `add_bucket`); only the children are removed so the next test starts
+    with an empty bucket. Cleanup-before-yield (not after) lets a failed
+    test leave debris on disk for inspection while still giving the next
+    test a clean slate. Tests should depend on `bucket` and/or `bucket_fs`
+    rather than this fixture directly.
     """
     global _bucket_counter
     idx = _bucket_counter % BUCKET_POOL_SIZE
@@ -234,6 +277,13 @@ def _leased_bucket(proxy_harness) -> tuple[str, BackendFs]:
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child)
             else:
+                # Restore mode in case a prior test chmod'd it 0o000 — unlink
+                # only needs write on the parent, but symlinks et al. don't
+                # need any mode change. Try mode-restore best-effort.
+                try:
+                    child.chmod(0o644)
+                except (OSError, NotImplementedError):
+                    pass
                 child.unlink()
     else:
         data_dir.mkdir(parents=True)
