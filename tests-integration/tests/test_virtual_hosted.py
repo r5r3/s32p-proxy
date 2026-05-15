@@ -41,15 +41,16 @@ def test_virtual_hosted_put_get_roundtrip(client, bucket):
 
 def test_virtual_hosted_endpoint_url_uses_suffix(client, bucket):
     """Sanity check on the harness wiring: with virtual addressing,
-    the boto3 client's endpoint URL must point at the suffix host (so the
-    SDK can prepend the bucket label) and not at loopback."""
+    the client's endpoint URL must point at the suffix host (so the SDK
+    can prepend the bucket label) and not at loopback. Adapter-specific
+    introspection — gated by name."""
     _skip_unless_virtual(client)
-    # boto3 stashes the endpoint on the client meta; not exercised by other
-    # tests so cross-check it here. Not all adapters expose this — gate
-    # by name.
-    if client.name != "boto3":
-        pytest.skip("endpoint introspection only implemented for boto3")
-    endpoint_url = client._s3.meta.endpoint_url
+    if client.name == "boto3":
+        endpoint_url = client._s3.meta.endpoint_url
+    elif client.name == "aws-cli":
+        endpoint_url = client._endpoint_url
+    else:
+        pytest.skip(f"endpoint introspection not implemented for {client.name}")
     assert "127.0.0.1.nip.io" in endpoint_url, (
         f"expected suffix in endpoint_url for virtual mode, got {endpoint_url!r}"
     )

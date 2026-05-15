@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .base import (
     Conditions,
@@ -66,6 +66,7 @@ class AwsCliClient(S3Client):
     name = "aws-cli"
     capabilities = {
         Capability.PATH_STYLE,
+        Capability.VIRTUAL_HOSTED,
         Capability.RANGE_REQUESTS,
         Capability.LIST_V1,
         Capability.LIST_V2,
@@ -76,13 +77,32 @@ class AwsCliClient(S3Client):
         Capability.MULTIPART,
         Capability.CONDITIONAL_REQUESTS,
         # Skipped for now (each is a follow-up):
-        # - VIRTUAL_HOSTED   needs ~/.aws/config addressing_style or env tweak
         # - OBJECT_ACL/BUCKET_ACL  can be added once we have a representative ACL doc shape
         # - PRESIGN_GET      `aws s3 presign` (not s3api); separate code path
     }
 
+    # `aws s3api` has no per-command addressing-style flag — the only knob
+    # is `s3.addressing_style` in the AWS config file. We write a temp INI
+    # once and point AWS_CONFIG_FILE at it for every virtual-mode call.
+    # Class-level cache: contents are constant so every instance shares
+    # one file. Leaked at process exit (tiny; /tmp will rotate it).
+    _virtual_config_path: ClassVar[str | None] = None
+
+    @classmethod
+    def _ensure_virtual_config(cls) -> str:
+        if cls._virtual_config_path is None:
+            fd, path = tempfile.mkstemp(prefix="s32p-aws-cfg-", suffix=".ini")
+            with os.fdopen(fd, "w") as fh:
+                fh.write("[default]\ns3 =\n    addressing_style = virtual\n")
+            cls._virtual_config_path = path
+        return cls._virtual_config_path
+
     def __init__(self, endpoint: Endpoint, *, addressing: str = "path"):
         super().__init__(endpoint, addressing=addressing)
+        self._endpoint_url = endpoint.url_for_addressing(addressing)
+        self._config_path: str | None = (
+            self._ensure_virtual_config() if addressing == "virtual" else None
+        )
 
     # ----------------------------------------------------------------- helpers
 
@@ -94,6 +114,8 @@ class AwsCliClient(S3Client):
         # Drop session token if the host env happens to have one — would
         # confuse SigV4.
         env.pop("AWS_SESSION_TOKEN", None)
+        if self._config_path is not None:
+            env["AWS_CONFIG_FILE"] = self._config_path
         return env
 
     def _run(
@@ -104,7 +126,7 @@ class AwsCliClient(S3Client):
         """Run `aws s3api <args>` and return parsed JSON (or None on empty stdout)."""
         cmd = [
             "aws", "s3api", *args,
-            "--endpoint-url", self.endpoint.base_url,
+            "--endpoint-url", self._endpoint_url,
             "--no-paginate",
             "--output", "json",
         ]
