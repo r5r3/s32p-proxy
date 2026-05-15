@@ -677,14 +677,11 @@ fn parse_bucket_key_auto(
     // Virtual-hosted-style detection:
     // - Host header format: bucket.suffix (where suffix is in virtual_hosted_suffixes)
     // - Path contains only the key (no bucket)
-    // - Not applicable for ListBuckets (GET /)
+    //
+    // We check virtual-hosted *before* the GET / shortcut: ListObjects on a
+    // virtual host is `GET /` plus query params, and that must yield the
+    // bucket-from-host, not get short-circuited to ListBuckets.
 
-    if method == "GET" && uri.path() == "/" {
-        // ListBuckets always uses path-style (no bucket in path)
-        return (None, None, false);
-    }
-
-    // Try to detect virtual-hosted-style using configured suffixes
     if let Some(host) = headers.and_then(|h| h.get("host").and_then(|v| v.to_str().ok())) {
         // Remove port number if present (e.g., "bucket.suffix:9000" -> "bucket.suffix")
         let host_without_port = host.split(':').next().unwrap_or(host);
@@ -716,7 +713,13 @@ fn parse_bucket_key_auto(
         }
     }
 
-    // Default to path-style parsing
+    // No virtual-hosted match — fall through to path-style.
+    if method == "GET" && uri.path() == "/" {
+        // ListBuckets: no bucket in the request, listing is over all
+        // buckets visible to the caller.
+        return (None, None, false);
+    }
+
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     (bucket, key, false)
 }

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pwd
 import shutil
+import socket
 import uuid
 from pathlib import Path
 
@@ -33,6 +34,13 @@ from s32p_test.proxy import ProxyHarness
 TEST_ACCESS_KEY = "TESTACCESSKEY123"
 TEST_SECRET_KEY = "TESTSECRETKEY456"  # noqa: S105 (test fixture, not a real secret)
 BUCKET_POOL_SIZE = 8
+
+# nip.io is wildcard DNS that resolves "<anything>.<ip>.nip.io" to <ip>.
+# We use it for virtual-hosted-style tests so boto3 can issue requests
+# like `https://<bucket>.127.0.0.1.nip.io:<port>/key` while the proxy
+# still listens on plain loopback. Requires DNS at test time; gated
+# behind --addressing including virtual.
+VIRTUAL_HOSTED_SUFFIX = "127.0.0.1.nip.io"
 
 
 # ----------------------------------------------------------------- CLI options
@@ -169,6 +177,25 @@ def client(_client_cls, _client_addressing, endpoint, request):
 # ----------------------------------------------------------------- harness fixtures
 
 
+def _virtual_hosted_dns_works(suffix: str) -> bool:
+    """Probe whether wildcard DNS for a virtual-hosted suffix resolves.
+
+    The probed name is `s32p-dns-probe.<suffix>` — a label that does not
+    actually need to exist server-side, only to resolve via wildcard DNS
+    (e.g. nip.io). We accept any successful resolution to a 127.0.0.0/8
+    address; an unrelated A record would mean DNS is being intercepted
+    and tests would fail in confusing ways.
+    """
+    try:
+        infos = socket.getaddrinfo(f"s32p-dns-probe.{suffix}", None)
+    except OSError:
+        return False
+    for family, _socktype, _proto, _canon, sockaddr in infos:
+        if family == socket.AF_INET and sockaddr[0].startswith("127."):
+            return True
+    return False
+
+
 @pytest.fixture(scope="session")
 def proxy_harness(tmp_path_factory, request) -> ProxyHarness:
     """Session-scoped: spawn one proxy, seed the directory, tear down at end.
@@ -183,7 +210,20 @@ def proxy_harness(tmp_path_factory, request) -> ProxyHarness:
     session_dir = tmp_path_factory.mktemp("s32p")
     me = pwd.getpwuid(os.getuid())
 
-    harness = ProxyHarness(session_dir=session_dir)
+    # Activate virtual-hosted-style addressing only when --addressing asks
+    # for it — otherwise a path-only run would acquire a DNS dependency it
+    # doesn't need.
+    addressing_opt = request.config.getoption("--addressing")
+    needs_virtual = addressing_opt in ("virtual", "both")
+    if needs_virtual and not _virtual_hosted_dns_works(VIRTUAL_HOSTED_SUFFIX):
+        pytest.skip(
+            f"virtual addressing requested but wildcard DNS for "
+            f"{VIRTUAL_HOSTED_SUFFIX} does not resolve to loopback "
+            "(likely no internet / blocked DNS); rerun with --addressing=path"
+        )
+    suffixes = (VIRTUAL_HOSTED_SUFFIX,) if needs_virtual else ()
+
+    harness = ProxyHarness(session_dir=session_dir, virtual_hosted_suffixes=suffixes)
     harness.directory.add_user(User(
         access_key=TEST_ACCESS_KEY,
         secret_key=TEST_SECRET_KEY,

@@ -110,13 +110,42 @@ class S3Error(Exception):
 
 @dataclass(slots=True)
 class Endpoint:
-    base_url: str          # e.g. "http://127.0.0.1:9000"
+    base_url: str          # e.g. "http://127.0.0.1:9000"  (path-style default)
     region: str
     access_key: str
     secret_key: str
-    # If set, virtual-hosted-style addressing is available; the adapter
-    # rewrites the request URL when `addressing="virtual"`.
+    # If set, virtual-hosted-style addressing is available. Value is the
+    # host suffix (e.g. "127.0.0.1.nip.io") that the proxy was told about
+    # via `server.virtual_hosted_suffixes`. The adapter feeds an endpoint
+    # URL constructed from this suffix to its SDK so the SDK's URL
+    # rewriter prepends the bucket as a host label.
     virtual_hosted_suffix: str | None = None
+
+    def url_for_addressing(self, addressing: str) -> str:
+        """Return the endpoint URL the SDK should be configured with for a
+        given addressing mode.
+
+        path: returns `base_url` unchanged — the SDK puts the bucket in the
+              first path segment and the Host header stays as the bare IP.
+        virtual: returns `base_url` with the host swapped for
+                 `virtual_hosted_suffix` (port preserved). The SDK's
+                 virtual-hosted URL rewriter will then build
+                 `https://<bucket>.<suffix>:<port>/<key>`.
+        """
+        if addressing == "path":
+            return self.base_url
+        if addressing != "virtual":
+            raise ValueError(f"unknown addressing: {addressing!r}")
+        if self.virtual_hosted_suffix is None:
+            raise ValueError(
+                "virtual addressing requires endpoint.virtual_hosted_suffix"
+            )
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(self.base_url)
+        netloc = self.virtual_hosted_suffix
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunparse(parsed._replace(netloc=netloc))
 
 
 # ---------------------------------------------------------------- ABC

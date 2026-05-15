@@ -52,7 +52,7 @@ class Boto3Client(S3Client):
         super().__init__(endpoint, addressing=addressing)
         self._s3: Boto3S3 = boto3.client(
             "s3",
-            endpoint_url=endpoint.base_url,
+            endpoint_url=endpoint.url_for_addressing(addressing),
             region_name=endpoint.region,
             aws_access_key_id=endpoint.access_key,
             aws_secret_access_key=endpoint.secret_key,
