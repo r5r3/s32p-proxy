@@ -40,10 +40,6 @@ pub struct WorkerManager {
     server_cfg:      ServerConfig,
     slots:           DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
     sweeper_started: AtomicBool,
-    /// Random per-proxy-process suffix used to disambiguate UDS run dirs.
-    /// Multiple proxy instances on the same host would otherwise collide on
-    /// `<uds_run_dir>/<uid>/` when they share a worker uid.
-    instance_id:     String,
 }
 
 struct WorkerSlot {
@@ -142,14 +138,11 @@ impl WorkerHandle {
 
 impl WorkerManager {
     pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig) -> Arc<Self> {
-        let instance_id = gen_instance_id();
-        tracing::info!(instance_id = %instance_id, "worker manager instance id");
         Arc::new(Self {
             cfg,
             server_cfg,
             slots: DashMap::new(),
             sweeper_started: AtomicBool::new(false),
-            instance_id,
         })
     }
 
@@ -331,8 +324,13 @@ impl WorkerManager {
                     anyhow!("workers.upstream.uds_run_dir missing (required for uds)")
                 })?;
 
+                // Per-worker random suffix. Two access keys can map to the
+                // same uid (CLAUDE.md design) — and a stale worker for the
+                // same (uid, profile) might still be torn down — so the
+                // socket path needs more than uid+profile to stay unique.
+                let worker_id = gen_instance_id();
                 let sock_path =
-                    uds_socket_path(base, user.uid, user.gid, &self.instance_id, profile_name)
+                    uds_socket_path(base, user.uid, user.gid, &worker_id, profile_name)
                         .with_context(|| {
                             format!(
                                 "failed to build uds socket path for uid={} profile={profile_name}",
@@ -340,7 +338,9 @@ impl WorkerManager {
                             )
                         })?;
 
-                // Remove stale socket file from a previous crash/restart
+                // Per-worker dir is fresh, so there should be no prior socket;
+                // the remove is belt-and-suspenders for the (very unlikely)
+                // case of suffix collision after a crash that didn't clean up.
                 let _ = std::fs::remove_file(&sock_path);
 
                 WorkerEndpoint::Uds(sock_path)
@@ -745,31 +745,34 @@ fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Create /run/s32p/<uid>-<instance_id>/ and return the socket path <profile>.sock.
+/// Create /run/s32p/<uid>-<worker_id>/ and return the socket path <profile>.sock.
 /// The directory must be writable by the worker user because the worker creates/binds the socket file.
 /// When the proxy is root, we chown the per-uid dir to (uid, gid) so the worker (which restricted-exec
 /// switches into) can bind. When the proxy is not root, the dir is created as the proxy's own uid
 /// (which is also the worker's uid in that mode), so chown is a no-op.
 ///
-/// The `<instance_id>` suffix is a per-proxy-process random string so that multiple proxy
-/// instances on the same host (sharing the same worker uid) don't collide on the run dir.
+/// `<worker_id>` is a per-worker random string. It serves two purposes:
+///   - Disambiguates concurrent proxy processes on the same host that share a worker uid.
+///   - Disambiguates workers that share `(uid, profile)` within a single proxy — which
+///     happens when two access keys map to the same uid (a documented design point).
 fn uds_socket_path(
     base: &str,
     uid: u32,
     gid: u32,
-    instance_id: &str,
+    worker_id: &str,
     profile: &str,
 ) -> Result<PathBuf> {
-    let dir = Path::new(base).join(format!("{uid}-{instance_id}"));
+    let dir = Path::new(base).join(format!("{uid}-{worker_id}"));
     ensure_dir(&dir, 0o700)?;
     chown_if_root(&dir, uid, gid)?;
     Ok(dir.join(format!("{profile}.sock")))
 }
 
 /// 8-char lowercase-hex random suffix from `getrandom(2)`, with a deterministic
-/// fallback (PID + boot-time nanos) if the syscall is unavailable. The fallback
-/// is good enough for uniqueness among concurrently running proxies on the same
-/// host, which is what this suffix is for.
+/// fallback (PID XOR boot-time nanos) if the syscall is unavailable. Used as
+/// the per-worker disambiguator in UDS socket paths — 32 bits is enough that
+/// concurrently-spawned workers within one proxy collide with negligible
+/// probability (~10⁻⁶ at 100 workers via birthday bound).
 fn gen_instance_id() -> String {
     let mut buf = [0u8; 4];
     let rc = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
