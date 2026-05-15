@@ -41,6 +41,8 @@ class Boto3Client(S3Client):
         Capability.BUCKET_ACL,
         Capability.PRESIGN_GET,
         Capability.PRESIGN_PUT,
+        Capability.PRESIGN_HEAD,
+        Capability.PRESIGN_DELETE,
         Capability.UNSIGNED_PAYLOAD,
         Capability.CONDITIONAL_REQUESTS,
         # RENAME_OBJECT intentionally not advertised: boto3's S3Control client
@@ -240,6 +242,20 @@ class Boto3Client(S3Client):
     def presign_put(self, bucket: str, key: str, *, expires: int = 60) -> str:
         return self._s3.generate_presigned_url(
             "put_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
+    def presign_head(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        return self._s3.generate_presigned_url(
+            "head_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
+    def presign_delete(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        return self._s3.generate_presigned_url(
+            "delete_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires,
         )

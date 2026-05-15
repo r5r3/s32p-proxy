@@ -34,6 +34,8 @@ class Capability(Enum):
     # Signing
     PRESIGN_GET = auto()
     PRESIGN_PUT = auto()
+    PRESIGN_HEAD = auto()
+    PRESIGN_DELETE = auto()
     UNSIGNED_PAYLOAD = auto()
 
     # Conditional requests (If-Match / If-None-Match / If-Modified-Since /

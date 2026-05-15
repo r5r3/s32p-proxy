@@ -286,3 +286,9 @@ class S3Client(ABC):
         """Generate a presigned URL for PUT. The body itself is uploaded
         unsigned (`UNSIGNED-PAYLOAD`) — that's how presign normally works."""
         raise NotImplementedError(f"{self.name}: PRESIGN_PUT not implemented")
+
+    def presign_head(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        raise NotImplementedError(f"{self.name}: PRESIGN_HEAD not implemented")
+
+    def presign_delete(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        raise NotImplementedError(f"{self.name}: PRESIGN_DELETE not implemented")

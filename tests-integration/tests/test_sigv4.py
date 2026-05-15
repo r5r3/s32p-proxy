@@ -94,6 +94,35 @@ def test_presigned_put_succeeds(client, bucket, bucket_fs):
     assert bucket_fs.read("presign-put.bin") == body
 
 
+@pytest.mark.requires_capability(Capability.PRESIGN_HEAD)
+def test_presigned_head_succeeds(client, bucket, bucket_fs):
+    """Presigned HEAD: same code path as GET on the proxy, exercised with
+    a different verb. Body comes back empty; Content-Length header
+    reflects the object size."""
+    body = b"head me" * 100
+    bucket_fs.write("presign-head.bin", body)
+
+    url = client.presign_head(bucket, "presign-head.bin", expires=60)
+    resp = requests.head(url, timeout=10)
+    assert resp.status_code == 200, resp.text
+    assert int(resp.headers["Content-Length"]) == len(body)
+    assert resp.content == b""
+
+
+@pytest.mark.requires_capability(Capability.PRESIGN_DELETE)
+def test_presigned_delete_succeeds(client, bucket, bucket_fs):
+    """Presigned DELETE: object must be gone from disk after the request."""
+    bucket_fs.write("presign-delete.bin", b"transient")
+    assert bucket_fs.exists("presign-delete.bin")
+
+    url = client.presign_delete(bucket, "presign-delete.bin", expires=60)
+    resp = requests.delete(url, timeout=10)
+    assert resp.status_code in (200, 204), resp.text
+    assert not bucket_fs.exists("presign-delete.bin"), (
+        "DELETE returned success but file still on disk"
+    )
+
+
 # ----------------------------------------------------------------- positive: unsigned payload
 
 
@@ -199,6 +228,116 @@ def test_presigned_get_modified_signature_rejected(client, bucket, bucket_fs):
     )
 
 
+@pytest.mark.requires_capability(Capability.PRESIGN_PUT)
+def test_presigned_put_after_expiry_rejected(client, bucket, bucket_fs):
+    """Mirror of the GET expiry test, on the write side. Same
+    before/after pattern: pre-expiry PUT must succeed; post-expiry must
+    fail with AccessDenied / 'Request has expired' so the client knows
+    to refresh the URL rather than re-sign."""
+    url = client.presign_put(bucket, "put-expires.bin", expires=1)
+
+    pre = requests.put(url, data=b"in-window", timeout=10)
+    assert pre.status_code == 200, (
+        f"sanity: presigned PUT must work before expiry, "
+        f"got {pre.status_code}: {pre.text}"
+    )
+
+    time.sleep(1.5)
+
+    post = requests.put(url, data=b"too-late", timeout=10)
+    assert post.status_code == 403, (
+        f"expected 403 after expiry, got {post.status_code}: {post.text}"
+    )
+    body_lc = post.text.lower()
+    assert "<code>accessdenied</code>" in body_lc, post.text[:400]
+    assert "expired" in body_lc, post.text[:400]
+    # Filesystem must hold the pre-expiry write but not the post-expiry one.
+    assert bucket_fs.read("put-expires.bin") == b"in-window"
+
+
+@pytest.mark.requires_capability(Capability.PRESIGN_PUT)
+def test_presigned_put_modified_signature_rejected(client, bucket, bucket_fs):
+    """Tampering with X-Amz-Signature on a presigned PUT must reject
+    BEFORE the body is written to the bucket."""
+    url = client.presign_put(bucket, "put-sig-flip.bin", expires=60)
+    mangled = _mangle_query_param(url, "X-Amz-Signature")
+
+    resp = requests.put(mangled, data=b"should-not-land", timeout=10)
+    assert resp.status_code == 403, (
+        f"expected 403 on bad signature, got {resp.status_code}: {resp.text}"
+    )
+    assert not bucket_fs.exists("put-sig-flip.bin"), (
+        "tampered presigned PUT was rejected but the body still landed"
+    )
+
+
+# ---------- presigned URL: cross-method / cross-path / cross-host swap ----------
+#
+# All three are forms of "the request that arrived doesn't match the request
+# that was signed". The signature covers the method, the canonical URI (path),
+# and a fixed list of headers (always including 'host'). Any of these
+# differing must invalidate the signature.
+
+
+@pytest.mark.requires_capability(Capability.PRESIGN_GET)
+def test_presigned_get_method_swapped_to_put_rejected(client, bucket, bucket_fs):
+    """Sign for GET, send PUT. The HTTP method is part of the canonical
+    request, so the signatures must not match. A server that didn't
+    include the method in canonicalization would let this through —
+    catastrophic for a presigned-URL world where GET URLs are routinely
+    shared as 'read-only' tokens."""
+    bucket_fs.write("method-swap.bin", b"original")
+
+    url = client.presign_get(bucket, "method-swap.bin", expires=60)
+    resp = requests.put(url, data=b"hijacked", timeout=10)
+    assert resp.status_code == 403, (
+        f"GET-signed URL accepted as PUT (status {resp.status_code}): "
+        f"{resp.text[:300]}"
+    )
+    # Original file content must be untouched.
+    assert bucket_fs.read("method-swap.bin") == b"original"
+
+
+@pytest.mark.requires_capability(Capability.PRESIGN_GET)
+def test_presigned_get_path_modified_rejected(client, bucket, bucket_fs):
+    """Sign for /a, send to /b. The canonical URI is signed, so swapping
+    keys on a presigned URL must fail. Common attacker shape: harvest a
+    presigned URL from a log, retarget to a sibling object."""
+    bucket_fs.write("intended.bin", b"intended")
+    bucket_fs.write("sibling.bin", b"sibling-untouched")
+
+    url = client.presign_get(bucket, "intended.bin", expires=60)
+    swapped = _replace_path_segment(url, "intended.bin", "sibling.bin")
+
+    resp = requests.get(swapped, timeout=10)
+    assert resp.status_code == 403, (
+        f"path-swapped presigned URL not rejected (status {resp.status_code}): "
+        f"{resp.text[:300]}"
+    )
+
+
+@pytest.mark.requires_capability(Capability.PRESIGN_GET)
+def test_presigned_get_host_modified_rejected(client, bucket, bucket_fs):
+    """The Host header is always in SignedHeaders; sending the request
+    with a different Host than was signed must reject with 403."""
+    bucket_fs.write("host-swap.bin", b"x")
+
+    url = client.presign_get(bucket, "host-swap.bin", expires=60)
+    # We connect to the proxy normally (URL.host = 127.0.0.1) but send a
+    # different Host header. boto3 included `host: 127.0.0.1:<port>` in
+    # the canonical request, so the proxy's recomputed signature won't
+    # match what we sent.
+    resp = requests.get(
+        url,
+        headers={"Host": "evil.example.com"},
+        timeout=10,
+    )
+    assert resp.status_code == 403, (
+        f"host-swapped presigned URL not rejected (status {resp.status_code}): "
+        f"{resp.text[:300]}"
+    )
+
+
 # ----------------------------------------------------------------- negative: header SigV4
 
 
@@ -283,6 +422,16 @@ def _now_amz_date() -> str:
 def _empty_sha256() -> str:
     # SHA-256 of the empty byte string, the canonical hash for body-less GETs.
     return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _replace_path_segment(url: str, old: str, new: str) -> str:
+    """Swap a literal segment of the URL path (leaving query untouched).
+    Used by the path-swap tamper test — preserves the X-Amz-* signature
+    block so the only difference vs the signed request is the resource."""
+    p = urlparse(url)
+    if old not in p.path:
+        raise AssertionError(f"path {p.path!r} does not contain {old!r}")
+    return urlunparse(p._replace(path=p.path.replace(old, new, 1)))
 
 
 def _add_query_param(url: str, key: str, value: str) -> str:
