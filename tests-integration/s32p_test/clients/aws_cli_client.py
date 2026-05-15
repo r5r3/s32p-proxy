@@ -76,9 +76,11 @@ class AwsCliClient(S3Client):
         Capability.UNSIGNED_PAYLOAD,
         Capability.MULTIPART,
         Capability.CONDITIONAL_REQUESTS,
+        Capability.PRESIGN_GET,
         # Skipped for now (each is a follow-up):
         # - OBJECT_ACL/BUCKET_ACL  can be added once we have a representative ACL doc shape
-        # - PRESIGN_GET      `aws s3 presign` (not s3api); separate code path
+        # - PRESIGN_PUT      `aws s3 presign` produces GET URLs only; PUT presign
+        #                    is not exposed by the CLI without manual signing.
     }
 
     # `aws s3api` has no per-command addressing-style flag — the only knob
@@ -375,6 +377,25 @@ class AwsCliClient(S3Client):
             "--key", key,
             "--upload-id", upload_id,
         )
+
+    # ----- presign -----
+
+    def presign_get(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        """Uses `aws s3 presign` (NOT s3api). The CLI emits the URL on
+        stdout; no JSON wrapping. Goes through a different command tree
+        than _run, so it shells out directly."""
+        cmd = [
+            "aws", "s3", "presign",
+            f"s3://{bucket}/{key}",
+            "--endpoint-url", self._endpoint_url,
+            "--expires-in", str(expires),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, env=self._env(), timeout=30,
+        )
+        if result.returncode != 0:
+            raise self._parse_error(result.stderr.decode("utf-8", "replace"))
+        return result.stdout.decode("utf-8").strip()
 
 
 def _quote_etag(value: str) -> str:

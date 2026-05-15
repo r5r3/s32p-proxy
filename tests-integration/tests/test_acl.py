@@ -1,10 +1,11 @@
 """ACL evaluation.
 
-CLAUDE.md pins the contract:
+Contract (see `crates/s32p-directory/src/directory/{yaml,openbao}.rs`
+`effective_access` and `crates/s32p-proxy/src/main.rs` `bucket_access_for_caller`):
 
     Effective access for a caller is the *max* of all matching ACL entries
     (read_write beats read_only). Principals can be access_key or group_name
-    (POSIX group resolved at runtime).
+    (POSIX group resolved at runtime via `posix_groups::groups_for_user`).
 
 These tests cover the externally observable consequences:
 

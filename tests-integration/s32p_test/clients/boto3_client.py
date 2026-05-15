@@ -237,6 +237,13 @@ class Boto3Client(S3Client):
             ExpiresIn=expires,
         )
 
+    def presign_put(self, bucket: str, key: str, *, expires: int = 60) -> str:
+        return self._s3.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires,
+        )
+
     # ----- multipart -----
 
     def create_multipart(self, bucket: str, key: str) -> str:

@@ -84,6 +84,10 @@ pub fn verify_sigv4_request_any(
     const CLIENT_MSG_BAD_SIG: &str =
         "the request signature we calculated does not match the signature you provided";
     const CLIENT_MSG_NO_AUTH: &str = "request is missing authentication information";
+    // AWS S3 returns AccessDenied with "Request has expired" for an expired
+    // presigned URL — distinct from SignatureDoesNotMatch so clients know to
+    // refresh the URL rather than re-sign.
+    const CLIENT_MSG_EXPIRED: &str = "Request has expired";
 
     // Header-style SigV4
     if headers.get("authorization").is_some() {
@@ -143,10 +147,16 @@ pub fn verify_sigv4_request_any(
     }
 
     if let Err(e) = verify_sigv4_presigned_url(method, uri, headers, &auth, secret_key) {
-        return Err(SigV4Rejection {
-            response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
-            reason:   e.to_string(),
-        });
+        let reason = e.to_string();
+        // Map an expired URL to AccessDenied/"Request has expired" so the
+        // client can distinguish "URL aged out, refresh it" from "signature
+        // is wrong, re-sign". Anything else stays SignatureDoesNotMatch.
+        let response = if reason.contains("expired") {
+            crate::s3resp::access_denied(CLIENT_MSG_EXPIRED, resource)
+        } else {
+            crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource)
+        };
+        return Err(SigV4Rejection { response, reason });
     }
 
     Ok(())

@@ -325,9 +325,10 @@ impl WorkerManager {
                 })?;
 
                 // Per-worker random suffix. Two access keys can map to the
-                // same uid (CLAUDE.md design) — and a stale worker for the
-                // same (uid, profile) might still be torn down — so the
-                // socket path needs more than uid+profile to stay unique.
+                // same uid by design (workers are keyed by (access_key,
+                // profile), not uid — see `WorkerKey`) — and a stale worker
+                // for the same (uid, profile) might still be torn down — so
+                // the socket path needs more than uid+profile to stay unique.
                 let worker_id = gen_instance_id();
                 let sock_path =
                     uds_socket_path(base, user.uid, user.gid, &worker_id, profile_name)
