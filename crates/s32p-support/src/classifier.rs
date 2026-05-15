@@ -255,6 +255,51 @@ impl QueryParams {
     }
 }
 
+impl S3Op {
+    /// True for ops that mutate bucket or object state.
+    ///
+    /// Used by both proxy and gateway to decide whether ACL access-level
+    /// applies (a `read_only` grant must reject writes). More precise than
+    /// dispatching on the HTTP method alone — `Multipart::ListParts` and
+    /// `Multipart::ListMultipartUploads` are GET-style reads even though
+    /// they live under the `Multipart` family, and `S3Op::Other` may be a
+    /// PUT/POST/DELETE we don't classify.
+    ///
+    /// `Unknown` sub-variants and `Other` are treated as writes so a
+    /// `read_only` caller cannot slip an unrecognized op through.
+    pub fn needs_write(&self) -> bool {
+        match self {
+            S3Op::Read(_) => false,
+            S3Op::Write(_) => true,
+            S3Op::Multipart(op) => match op {
+                MultipartOp::ListParts { .. } | MultipartOp::ListMultipartUploads => false,
+                MultipartOp::CreateMultipartUpload
+                | MultipartOp::UploadPart { .. }
+                | MultipartOp::CompleteMultipartUpload { .. }
+                | MultipartOp::AbortMultipartUpload { .. }
+                | MultipartOp::Unknown => true,
+            },
+            S3Op::Versioning(op) => match op {
+                VersioningOp::GetBucketVersioning
+                | VersioningOp::ListObjectVersions
+                | VersioningOp::ObjectWithVersionId { .. } => false,
+                VersioningOp::PutBucketVersioning | VersioningOp::Unknown => true,
+            },
+            S3Op::ObjectLock(op) => match op {
+                ObjectLockOp::GetBucketObjectLockConfiguration
+                | ObjectLockOp::GetObjectRetention
+                | ObjectLockOp::GetObjectLegalHold => false,
+                ObjectLockOp::PutBucketObjectLockConfiguration
+                | ObjectLockOp::PutObjectRetention
+                | ObjectLockOp::PutObjectLegalHold
+                | ObjectLockOp::Unknown => true,
+            },
+            S3Op::BucketAdmin(_) => true,
+            S3Op::Other => true,
+        }
+    }
+}
+
 /// Convert a parsed class into a stable routing key used by config/routing.
 /// This keeps the routing table simple (multipart/versioning/getobject/other).
 pub fn class_key(class: &S3RequestClass) -> &'static str {
@@ -722,4 +767,125 @@ fn parse_bucket_key_auto(
 
     let (bucket, key) = parse_bucket_key_path_style(uri.path());
     (bucket, key, false)
+}
+
+#[cfg(test)]
+mod needs_write_tests {
+    use super::*;
+
+    #[test]
+    fn read_ops_are_not_writes() {
+        for op in [
+            ReadOp::ListBuckets,
+            ReadOp::GetObject,
+            ReadOp::HeadObject,
+            ReadOp::HeadBucket,
+            ReadOp::GetBucketLocation,
+            ReadOp::ListObjectsV2,
+            ReadOp::ListObjectsV1,
+            ReadOp::GetObjectAcl,
+            ReadOp::GetBucketAcl,
+        ] {
+            assert!(!S3Op::Read(op.clone()).needs_write(), "Read({op:?}) should not be write");
+        }
+    }
+
+    #[test]
+    fn write_ops_are_writes() {
+        for op in [
+            WriteOp::PutObject,
+            WriteOp::CopyObject,
+            WriteOp::RenameObject,
+            WriteOp::DeleteObject,
+            WriteOp::DeleteObjects,
+            WriteOp::PutObjectAcl,
+            WriteOp::PutBucketAcl,
+        ] {
+            assert!(S3Op::Write(op.clone()).needs_write(), "Write({op:?}) should be write");
+        }
+    }
+
+    #[test]
+    fn multipart_list_ops_are_reads_others_are_writes() {
+        let upload_id = "u".to_string();
+        // reads
+        for op in [
+            MultipartOp::ListParts { upload_id: upload_id.clone() },
+            MultipartOp::ListMultipartUploads,
+        ] {
+            assert!(!S3Op::Multipart(op.clone()).needs_write(), "Multipart({op:?}) should be read");
+        }
+        // writes
+        for op in [
+            MultipartOp::CreateMultipartUpload,
+            MultipartOp::UploadPart { upload_id: upload_id.clone(), part_number: 1 },
+            MultipartOp::CompleteMultipartUpload { upload_id: upload_id.clone() },
+            MultipartOp::AbortMultipartUpload { upload_id: upload_id.clone() },
+            // Unknown is conservatively a write so a read_only caller can't slip
+            // an unrecognized multipart op through.
+            MultipartOp::Unknown,
+        ] {
+            assert!(S3Op::Multipart(op.clone()).needs_write(), "Multipart({op:?}) should be write");
+        }
+    }
+
+    #[test]
+    fn versioning_get_ops_are_reads_put_and_unknown_are_writes() {
+        for op in [
+            VersioningOp::GetBucketVersioning,
+            VersioningOp::ListObjectVersions,
+            VersioningOp::ObjectWithVersionId { version_id: "v1".to_string() },
+        ] {
+            assert!(
+                !S3Op::Versioning(op.clone()).needs_write(),
+                "Versioning({op:?}) should be read"
+            );
+        }
+        for op in [VersioningOp::PutBucketVersioning, VersioningOp::Unknown] {
+            assert!(
+                S3Op::Versioning(op.clone()).needs_write(),
+                "Versioning({op:?}) should be write"
+            );
+        }
+    }
+
+    #[test]
+    fn object_lock_get_ops_are_reads_put_and_unknown_are_writes() {
+        for op in [
+            ObjectLockOp::GetBucketObjectLockConfiguration,
+            ObjectLockOp::GetObjectRetention,
+            ObjectLockOp::GetObjectLegalHold,
+        ] {
+            assert!(
+                !S3Op::ObjectLock(op.clone()).needs_write(),
+                "ObjectLock({op:?}) should be read"
+            );
+        }
+        for op in [
+            ObjectLockOp::PutBucketObjectLockConfiguration,
+            ObjectLockOp::PutObjectRetention,
+            ObjectLockOp::PutObjectLegalHold,
+            ObjectLockOp::Unknown,
+        ] {
+            assert!(
+                S3Op::ObjectLock(op.clone()).needs_write(),
+                "ObjectLock({op:?}) should be write"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_admin_ops_are_writes() {
+        for op in [BucketAdminOp::CreateBucket, BucketAdminOp::DeleteBucket] {
+            assert!(
+                S3Op::BucketAdmin(op.clone()).needs_write(),
+                "BucketAdmin({op:?}) should be write"
+            );
+        }
+    }
+
+    #[test]
+    fn other_is_conservatively_a_write() {
+        assert!(S3Op::Other.needs_write());
+    }
 }

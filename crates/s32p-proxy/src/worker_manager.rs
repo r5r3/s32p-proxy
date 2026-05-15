@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
-use s32p_directory::{BucketView, UserDoc};
+use s32p_directory::{AccessLevel, BucketView, UserDoc};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
@@ -330,14 +330,13 @@ impl WorkerManager {
                 // for the same (uid, profile) might still be torn down — so
                 // the socket path needs more than uid+profile to stay unique.
                 let worker_id = gen_instance_id();
-                let sock_path =
-                    uds_socket_path(base, user.uid, user.gid, &worker_id, profile_name)
-                        .with_context(|| {
-                            format!(
-                                "failed to build uds socket path for uid={} profile={profile_name}",
-                                user.uid
-                            )
-                        })?;
+                let sock_path = uds_socket_path(base, user.uid, user.gid, &worker_id, profile_name)
+                    .with_context(|| {
+                        format!(
+                            "failed to build uds socket path for uid={} profile={profile_name}",
+                            user.uid
+                        )
+                    })?;
 
                 // Per-worker dir is fresh, so there should be no prior socket;
                 // the remove is belt-and-suspenders for the (very unlikely)
@@ -415,6 +414,16 @@ impl WorkerManager {
             "S32P_LOG_UTC_OFFSET_SECS",
             s32p_support::utils::local_utc_offset().whole_seconds().to_string(),
         );
+
+        // Snapshot per-bucket access levels for ACL enforcement inside the
+        // worker. The worker rejects writes against `read_only` buckets;
+        // the staged posix_root already filters out buckets the caller has
+        // no grant on, so this only needs to distinguish ro vs rw. Format
+        // is `name:ro|rw` joined by `,` — S3 bucket names cannot contain
+        // either separator (charset is `[a-z0-9.-]`), so no escaping is
+        // needed. This is a snapshot at spawn; ACL changes apply only when
+        // the worker is restarted (consistent with the staged-symlink set).
+        cmd.env("S32P_BUCKET_ACL", format_bucket_acl(buckets));
 
         // log command and env for debuuging
         tracing::debug!(command = ?cmd, "spawning worker");
@@ -628,6 +637,31 @@ async fn wait_until_ready(endpoint: &WorkerEndpoint, timeout: Duration) -> Resul
     }
 }
 
+/// Render the bucket-ACL snapshot for a freshly-spawned worker.
+///
+/// Format: `name:rw|ro` joined by `,`. The empty string is returned when
+/// the worker has no buckets — the gateway parses an empty value as "no
+/// entries" and applies its default-rw rule (which, with no buckets to
+/// see, also produces no enforcement).
+///
+/// S3 bucket names are restricted by spec to `[a-z0-9.-]` (3-63 chars),
+/// so neither `,` nor `:` can collide with a name and no escaping is
+/// needed. The gateway re-validates each name and drops anything that
+/// doesn't match the S3 charset.
+fn format_bucket_acl(buckets: &[BucketView]) -> String {
+    buckets
+        .iter()
+        .map(|b| {
+            let lvl = match b.access {
+                AccessLevel::ReadOnly => "ro",
+                AccessLevel::ReadWrite => "rw",
+            };
+            format!("{}:{lvl}", b.bucket_name)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn validate_bucket_link_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("bucket name must not be empty"));
@@ -798,4 +832,33 @@ fn hex_lower(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bv(name: &str, access: AccessLevel) -> BucketView {
+        BucketView {
+            bucket_id: format!("bkt-{name}"),
+            bucket_name: name.to_string(),
+            data_path: format!("/srv/{name}"),
+            access,
+        }
+    }
+
+    #[test]
+    fn format_bucket_acl_empty_for_no_buckets() {
+        assert_eq!(format_bucket_acl(&[]), "");
+    }
+
+    #[test]
+    fn format_bucket_acl_renders_ro_and_rw() {
+        let buckets = vec![
+            bv("alpha", AccessLevel::ReadWrite),
+            bv("bravo", AccessLevel::ReadOnly),
+            bv("charlie", AccessLevel::ReadWrite),
+        ];
+        assert_eq!(format_bucket_acl(&buckets), "alpha:rw,bravo:ro,charlie:rw");
+    }
 }

@@ -324,8 +324,8 @@ Group membership is resolved from the OS at runtime (username → gids → group
   - TCP loopback: `127.0.0.1:<port>`
   - Unix domain socket: `<uds_run_dir>/<uid>-<instance_id>/<profile>.sock`
     - `<uds_run_dir>` defaults to `/run/s32p` (root) or `$XDG_RUNTIME_DIR/s32p` (non-root); override per profile via `workers.profiles.<name>.upstream.uds_run_dir`.
-    - `<instance_id>` is a per-proxy-process random suffix so multiple proxy instances on one host don't collide.
-    - One socket file per worker profile under the per-uid run dir.
+    - `<instance_id>` is a per-worker random suffix. It disambiguates concurrent proxy processes on the same host *and* disambiguates workers that share `(uid, profile)` within a single proxy — which happens when two access keys map to the same uid (a documented design point).
+    - One socket file per worker profile under the per-worker run dir.
 - Readiness probing: connect loop until port is reachable
 - Idle shutdown after `idle_timeout_secs`
 - Sweeper removes dead/idle workers periodically (`sweep_interval_secs`)
@@ -793,8 +793,9 @@ Notes:
 
 ACL notes:
 
-- `read_only` vs `read_write` is computed by the proxy for staging and (optionally) future proxy-side enforcement.
-- Actual filesystem enforcement is still done by the kernel permissions of the target user and the bucket data path.
+- `read_only` vs `read_write` is computed by the proxy at worker spawn (via `directory.buckets_for_access_key`) and snapshotted into the worker's `S32P_BUCKET_ACL` environment variable as a `name:rw|ro` list. The worker rejects writes against `read_only` buckets with `AccessDenied` on every request. Buckets not in the snapshot (or an absent snapshot, e.g. when paired with an older proxy) default to `read_write`, preserving prior behavior.
+- The snapshot is captured at spawn time and stays frozen for the worker's lifetime. ACL changes in the directory take effect at the next worker spawn — operators can force a refresh by waiting for `idle_timeout_secs` to expire or by restarting the proxy.
+- Actual filesystem enforcement is still done by the kernel permissions of the target user and the bucket data path; the worker-side ACL check sits on top of that.
 
 ---
 

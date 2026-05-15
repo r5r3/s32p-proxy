@@ -389,13 +389,7 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
     //      itself, never the resolved file.
     let mut do_statx = |flags: libc::c_int| -> i32 {
         unsafe {
-            libc::statx(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                flags,
-                mask,
-                &mut stx as *mut libc::statx,
-            )
+            libc::statx(libc::AT_FDCWD, c_path.as_ptr(), flags, mask, &mut stx as *mut libc::statx)
         }
     };
     let mut rc = do_statx(libc::AT_STATX_DONT_SYNC);

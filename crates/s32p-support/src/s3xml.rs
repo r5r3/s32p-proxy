@@ -168,8 +168,8 @@ pub fn get_acl_body(
     }
 
     let doc = AccessControlPolicyDoc {
-        xmlns: S3_XMLNS,
-        owner: AclOwner {
+        xmlns:               S3_XMLNS,
+        owner:               AclOwner {
             id:           owner_id.to_string(),
             display_name: owner_display_name.to_string(),
         },
@@ -614,9 +614,9 @@ struct LocationConstraintDoc {
 #[serde(rename = "AccessControlPolicy")]
 struct AccessControlPolicyDoc {
     #[serde(rename = "@xmlns")]
-    xmlns: &'static str,
+    xmlns:               &'static str,
     #[serde(rename = "Owner")]
-    owner: AclOwner,
+    owner:               AclOwner,
     #[serde(rename = "AccessControlList")]
     access_control_list: AccessControlList,
 }
@@ -1044,9 +1044,7 @@ pub fn parse_put_acl_request_world_readable(xml: &[u8]) -> Result<bool> {
                 } else if local == b"Permission" {
                     in_permission = false;
                 } else if local == b"Grant" {
-                    let public = current_uri
-                        .as_deref()
-                        .is_some_and(|u| u.contains("AllUsers"));
+                    let public = current_uri.as_deref().is_some_and(|u| u.contains("AllUsers"));
                     let perm = current_permission.as_deref().unwrap_or("");
                     if public
                         && (perm.eq_ignore_ascii_case("READ")

@@ -23,9 +23,7 @@ mod config;
 mod responses;
 mod worker_manager;
 
-use s32p_directory::{
-    AccessLevel, Directory, UserDoc, openbao::OpenBaoDirectory, yaml::YamlDirectory,
-};
+use s32p_directory::{Directory, UserDoc, openbao::OpenBaoDirectory, yaml::YamlDirectory};
 use s32p_support;
 use worker_manager::{WorkerEndpoint, WorkerHandle, WorkerManager};
 
@@ -213,77 +211,11 @@ impl ProxyHttp for S3ProxyApp {
         };
         ctx.set_user(&user);
 
-        // Track whether we've already SigV4-verified this request inside the
-        // proxy. Multiple steps below (ACL pre-check, NotImplemented gate,
-        // pre-spawn gate) used to verify independently — wasted work for
-        // write requests that hit two of these paths. We verify at most
-        // once per request now.
-        let mut sigv4_validated = false;
-
-        // 2a) ACL access-level enforcement.
-        //
-        // Look up the caller's effective access on the request's bucket and
-        // reject early if the request needs write but the grant is read_only.
-        // Doing this before SigV4 validation would leak ACL state to
-        // unauthenticated callers, so it sits *after* user lookup but *before*
-        // the SigV4 verify in 2b/4 — a read_only caller still has to present
-        // a valid signature to learn the request was rejected for ACL reasons.
-        //
-        // ListBuckets has no bucket and is filtered by visibility downstream,
-        // so it's exempt here. For any other request without a recognised
-        // bucket (malformed URL, etc.) we let later layers produce the right
-        // error.
-        if needs_write(method)
-            && let Some(bucket_name) = class.bucket.as_deref()
-        {
-            // First validate the signature so we don't tell unauthenticated
-            // callers anything about the bucket's ACL.
-            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
-                return Ok(true);
-            }
-            sigv4_validated = true;
-            let access = bucket_access_for_caller(
-                self.directory.as_ref(),
-                &access_key,
-                bucket_name,
-            )
-            .await
-            .map_err(|e| {
-                Error::explain(
-                    ErrorType::InternalError,
-                    format!("acl lookup failed: {e:#}"),
-                )
-            })?;
-            if matches!(access, Some(AccessLevel::ReadOnly)) {
-                tracing::info!(
-                    access_key = access_key.as_str(),
-                    bucket = bucket_name,
-                    method = method,
-                    "rejecting write on read_only-granted bucket"
-                );
-                responses::respond_s3_error(
-                    session,
-                    StatusCode::FORBIDDEN,
-                    responses::error_code::ACCESS_DENIED,
-                    "access denied",
-                    Some(req.uri.path()),
-                    None,
-                )
-                .await?;
-                return Ok(true);
-            }
-            // None (no grant) and Some(ReadWrite) both fall through.
-            // No-grant is enforced downstream (the bucket isn't symlinked
-            // into the worker's posix_root); leaving that path unchanged
-            // keeps this commit narrowly scoped to read_only enforcement.
-        }
-
-        // 2b) If routing says NotImplemented: validate first, then reply NotImplemented.
+        // 2a) If routing says NotImplemented: validate SigV4 first, then
+        // reply with NotImplemented. Validating up front prevents
+        // unauthenticated callers from probing the routing table.
         if let config::RouteAction::NotImplemented { message } = action {
-            // Only send NotImplemented for VALID requests.
-            if !sigv4_validated
-                && validate_sigv4_header_only_or_reject(session, &req, &user).await?
-            {
+            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
                 return Ok(true); // already responded with auth/signature error
             }
 
@@ -292,14 +224,18 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(true);
         }
 
-        // 2c) Routing says Proxy: select worker profile
+        // 2b) Routing says Proxy: select worker profile
         let profile = match action {
             config::RouteAction::Proxy { worker_profile } => worker_profile.as_str(),
             config::RouteAction::NotImplemented { .. } => unreachable!(),
         };
         ctx.worker_profile = Some(profile.to_string());
 
-        // 3) If worker already running: NO proxy-side SigV4 verify (just route)
+        // 3) If worker already running: NO proxy-side SigV4 verify (just route).
+        // Applies to both reads and writes: the worker re-validates SigV4 on
+        // every request and now also enforces bucket-ACL access levels using
+        // the snapshot the proxy stages into S32P_BUCKET_ACL at spawn (see
+        // `worker_manager::format_bucket_acl`).
         if let Some(h) = self.workers.get_running(user.access_key.as_str(), profile).await {
             h.touch();
             ctx.upstream = Some(h.endpoint.clone());
@@ -316,11 +252,8 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(false);
         }
 
-        // 4) Worker not running: verify header-only before spawn (unless
-        //    the ACL pre-check in 2a already verified for this request).
-        if !sigv4_validated
-            && validate_sigv4_header_only_or_reject(session, &req, &user).await?
-        {
+        // 4) Worker not running: verify header-only before spawn (anti-DoS gate).
+        if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
             return Ok(true); // already responded with auth/signature error, no spawn
         }
 
@@ -509,37 +442,6 @@ impl ProxyHttp for S3ProxyApp {
             );
         }
     }
-}
-
-/// True for HTTP methods that mutate state on S3.
-///
-/// PUT/POST/DELETE cover every write operation in the S3 surface s32p
-/// implements. The one S3 op that's a POST-but-read is `SelectObjectContent`
-/// (`POST /key?select`), which s32p doesn't classify or implement; if it's
-/// added later, this predicate has to grow a query-param exception so a
-/// read_only caller can still issue Select.
-fn needs_write(method: &str) -> bool {
-    matches!(method, "PUT" | "POST" | "DELETE")
-}
-
-/// Look up the caller's effective access level on a single bucket.
-///
-/// Walks the directory's `buckets_for_access_key` view, which already
-/// folds together access-key + group grants and applies the documented
-/// max-of-principals rule. Returns:
-///   - `Some(level)` if the caller has any grant on the bucket
-///   - `None` if the caller has no matching grant (and so the bucket
-///     should be invisible to them)
-async fn bucket_access_for_caller(
-    directory: &dyn Directory,
-    access_key: &str,
-    bucket_name: &str,
-) -> Result<Option<AccessLevel>> {
-    let buckets = directory.buckets_for_access_key(access_key).await?;
-    Ok(buckets
-        .into_iter()
-        .find(|b| b.bucket_name == bucket_name)
-        .map(|b| b.access))
 }
 
 async fn validate_sigv4_header_only_or_reject(

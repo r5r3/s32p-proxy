@@ -15,10 +15,7 @@ fn owner_only_full_control() {
     let xml_bytes = get_acl_body("1000", "alice", false).unwrap();
     let xml = std::str::from_utf8(&xml_bytes).unwrap();
 
-    assert!(
-        xml.starts_with("<AccessControlPolicy"),
-        "unexpected root element: {xml}"
-    );
+    assert!(xml.starts_with("<AccessControlPolicy"), "unexpected root element: {xml}");
     assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
 
     // Owner block

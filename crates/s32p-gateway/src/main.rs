@@ -13,6 +13,7 @@ mod uring_io;
 mod lustre;
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     fs,
     os::unix::fs::{FileExt, MetadataExt},
@@ -57,6 +58,7 @@ impl PeerAddr {
             PeerAddr::Unix => true,
         }
     }
+
     fn client_label(&self) -> String {
         match self {
             PeerAddr::Tcp(sa) => sa.ip().to_string(),
@@ -83,6 +85,15 @@ type Resp = s32p_support::s3resp::HttpResponse;
 
 // ---- config ----
 
+/// Effective per-bucket access level snapshotted at worker spawn.
+/// The proxy passes this in via `S32P_BUCKET_ACL`; buckets not listed
+/// (and the env var being absent entirely) default to `ReadWrite`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AclLevel {
+    ReadOnly,
+    ReadWrite,
+}
+
 #[derive(Clone)]
 struct Cfg {
     bind_addr:               String,
@@ -101,6 +112,12 @@ struct Cfg {
     #[cfg(feature = "lustre")]
     lustre_max_stripe_count: u32,
     virtual_hosted_suffixes: Vec<String>,
+    /// Snapshot of per-bucket access levels, supplied by the proxy via
+    /// `S32P_BUCKET_ACL`. Entries are looked up by bucket name; absence
+    /// (or absence of the env var entirely) means `ReadWrite` — that
+    /// preserves the historical worker behavior when the proxy doesn't
+    /// pre-stage ACL state.
+    bucket_acl:              HashMap<String, AclLevel>,
 }
 
 fn env_bool(k: &str, default: bool) -> bool {
@@ -114,6 +131,59 @@ fn env_bool(k: &str, default: bool) -> bool {
 
 fn env_usize(k: &str, default: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// True iff `name` matches the S3 bucket-name charset (lowercase letters,
+/// digits, `.`, `-`). This is *not* a full S3 bucket-name validator (no
+/// length check, no rules about leading/trailing chars, no `..` rule) —
+/// just a charset gate so a malformed `S32P_BUCKET_ACL` value can't smuggle
+/// `,` or `:` into a name and silently shift the entry boundary.
+fn is_s3_bucket_name_charset(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+}
+
+/// Parse `S32P_BUCKET_ACL=foo:rw,bar:ro,baz:rw` into a name → level map.
+///
+/// Per-entry parse failures (missing `:`, unknown access value, name fails
+/// the S3 charset check) are skipped with a warning log, leaving the
+/// affected bucket to fall back to the default-rw rule. Empty input yields
+/// an empty map. Bucket name is preserved verbatim (no case folding); S3
+/// bucket names are required to be lowercase by spec, and the proxy emits
+/// them as-is.
+fn parse_bucket_acl(raw: &str) -> HashMap<String, AclLevel> {
+    let mut out = HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((name, level)) = entry.split_once(':') else {
+            tracing::warn!(entry = %entry, "S32P_BUCKET_ACL: entry missing ':' separator, skipping");
+            continue;
+        };
+        let name = name.trim();
+        let level = level.trim();
+        if !is_s3_bucket_name_charset(name) {
+            tracing::warn!(entry = %entry, "S32P_BUCKET_ACL: bucket name fails S3 charset, skipping");
+            continue;
+        }
+        let parsed = match level {
+            "ro" => AclLevel::ReadOnly,
+            "rw" => AclLevel::ReadWrite,
+            other => {
+                tracing::warn!(
+                    entry = %entry, level = %other,
+                    "S32P_BUCKET_ACL: unknown access level (expected ro|rw), skipping"
+                );
+                continue;
+            }
+        };
+        out.insert(name.to_string(), parsed);
+    }
+    out
 }
 
 fn load_cfg() -> Result<Cfg> {
@@ -167,6 +237,14 @@ fn load_cfg() -> Result<Cfg> {
         .map(|s| s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
         .unwrap_or_default();
 
+    // Per-bucket ACL snapshot from the proxy. Absent/empty → empty map →
+    // every bucket the worker sees is treated as read_write (legacy
+    // behavior preserved when paired with an older proxy).
+    let bucket_acl = std::env::var("S32P_BUCKET_ACL")
+        .ok()
+        .map(|s| parse_bucket_acl(&s))
+        .unwrap_or_default();
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -184,6 +262,7 @@ fn load_cfg() -> Result<Cfg> {
         #[cfg(feature = "lustre")]
         lustre_max_stripe_count,
         virtual_hosted_suffixes,
+        bucket_acl,
     })
 }
 
@@ -296,6 +375,28 @@ async fn handle(
             "sigv4 verification failed"
         );
         return Ok(rej.response);
+    }
+
+    // ACL access-level enforcement. The proxy stages this access key's
+    // bucket→level map into S32P_BUCKET_ACL at spawn; any bucket not in
+    // the map (or an absent map entirely) defaults to read_write — that
+    // keeps a fresh worker behaving exactly as before when the proxy
+    // doesn't send the snapshot. ListBuckets has no bucket and is
+    // exempted by `class.bucket.is_none()`. Visibility (no-grant) is
+    // already enforced by the staged posix_root, so the only check left
+    // here is "write against a known-read_only bucket".
+    if class.op.needs_write()
+        && let Some(bucket_name) = class.bucket.as_deref()
+        && matches!(cfg.bucket_acl.get(bucket_name), Some(AclLevel::ReadOnly))
+    {
+        tracing::info!(
+            client = %client_log,
+            access_key = cfg.access_key.as_str(),
+            bucket = bucket_name,
+            method = %method,
+            "rejecting write on read_only-granted bucket"
+        );
+        return Ok(s32p_support::s3resp::access_denied("access denied", Some(req.uri().path())));
     }
 
     let resp = match &class.op {
@@ -716,10 +817,7 @@ async fn handle_get_object_acl(
     let m = match std::fs::metadata(&obj_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key(
-                "object not found",
-                Some(req.uri().path()),
-            );
+            return s32p_support::s3resp::no_such_key("object not found", Some(req.uri().path()));
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -867,10 +965,7 @@ async fn handle_put_object_acl(
     let m = match std::fs::metadata(&obj_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key(
-                "object not found",
-                Some(req.uri().path()),
-            );
+            return s32p_support::s3resp::no_such_key("object not found", Some(req.uri().path()));
         }
         Err(e) => {
             return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
@@ -1869,9 +1964,8 @@ async fn handle_list_objects_v2(
             // reach the dir to remove it. We only mark *leaf-empty* dirs;
             // for non-empty parents, prune_empty_parents collapses the
             // chain after the leaf marker is deleted.
-            let dir_is_empty = std::fs::read_dir(&it.path)
-                .map(|mut rd| rd.next().is_none())
-                .unwrap_or(false);
+            let dir_is_empty =
+                std::fs::read_dir(&it.path).map(|mut rd| rd.next().is_none()).unwrap_or(false);
 
             if dir_is_empty {
                 if let Some(stx) = statx_info(&it.path) {
@@ -2167,9 +2261,8 @@ async fn handle_list_objects_v1(
 
             // Surface leaf-empty directories as 0-byte directory markers in
             // recursive listings — see the matching v2 handler for rationale.
-            let dir_is_empty = std::fs::read_dir(&it.path)
-                .map(|mut rd| rd.next().is_none())
-                .unwrap_or(false);
+            let dir_is_empty =
+                std::fs::read_dir(&it.path).map(|mut rd| rd.next().is_none()).unwrap_or(false);
 
             if dir_is_empty {
                 if let Some(stx) = statx_info(&it.path) {
@@ -3428,19 +3521,13 @@ fn main() -> Result<()> {
         offset,
         time::format_description::well_known::Rfc3339,
     );
-    tracing_subscriber::fmt()
-        .with_timer(timer)
-        .with_env_filter(log_filter)
-        .init();
+    tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter).init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
-
     let cfg = Arc::new(load_cfg()?);
 
     let pool = Arc::new(BufPool::new(cfg.chunk_size, cfg.pool_size));
@@ -3482,8 +3569,7 @@ async fn async_main() -> Result<()> {
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc =
-                    service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
+                let svc = service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
@@ -3515,8 +3601,7 @@ async fn async_main() -> Result<()> {
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                let svc =
-                    service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
+                let svc = service_fn(move |req| handle(req, app2.clone(), Some(peer.clone())));
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
@@ -3527,5 +3612,60 @@ async fn async_main() -> Result<()> {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bucket_acl_empty_yields_empty_map() {
+        assert!(parse_bucket_acl("").is_empty());
+        assert!(parse_bucket_acl("   ").is_empty());
+        assert!(parse_bucket_acl(",,").is_empty());
+    }
+
+    #[test]
+    fn parse_bucket_acl_well_formed() {
+        let m = parse_bucket_acl("alpha:rw,bravo:ro,charlie:rw");
+        assert_eq!(m.get("alpha"), Some(&AclLevel::ReadWrite));
+        assert_eq!(m.get("bravo"), Some(&AclLevel::ReadOnly));
+        assert_eq!(m.get("charlie"), Some(&AclLevel::ReadWrite));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn parse_bucket_acl_tolerates_whitespace() {
+        let m = parse_bucket_acl("  alpha : rw , bravo:ro");
+        assert_eq!(m.get("alpha"), Some(&AclLevel::ReadWrite));
+        assert_eq!(m.get("bravo"), Some(&AclLevel::ReadOnly));
+    }
+
+    #[test]
+    fn parse_bucket_acl_skips_malformed_entries_keeping_good_ones() {
+        // "noseparator" has no colon; "bad:xx" has unknown level;
+        // "UPPER:rw" fails the S3 charset check; "good:ro" survives.
+        let m = parse_bucket_acl("noseparator,bad:xx,UPPER:rw,good:ro");
+        assert_eq!(m.get("good"), Some(&AclLevel::ReadOnly));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn parse_bucket_acl_rejects_non_s3_charset() {
+        // The S3 bucket-name spec is `[a-z0-9.-]`. The charset gate
+        // exists so a buggy or hostile proxy can't smuggle entries with
+        // characters that S3 itself forbids — they're dropped, leaving
+        // the affected bucket on the default-rw fallback.
+        assert!(parse_bucket_acl("UPPER:rw").is_empty());
+        assert!(parse_bucket_acl("with_underscore:rw").is_empty());
+        assert!(parse_bucket_acl("with space:rw").is_empty());
+        assert!(parse_bucket_acl(":rw").is_empty()); // empty name
+    }
+
+    #[test]
+    fn parse_bucket_acl_accepts_dots_and_hyphens() {
+        let m = parse_bucket_acl("my-bucket.0:ro");
+        assert_eq!(m.get("my-bucket.0"), Some(&AclLevel::ReadOnly));
     }
 }

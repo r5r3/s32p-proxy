@@ -92,10 +92,10 @@ fn sign_path(method: &str, host: &str, canonical_path: &str) -> String {
 
 fn build_auth(signature: String) -> SigV4Auth {
     SigV4Auth {
-        access_key:     ACCESS_KEY.to_string(),
-        scope_date:     scope_date_str(),
-        region:         REGION.to_string(),
-        service:        SERVICE.to_string(),
+        access_key: ACCESS_KEY.to_string(),
+        scope_date: scope_date_str(),
+        region: REGION.to_string(),
+        service: SERVICE.to_string(),
         signed_headers: "host;x-amz-content-sha256;x-amz-date".to_string(),
         signature,
     }

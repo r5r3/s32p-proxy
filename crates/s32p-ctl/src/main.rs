@@ -534,26 +534,22 @@ fn yaml_bucket_set_acl(
 fn main() -> Result<()> {
     // Capture the local UTC offset before tokio spawns its worker threads —
     // `time` refuses to determine it once other threads exist.
-    let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::fmt::time::OffsetTime::new(
-                time::UtcOffset::UTC,
-                time::format_description::well_known::Rfc3339,
-            )
-        });
+    let timer = tracing_subscriber::fmt::time::OffsetTime::local_rfc_3339().unwrap_or_else(|_| {
+        tracing_subscriber::fmt::time::OffsetTime::new(
+            time::UtcOffset::UTC,
+            time::format_description::well_known::Rfc3339,
+        )
+    });
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
-
     let mut cli = Cli::parse();
     apply_config_defaults(&mut cli)?;
     let backend = cli.backend.unwrap_or(Backend::Openbao);

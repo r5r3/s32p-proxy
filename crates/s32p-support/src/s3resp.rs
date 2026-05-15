@@ -241,8 +241,8 @@ pub fn list_buckets_paginated(
 /// "bucket-owner-enforced" response and optionally tack on an `AllUsers/READ`
 /// grant when the file is world-readable in POSIX.
 pub fn get_acl(owner_id: &str, owner_display_name: &str, world_readable: bool) -> HttpResponse {
-    let body = s3xml::get_acl_body(owner_id, owner_display_name, world_readable).unwrap_or_else(
-        |_| {
+    let body =
+        s3xml::get_acl_body(owner_id, owner_display_name, world_readable).unwrap_or_else(|_| {
             // Minimal fallback (still valid for clients): owner-only FULL_CONTROL.
             format!(
                 "<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -255,8 +255,7 @@ pub fn get_acl(owner_id: &str, owner_display_name: &str, world_readable: bool) -
                 </Grant></AccessControlList></AccessControlPolicy>"
             )
             .into_bytes()
-        },
-    );
+        });
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
