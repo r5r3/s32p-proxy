@@ -18,10 +18,16 @@
 //!
 //! # Concurrency notes
 //!
-//! Under a cold cache, N concurrent callers for the same key all miss
-//! and fan out to N backend calls. A single-flight layer (per-key
-//! `tokio::sync::OnceCell` or `Mutex`) would dedupe these but adds
-//! bookkeeping cost; deferred until profiling shows it matters.
+//! Cold-cache fan-out is deduplicated by per-key single-flight: when N
+//! concurrent callers all miss, the first one acquires the per-key
+//! flight lock and goes to the backend; the rest serialize on the same
+//! lock and re-check the cache after acquiring it, so only one backend
+//! call happens per (key, fetch-cycle).
+//!
+//! On a backend error, the slot is not poisoned — the next waiter
+//! retries its own fetch (serialized via the same flight lock). This
+//! keeps the cache-error path from amplifying load on a struggling
+//! backend.
 
 use std::{
     collections::HashMap,
@@ -31,7 +37,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{BucketView, Directory, UserDoc};
 
@@ -65,11 +71,18 @@ struct Entry<V> {
     expires_at: Instant,
 }
 
+/// Per-key flight lock: tasks racing on the same cold key all hold
+/// their own clone of the same `Arc<Mutex<()>>` and serialize through
+/// it. Empty unit value is sufficient — the lock itself is the signal.
+type FlightSlots = Mutex<HashMap<String, Arc<Mutex<()>>>>;
+
 pub struct CachingDirectory<D: ?Sized> {
-    inner:   Arc<D>,
-    cfg:     CacheConfig,
-    users:   RwLock<HashMap<String, Entry<Option<UserDoc>>>>,
-    buckets: RwLock<HashMap<String, Entry<Vec<BucketView>>>>,
+    inner:            Arc<D>,
+    cfg:              CacheConfig,
+    users:            RwLock<HashMap<String, Entry<Option<UserDoc>>>>,
+    buckets:          RwLock<HashMap<String, Entry<Vec<BucketView>>>>,
+    users_inflight:   FlightSlots,
+    buckets_inflight: FlightSlots,
 }
 
 impl<D: Directory + ?Sized> CachingDirectory<D> {
@@ -79,6 +92,8 @@ impl<D: Directory + ?Sized> CachingDirectory<D> {
             cfg,
             users: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
+            users_inflight: Mutex::new(HashMap::new()),
+            buckets_inflight: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -98,24 +113,60 @@ impl<D: Directory + ?Sized> Directory for CachingDirectory<D> {
             );
             return Ok(hit);
         }
-        let value = self.inner.user_by_access_key(access_key).await?;
-        let (ttl, outcome) = if value.is_some() {
-            (self.cfg.user_ttl, "positive")
+
+        // Single-flight: serialize concurrent cold misses on the same
+        // key through a per-key lock. The follower path then re-checks
+        // the cache and almost always sees the leader's populated entry.
+        let key_lock = acquire_flight_slot(&self.users_inflight, access_key).await;
+        let flight = key_lock.lock().await;
+
+        if let Some(hit) = read_fresh(&self.users, access_key).await {
+            tracing::trace!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "users",
+                outcome = if hit.is_some() { "positive" } else { "negative" },
+                role = "follower",
+                "single-flight cache hit",
+            );
+            drop(flight);
+            drop(key_lock);
+            release_flight_slot(&self.users_inflight, access_key).await;
+            return Ok(hit);
+        }
+
+        let result = self.inner.user_by_access_key(access_key).await;
+        if let Ok(value) = &result {
+            let (ttl, outcome) = if value.is_some() {
+                (self.cfg.user_ttl, "positive")
+            } else {
+                (self.cfg.negative_ttl, "negative")
+            };
+            // Misses are interesting for tuning — debug level so they
+            // show up under `RUST_LOG=s32p_directory::cache=debug`.
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "users",
+                outcome,
+                ttl_secs = ttl.as_secs(),
+                "cache miss; populated from backend",
+            );
+            insert_with_cap(&self.users, access_key, value.clone(), ttl, self.cfg.max_entries)
+                .await;
         } else {
-            (self.cfg.negative_ttl, "negative")
-        };
-        // Misses are interesting for tuning — debug level so they show
-        // up under `RUST_LOG=s32p_directory::cache=debug`.
-        tracing::debug!(
-            target: "s32p_directory::cache",
-            access_key,
-            map = "users",
-            outcome,
-            ttl_secs = ttl.as_secs(),
-            "cache miss; populated from backend",
-        );
-        insert_with_cap(&self.users, access_key, value.clone(), ttl, self.cfg.max_entries).await;
-        Ok(value)
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "users",
+                "cache miss; backend error, not cached",
+            );
+        }
+
+        drop(flight);
+        drop(key_lock);
+        release_flight_slot(&self.users_inflight, access_key).await;
+        result
     }
 
     async fn buckets_for_access_key(&self, access_key: &str) -> Result<Vec<BucketView>> {
@@ -129,27 +180,83 @@ impl<D: Directory + ?Sized> Directory for CachingDirectory<D> {
             );
             return Ok(hit);
         }
-        let value = self.inner.buckets_for_access_key(access_key).await?;
-        // No distinct negative TTL: an empty Vec is a valid positive
-        // answer (e.g. a user with no granted buckets), and an unknown
-        // access key already returns Ok(vec![]) in both backends today.
-        tracing::debug!(
-            target: "s32p_directory::cache",
-            access_key,
-            map = "buckets",
-            entries = value.len(),
-            ttl_secs = self.cfg.buckets_ttl.as_secs(),
-            "cache miss; populated from backend",
-        );
-        insert_with_cap(
-            &self.buckets,
-            access_key,
-            value.clone(),
-            self.cfg.buckets_ttl,
-            self.cfg.max_entries,
-        )
-        .await;
-        Ok(value)
+
+        let key_lock = acquire_flight_slot(&self.buckets_inflight, access_key).await;
+        let flight = key_lock.lock().await;
+
+        if let Some(hit) = read_fresh(&self.buckets, access_key).await {
+            tracing::trace!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "buckets",
+                entries = hit.len(),
+                role = "follower",
+                "single-flight cache hit",
+            );
+            drop(flight);
+            drop(key_lock);
+            release_flight_slot(&self.buckets_inflight, access_key).await;
+            return Ok(hit);
+        }
+
+        let result = self.inner.buckets_for_access_key(access_key).await;
+        if let Ok(value) = &result {
+            // No distinct negative TTL: an empty Vec is a valid positive
+            // answer (e.g. a user with no granted buckets), and an
+            // unknown access key already returns Ok(vec![]) in both
+            // backends today.
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "buckets",
+                entries = value.len(),
+                ttl_secs = self.cfg.buckets_ttl.as_secs(),
+                "cache miss; populated from backend",
+            );
+            insert_with_cap(
+                &self.buckets,
+                access_key,
+                value.clone(),
+                self.cfg.buckets_ttl,
+                self.cfg.max_entries,
+            )
+            .await;
+        } else {
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "buckets",
+                "cache miss; backend error, not cached",
+            );
+        }
+
+        drop(flight);
+        drop(key_lock);
+        release_flight_slot(&self.buckets_inflight, access_key).await;
+        result
+    }
+}
+
+/// Claim or join the per-key flight slot. The returned `Arc<Mutex<()>>`
+/// must subsequently be `.lock().await`ed to serialize with any other
+/// concurrent caller for the same key.
+async fn acquire_flight_slot(slots: &FlightSlots, key: &str) -> Arc<Mutex<()>> {
+    let mut map = slots.lock().await;
+    Arc::clone(map.entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+}
+
+/// Drop the per-key flight slot if no other task still holds a
+/// reference. Strong-count comparison is reliable here because every
+/// joiner holds an `Arc` clone from `acquire_flight_slot`, so the slot
+/// is only safe to remove when the map's entry is the sole remaining
+/// reference. Call this only after dropping the local `Arc` returned by
+/// `acquire_flight_slot` and the lock guard.
+async fn release_flight_slot(slots: &FlightSlots, key: &str) {
+    let mut map = slots.lock().await;
+    if let Some(existing) = map.get(key)
+        && Arc::strong_count(existing) == 1
+    {
+        map.remove(key);
     }
 }
 
@@ -411,6 +518,108 @@ mod tests {
         // expiry eviction kicks in.
         let len = cache.users.read().await.len();
         assert!(len <= 4, "users map size {len} must be <= cap of 4");
+    }
+
+    /// Slow mock whose backend call sleeps, widening the cold-burst race
+    /// window so single-flight has something to deduplicate.
+    struct SlowMock {
+        user:          Option<UserDoc>,
+        user_calls:    AtomicUsize,
+        buckets:       Vec<BucketView>,
+        buckets_calls: AtomicUsize,
+        delay:         Duration,
+    }
+
+    #[async_trait]
+    impl Directory for SlowMock {
+        async fn user_by_access_key(&self, _k: &str) -> Result<Option<UserDoc>> {
+            self.user_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.user.clone())
+        }
+
+        async fn buckets_for_access_key(&self, _k: &str) -> Result<Vec<BucketView>> {
+            self.buckets_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(self.buckets.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn singleflight_collapses_cold_burst_to_one_backend_call() {
+        let mock = Arc::new(SlowMock {
+            user:          Some(sample_user("k1")),
+            user_calls:    AtomicUsize::new(0),
+            buckets:       vec![sample_bucket("photos", AccessLevel::ReadWrite)],
+            buckets_calls: AtomicUsize::new(0),
+            delay:         Duration::from_millis(40),
+        });
+        let cache = Arc::new(CachingDirectory::new(mock.clone(), fast_cfg()));
+
+        // 10 concurrent users + 10 concurrent buckets lookups on the
+        // same cold key. Without single-flight this fans out to 20
+        // backend calls; with it, exactly 2 (one per map).
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                c.user_by_access_key("k1").await.unwrap();
+            }));
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                c.buckets_for_access_key("k1").await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            mock.user_calls.load(Ordering::SeqCst),
+            1,
+            "10 concurrent cold users lookups must collapse to 1 backend call"
+        );
+        assert_eq!(
+            mock.buckets_calls.load(Ordering::SeqCst),
+            1,
+            "10 concurrent cold buckets lookups must collapse to 1 backend call"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_slot_is_cleaned_up_after_completion() {
+        let mock = Arc::new(MockDirectory::new().with_user("k1", sample_user("k1")));
+        let cache = CachingDirectory::new(mock.clone(), fast_cfg());
+
+        cache.user_by_access_key("k1").await.unwrap();
+        cache.buckets_for_access_key("k1").await.unwrap();
+
+        assert!(
+            cache.users_inflight.lock().await.is_empty(),
+            "users flight slot must be released after fetch completes"
+        );
+        assert!(
+            cache.buckets_inflight.lock().await.is_empty(),
+            "buckets flight slot must be released after fetch completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_error_does_not_prevent_subsequent_success() {
+        // Leader's fetch errors; the next caller must be able to retry
+        // and succeed without being blocked by a poisoned flight slot.
+        let mock =
+            Arc::new(MockDirectory::new().with_user("k1", sample_user("k1")).with_user_errors(1));
+        let cache = CachingDirectory::new(mock.clone(), fast_cfg());
+
+        assert!(cache.user_by_access_key("k1").await.is_err());
+        let r = cache.user_by_access_key("k1").await.unwrap();
+        assert!(r.is_some());
+        assert_eq!(mock.user_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cache.users_inflight.lock().await.is_empty(),
+            "flight slot must not be left dangling after an errored fetch"
+        );
     }
 
     #[tokio::test]
