@@ -181,6 +181,30 @@ pub fn get_acl_body(
     Ok(xml.into_bytes())
 }
 
+/// Build XML body for CreateSession (S3 Express directory-bucket session
+/// establishment). Mirrors AWS's `<CreateSessionResult>` wire format so SDKs
+/// in directory-bucket mode (boto3, AWS CLI, mountpoint-s3) can parse it.
+///
+/// The credentials passed here are the *ephemeral* triple minted by the
+/// proxy's session store — never the caller's long-term IAM secret.
+pub fn create_session_result_body(
+    access_key: &str,
+    secret_key: &str,
+    session_token: &str,
+    expiration: SystemTime,
+) -> Result<Vec<u8>> {
+    let doc = CreateSessionResultDoc {
+        credentials: SessionCredentials {
+            access_key_id:     access_key.to_string(),
+            secret_access_key: secret_key.to_string(),
+            session_token:     session_token.to_string(),
+            expiration:        format_s3_time_system(expiration),
+        },
+    };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
 /// Format SystemTime into S3 list time format (UTC with trailing Z).
 pub fn format_s3_time_system(st: SystemTime) -> String {
     let dt = match OffsetDateTime::from(st) {
@@ -817,6 +841,27 @@ struct OwnerV1 {
 struct CommonPrefixesV1 {
     #[serde(rename = "Prefix")]
     prefix: String,
+}
+
+// --- internal DTOs for CreateSession response ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CreateSessionResult")]
+struct CreateSessionResultDoc {
+    #[serde(rename = "Credentials")]
+    credentials: SessionCredentials,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionCredentials {
+    #[serde(rename = "AccessKeyId")]
+    access_key_id:     String,
+    #[serde(rename = "SecretAccessKey")]
+    secret_access_key: String,
+    #[serde(rename = "SessionToken")]
+    session_token:     String,
+    #[serde(rename = "Expiration")]
+    expiration:        String,
 }
 
 // --- internal DTOs for CopyObject response ---

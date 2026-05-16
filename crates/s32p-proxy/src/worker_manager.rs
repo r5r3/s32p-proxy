@@ -69,13 +69,19 @@ impl fmt::Display for WorkerEndpoint {
 }
 
 pub struct WorkerHandle {
-    pub key:        WorkerKey,
-    pub username:   String,
-    pub endpoint:   WorkerEndpoint,
-    pub posix_root: PathBuf,
-    tempdir:        Mutex<Option<TempDir>>,
-    last_used_unix: AtomicU64,
-    child:          Mutex<Child>,
+    pub key:          WorkerKey,
+    pub username:     String,
+    pub endpoint:     WorkerEndpoint,
+    pub posix_root:   PathBuf,
+    /// Random per-spawn secret. Echoed back by the proxy's
+    /// `upstream_request_filter` as `X-S32P-Validated: <worker_token>` when
+    /// forwarding session-validated requests; the worker compares against its
+    /// env-loaded `S32P_WORKER_TOKEN` to short-circuit SigV4 re-validation.
+    /// Regenerated on every spawn; never persisted.
+    pub worker_token: String,
+    tempdir:          Mutex<Option<TempDir>>,
+    last_used_unix:   AtomicU64,
+    child:            Mutex<Child>,
 }
 
 impl WorkerHandle {
@@ -390,6 +396,15 @@ impl WorkerManager {
             self.server_cfg.virtual_hosted_suffixes.join(",")
         };
 
+        // Fresh per-spawn secret. Auto-injected as `S32P_WORKER_TOKEN` env
+        // below (not exposed as a template placeholder — the operator
+        // shouldn't have to know about it). The proxy echoes it in the
+        // `X-S32P-Validated` header when forwarding session-validated
+        // requests; see `session.rs` and the gateway's `require_sigv4`
+        // short-circuit. Generated from OsRng since this gates SigV4
+        // short-circuit.
+        let worker_token = gen_worker_token();
+
         let vars = TemplateVars {
             username:                &user.username,
             uid:                     user.uid,
@@ -443,6 +458,15 @@ impl WorkerManager {
         // the worker is restarted (consistent with the staged-symlink set).
         cmd.env("S32P_BUCKET_ACL", format_bucket_acl(buckets));
 
+        // Per-spawn token used by the session short-circuit. Auto-injected
+        // (not a YAML placeholder) because (a) it has no operator-tunable
+        // shape and (b) leaving it out of the YAML keeps the trust material
+        // off operator-facing config files. `cmd.env` overrides any
+        // earlier `S32P_WORKER_TOKEN` from the rendered_env loop, so an
+        // operator's stray value (e.g. accidentally added) can't take
+        // precedence over the proxy's generated one.
+        cmd.env("S32P_WORKER_TOKEN", &worker_token);
+
         // log command and env for debuuging
         tracing::debug!(command = ?cmd, "spawning worker");
 
@@ -453,6 +477,7 @@ impl WorkerManager {
             username:       user.username.clone(),
             endpoint:       endpoint.clone(),
             posix_root:     staged_root.clone(),
+            worker_token,
             tempdir:        Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
             child:          Mutex::new(child),
@@ -634,6 +659,16 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
 fn pick_free_port() -> Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
+}
+
+/// Fresh per-spawn token (32 bytes → 43-char URL-safe base64 no-pad).
+/// Used by the session short-circuit between proxy and worker.
+fn gen_worker_token() -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
 }
 
 async fn wait_until_ready(endpoint: &WorkerEndpoint, timeout: Duration) -> Result<()> {

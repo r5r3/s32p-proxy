@@ -32,6 +32,8 @@ pub enum S3Op {
     Write(WriteOp),
     /// Bucket administration operations.
     BucketAdmin(BucketAdminOp),
+    /// Session / authorization operations (S3 Express directory-bucket flow).
+    Session(SessionOp),
     /// Anything else (for now).
     Other,
 }
@@ -138,6 +140,12 @@ pub enum BucketAdminOp {
     CreateBucket,
     /// DELETE /{bucket}
     DeleteBucket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOp {
+    /// GET /{bucket}?session — S3 Express directory-bucket session establishment.
+    CreateSession,
 }
 
 /// Parse/validate conditional headers.
@@ -295,6 +303,7 @@ impl S3Op {
                 | ObjectLockOp::Unknown => true,
             },
             S3Op::BucketAdmin(_) => true,
+            S3Op::Session(_) => false,
             S3Op::Other => true,
         }
     }
@@ -310,6 +319,7 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
         S3Op::Read(_) => "read",
         S3Op::Write(_) => "write",
         S3Op::BucketAdmin(_) => "bucket_admin",
+        S3Op::Session(_) => "session",
         S3Op::Other => "other",
     }
 }
@@ -388,6 +398,22 @@ pub fn classify_with_headers(
         && query.validate_xid("GetBucketLocation")
     {
         return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetBucketLocation) };
+    }
+
+    // CreateSession (S3 Express directory-bucket): GET /{bucket}?session, that param only.
+    // Must come before ListObjectsV1 so it doesn't get swallowed by the V1 fallback.
+    if method == "GET"
+        && bucket.is_some()
+        && key.is_none()
+        && query.is_only_effective("session")
+        && query.validate_xid("CreateSession")
+    {
+        return S3RequestClass {
+            bucket,
+            key,
+            query,
+            op: S3Op::Session(SessionOp::CreateSession),
+        };
     }
 
     // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params (allow x-id)
@@ -533,6 +559,7 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
         S3Op::Read(_) => None, // handled by routing/gateway
         S3Op::Write(_) => None,
         S3Op::BucketAdmin(_) => Some("bucket administration is not implemented"),
+        S3Op::Session(_) => None, // handled locally at the proxy
         S3Op::Other => None,
     }
 }

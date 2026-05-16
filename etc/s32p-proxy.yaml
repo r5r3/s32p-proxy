@@ -66,7 +66,7 @@ workers:
         S32P_PUBLIC_SCHEME: "http"        # must match proxy's server.public_scheme
         S32P_REGION: "{{region}}"
         S32P_VIRTUAL_HOSTED_SUFFIXES: "{{virtual_hosted_suffixes}}"
-        S32P_CHUNK_SIZE_MB: "16" 
+        S32P_CHUNK_SIZE_MB: "16"
         S32P_INFLIGHT: "32"
         S32P_POOL_SIZE: "128"
         S32P_DIRECT_IO: "true"
@@ -92,7 +92,14 @@ routing:
     bucket_admin:
       action: "not_implemented"
       message: "bucket administration is not implemented"
+    session:
+      action: "create_session"
     other:
       action: "proxy"
       worker_profile: "versitygw-default"
+
+session:
+  ttl_secs: 300
+  cleanup_interval_secs: 60
+  max_active: 10000
 

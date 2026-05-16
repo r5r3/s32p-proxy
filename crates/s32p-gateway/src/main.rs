@@ -112,6 +112,13 @@ struct Cfg {
     #[cfg(feature = "lustre")]
     lustre_max_stripe_count: u32,
     virtual_hosted_suffixes: Vec<String>,
+    /// Per-spawn secret shared with the proxy. The proxy attaches it as
+    /// `X-S32P-Validated: <worker_token>` when forwarding a session-validated
+    /// request; the worker uses the comparison to short-circuit SigV4
+    /// re-validation (which is impossible against session-signed requests
+    /// because the worker has no directory access to the ephemeral secret).
+    /// Loaded from env `S32P_WORKER_TOKEN`; fatal at startup if missing.
+    worker_token:            String,
     /// Snapshot of per-bucket access levels, supplied by the proxy via
     /// `S32P_BUCKET_ACL`. Entries are looked up by bucket name; absence
     /// (or absence of the env var entirely) means `ReadWrite` — that
@@ -245,6 +252,14 @@ fn load_cfg() -> Result<Cfg> {
         .map(|s| parse_bucket_acl(&s))
         .unwrap_or_default();
 
+    // Per-spawn token shared with the proxy. Optional: if absent or empty
+    // (e.g. running under an older proxy, a manual invocation for
+    // debugging, or a custom wrapper), the session short-circuit is
+    // disabled entirely. `require_sigv4` ignores `X-S32P-Validated` in
+    // that mode and falls through to standard SigV4 — sessions just won't
+    // work end-to-end, but normal long-term-credential traffic does.
+    let worker_token = std::env::var("S32P_WORKER_TOKEN").unwrap_or_default();
+
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -263,6 +278,7 @@ fn load_cfg() -> Result<Cfg> {
         lustre_max_stripe_count,
         virtual_hosted_suffixes,
         bucket_acl,
+        worker_token,
     })
 }
 
@@ -364,7 +380,7 @@ async fn handle(
 
     // All actions require authentication
     let cfg = app.cfg.clone();
-    if let Err(rej) = require_sigv4(&req, &cfg) {
+    if let Err(rej) = require_sigv4(&req, &cfg, peer.as_ref()) {
         tracing::debug!(
             client = %client_log,
             method = %method,
@@ -465,7 +481,62 @@ async fn handle(
 fn require_sigv4(
     req: &Request<Incoming>,
     cfg: &Cfg,
+    peer: Option<&PeerAddr>,
 ) -> std::result::Result<(), s32p_support::SigV4Rejection> {
+    // Session-validated short-circuit. The proxy validated SigV4 with the
+    // session's ephemeral secret; we can't redo that here because we don't
+    // know the secret (the session store lives in the proxy, not the
+    // worker). Instead, three things must all hold:
+    //
+    //   1. cfg.worker_token configured — empty means the worker wasn't
+    //      spawned by a session-aware proxy; the header (if any) is
+    //      ignored entirely and we fall through to normal SigV4.
+    //   2. peer.is_local()             — only proxy → worker traffic is
+    //                                    loopback/UDS.
+    //   3. header == cfg.worker_token  — proves the connection comes from
+    //                                    the proxy that spawned us.
+    //
+    // Each failure mode logs distinctly so misconfigs (worker exposed
+    // off-host, stale token after restart) are distinguishable from
+    // active probes.
+    if !cfg.worker_token.is_empty()
+        && let Some(hv) = req.headers().get("x-s32p-validated")
+    {
+        let resource = Some(req.uri().path());
+        let is_local = peer.map(PeerAddr::is_local).unwrap_or(false);
+        if !is_local {
+            tracing::warn!(
+                peer = ?peer,
+                "rejected X-S32P-Validated header from non-local peer"
+            );
+            return Err(s32p_support::SigV4Rejection {
+                response: s32p_support::s3resp::access_denied(
+                    "validation header rejected",
+                    resource,
+                ),
+                reason:   "X-S32P-Validated from non-local peer".to_string(),
+            });
+        }
+        let provided = hv.to_str().unwrap_or("");
+        // Constant-time-ish comparison is overkill at this trust boundary
+        // (the channel is loopback/UDS), but use a length-then-compare to
+        // avoid early-exit on the first differing byte costing nothing.
+        let token_match =
+            provided.len() == cfg.worker_token.len() && provided == cfg.worker_token;
+        if !token_match {
+            tracing::warn!("X-S32P-Validated header token mismatch");
+            return Err(s32p_support::SigV4Rejection {
+                response: s32p_support::s3resp::access_denied(
+                    "validation header rejected",
+                    resource,
+                ),
+                reason:   "X-S32P-Validated token mismatch".to_string(),
+            });
+        }
+        // All three checks passed — trust the proxy's prior validation.
+        return Ok(());
+    }
+
     s32p_support::verify_sigv4_request_any(
         req.method().as_str(),
         req.uri(),

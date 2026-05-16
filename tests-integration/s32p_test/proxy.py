@@ -72,6 +72,9 @@ class ProxyHarness:
     idle_timeout_secs: int = 60
     sweep_interval_secs: int = 5
     profile_name: str = "gateway"
+    # CreateSession TTL. Kept short by default so expiry tests don't
+    # bottleneck the suite; tests that need longer can override.
+    session_ttl_secs: int = 60
 
     # Derived in __post_init__
     posix_root: Path = field(init=False)
@@ -117,6 +120,8 @@ class ProxyHarness:
             "S32P_REGION": "{{region}}",
             "S32P_VIRTUAL_HOSTED_SUFFIXES": "{{virtual_hosted_suffixes}}",
             "S32P_LOG_LEVEL": "{{log_level}}",
+            # NOTE: S32P_WORKER_TOKEN is auto-injected by the proxy at
+            # spawn time; not exposed as a YAML placeholder.
         }
 
         return {
@@ -165,7 +170,13 @@ class ProxyHarness:
                     "versioning":   {"action": "not_implemented", "message": "versioning not implemented"},
                     "object_lock":  {"action": "not_implemented", "message": "object lock not implemented"},
                     "bucket_admin": {"action": "not_implemented", "message": "bucket admin via s32p-ctl only"},
+                    "session":      {"action": "create_session"},
                 },
+            },
+            "session": {
+                "ttl_secs": self.session_ttl_secs,
+                "cleanup_interval_secs": 5,
+                "max_active": 1000,
             },
         }
 

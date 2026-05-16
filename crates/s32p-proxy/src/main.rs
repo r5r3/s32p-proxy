@@ -3,7 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{fs, path::PathBuf, sync::Arc, time::Instant};
+use std::{fs, path::PathBuf, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -21,10 +21,12 @@ use rustls::crypto::{CryptoProvider, aws_lc_rs};
 
 mod config;
 mod responses;
+mod session;
 mod worker_manager;
 
 use s32p_directory::{Directory, UserDoc, openbao::OpenBaoDirectory, yaml::YamlDirectory};
 use s32p_support;
+use session::{SessionMode, SessionStore};
 use worker_manager::{WorkerEndpoint, WorkerHandle, WorkerManager};
 
 #[derive(Parser, Debug)]
@@ -37,6 +39,8 @@ struct Cli {
 struct S3ProxyApp {
     directory:               Arc<dyn Directory>,
     workers:                 Arc<WorkerManager>,
+    sessions:                Arc<SessionStore>,
+    session_ttl:             Duration,
     routing:                 config::RoutingConfig,
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
 }
@@ -65,16 +69,21 @@ impl BackgroundService for WorkerShutdownService {
 
 #[derive(Clone, Default)]
 struct ProxyCtx {
-    uid:            Option<u32>,
-    username:       Option<String>,
+    uid:               Option<u32>,
+    username:          Option<String>,
     // Preserve original host EXACTLY (important for SigV4 verification in worker)
-    orig_host:      Option<String>,
+    orig_host:         Option<String>,
     // Selected worker profile (used as part of worker key)
-    worker_profile: Option<String>,
+    worker_profile:    Option<String>,
     // Selected upstream (per-user worker)
-    upstream:       Option<WorkerEndpoint>,
+    upstream:          Option<WorkerEndpoint>,
     // Optional handle (for touch/logging)
-    worker:         Option<Arc<WorkerHandle>>,
+    worker:            Option<Arc<WorkerHandle>>,
+    // True when the proxy validated this request using a session credential
+    // (rather than long-term creds). `upstream_request_filter` uses this to
+    // inject `X-S32P-Validated: <worker_token>` so the gateway short-circuits
+    // its own SigV4 re-check.
+    session_validated: bool,
 }
 
 impl ProxyCtx {
@@ -93,8 +102,9 @@ impl ProxyHttp for S3ProxyApp {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> PResult<bool> {
-        // Start background sweeper lazily (we are now inside tokio)
+        // Start background sweepers lazily (we are now inside tokio).
         self.workers.start_sweeper();
+        self.sessions.start_cleanup();
 
         let start = Instant::now();
 
@@ -108,6 +118,12 @@ impl ProxyHttp for S3ProxyApp {
             let v = authority.as_str().to_string();
             session.req_header_mut().insert_header("host", &v)?;
         }
+
+        // SECURITY: strip any client-supplied trust header. Only the proxy
+        // itself is allowed to inject this in `upstream_request_filter`; a
+        // request arriving with it from the public listener is either
+        // confused (proxy chain?) or hostile (spoof attempt).
+        session.req_header_mut().remove_header("x-s32p-validated");
 
         // IMPORTANT: clone header so we don't hold an immutable borrow of `session`
         let req: RequestHeader = session.req_header().clone();
@@ -190,32 +206,126 @@ impl ProxyHttp for S3ProxyApp {
             }
         };
 
-        // 2) Map access key -> unix user
-        let user = match self.directory.user_by_access_key(&access_key).await.map_err(|e| {
-            Error::explain(ErrorType::InternalError, format!("directory error: {e:#}"))
-        })? {
-            Some(u) => u,
-            None => {
-                // InvalidAccessKeyId
+        // 2) Resolve access_key → user. Check the session store first: an
+        // ephemeral session credential pre-empts the long-term Directory
+        // lookup. SigV4 validation (with the ephemeral secret) happens here
+        // too because the worker can't redo it later — workers don't have a
+        // Directory and can't see the session store.
+        let (user, session_validated) = if let Some(entry) = self.sessions.lookup(&access_key) {
+            // Cross-bucket scope. A session minted for bucket A must not be
+            // accepted on bucket B. Reject before SigV4 to avoid leaking
+            // "this access_key is a valid session" via timing.
+            if class.bucket.as_deref() != Some(entry.bucket.as_str()) {
                 responses::respond_s3_error(
                     session,
                     StatusCode::FORBIDDEN,
-                    responses::error_code::INVALID_ACCESS_KEY_ID,
-                    "unknown access key",
+                    responses::error_code::ACCESS_DENIED,
+                    "session credentials are scoped to a different bucket",
                     Some(req.uri.path()),
                     None,
                 )
                 .await?;
                 return Ok(true);
             }
+
+            // ReadOnly session: reject writes (proxy-side enforcement; the
+            // worker can't tell ReadOnly from ReadWrite — they have the same
+            // SigV4 shape — so this check must live here).
+            if matches!(entry.mode, SessionMode::ReadOnly) && class.op.needs_write() {
+                responses::respond_s3_error(
+                    session,
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::ACCESS_DENIED,
+                    "session is ReadOnly; write operations are not permitted",
+                    Some(req.uri.path()),
+                    None,
+                )
+                .await?;
+                return Ok(true);
+            }
+
+            // Re-check the real user via Directory every request. If the
+            // operator revoked the long-term identity since the session was
+            // minted, the session must die with it.
+            let real_user = match self
+                .directory
+                .user_by_access_key(&entry.real_access_key)
+                .await
+                .map_err(|e| {
+                    Error::explain(ErrorType::InternalError, format!("directory error: {e:#}"))
+                })? {
+                Some(u) => u,
+                None => {
+                    self.sessions.invalidate(&access_key);
+                    responses::respond_s3_error(
+                        session,
+                        StatusCode::FORBIDDEN,
+                        responses::error_code::ACCESS_DENIED,
+                        "session owner has been removed",
+                        Some(req.uri.path()),
+                        None,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            // Validate SigV4 with the *ephemeral* secret bound to this
+            // session. Same verifier as the long-term path; only the secret
+            // differs.
+            match s32p_support::verify_sigv4_request_any(
+                req.method.as_str(),
+                &req.uri,
+                &req.headers,
+                None,
+                &entry.secret_key,
+                Some(req.uri.path()),
+            ) {
+                Ok(()) => {}
+                Err(rej) => {
+                    tracing::debug!(
+                        method = req.method.as_str(),
+                        path = req.uri.path(),
+                        reason = %rej.reason,
+                        "session-signed request rejected at proxy SigV4 check"
+                    );
+                    responses::respond_hyper(session, rej.response, true).await?;
+                    return Ok(true);
+                }
+            }
+
+            (real_user, true)
+        } else {
+            // Long-term credentials: standard Directory lookup.
+            match self.directory.user_by_access_key(&access_key).await.map_err(|e| {
+                Error::explain(ErrorType::InternalError, format!("directory error: {e:#}"))
+            })? {
+                Some(u) => (u, false),
+                None => {
+                    responses::respond_s3_error(
+                        session,
+                        StatusCode::FORBIDDEN,
+                        responses::error_code::INVALID_ACCESS_KEY_ID,
+                        "unknown access key",
+                        Some(req.uri.path()),
+                        None,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
         };
         ctx.set_user(&user);
+        ctx.session_validated = session_validated;
 
-        // 2a) If routing says NotImplemented: validate SigV4 first, then
-        // reply with NotImplemented. Validating up front prevents
-        // unauthenticated callers from probing the routing table.
+        // 2a) If routing says NotImplemented: validate SigV4 first (unless we
+        // already validated via session), then reply with NotImplemented.
+        // Validating up front prevents unauthenticated callers from probing
+        // the routing table.
         if let config::RouteAction::NotImplemented { message } = action {
-            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
+            if !session_validated
+                && validate_sigv4_header_only_or_reject(session, &req, &user).await?
+            {
                 return Ok(true); // already responded with auth/signature error
             }
 
@@ -224,10 +334,85 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(true);
         }
 
+        // 2a') CreateSession: mint an ephemeral session for the caller, return
+        // the AWS-shaped XML credentials. Sessions can't beget sessions —
+        // CreateSession must be driven with long-term IAM creds.
+        if let config::RouteAction::CreateSession = action {
+            if session_validated {
+                responses::respond_s3_error(
+                    session,
+                    StatusCode::BAD_REQUEST,
+                    responses::error_code::INVALID_REQUEST,
+                    "CreateSession requires long-term credentials",
+                    Some(req.uri.path()),
+                    None,
+                )
+                .await?;
+                return Ok(true);
+            }
+            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
+                return Ok(true);
+            }
+
+            let bucket = match class.bucket.as_deref() {
+                Some(b) if !b.is_empty() => b.to_string(),
+                _ => {
+                    responses::respond_s3_error(
+                        session,
+                        StatusCode::BAD_REQUEST,
+                        responses::error_code::INVALID_REQUEST,
+                        "CreateSession requires a bucket",
+                        Some(req.uri.path()),
+                        None,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            let mode = SessionMode::from_header(
+                req.headers.get("x-amz-create-session-mode").and_then(|v| v.to_str().ok()),
+            );
+
+            let entry = match self
+                .sessions
+                .create(&user.access_key, &bucket, mode, self.session_ttl)
+            {
+                Some(e) => e,
+                None => {
+                    responses::respond_s3_error(
+                        session,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        responses::error_code::SERVICE_UNAVAILABLE,
+                        "session store is at capacity",
+                        Some(req.uri.path()),
+                        None,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            };
+
+            let body = s32p_support::s3xml::create_session_result_body(
+                &entry.access_key,
+                &entry.secret_key,
+                &entry.session_token,
+                entry.expires_at_system,
+            )
+            .map_err(|e| Error::explain(ErrorType::InternalError, format!("xml: {e}")))?;
+
+            let resp =
+                s32p_support::s3resp::response_bytes(StatusCode::OK, "application/xml", body, []);
+            responses::respond_hyper(session, resp, /* close = */ false).await?;
+            return Ok(true);
+        }
+
         // 2b) Routing says Proxy: select worker profile
         let profile = match action {
             config::RouteAction::Proxy { worker_profile } => worker_profile.as_str(),
-            config::RouteAction::NotImplemented { .. } => unreachable!(),
+            config::RouteAction::NotImplemented { .. } | config::RouteAction::CreateSession => {
+                unreachable!()
+            }
         };
         ctx.worker_profile = Some(profile.to_string());
 
@@ -253,14 +438,21 @@ impl ProxyHttp for S3ProxyApp {
         }
 
         // 4) Worker not running: verify header-only before spawn (anti-DoS gate).
-        if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
+        // Skip if we already validated via session credentials above; sessions
+        // sign with `s3express` and a different secret, which the long-term
+        // path would reject.
+        if !session_validated && validate_sigv4_header_only_or_reject(session, &req, &user).await? {
             return Ok(true); // already responded with auth/signature error, no spawn
         }
 
         // 5) Start worker on demand (profile-specific)
-        let buckets = self.directory.buckets_for_access_key(&access_key).await.map_err(|e| {
-            Error::explain(ErrorType::InternalError, format!("directory buckets error: {e:#}"))
-        })?;
+        // For session-validated requests, `access_key` is the ephemeral key
+        // (not in the Directory). Look up buckets via `user.access_key`,
+        // which we resolved to the real long-term identity earlier.
+        let buckets =
+            self.directory.buckets_for_access_key(&user.access_key).await.map_err(|e| {
+                Error::explain(ErrorType::InternalError, format!("directory buckets error: {e:#}"))
+            })?;
 
         // Start worker with staged root
         let h = match self.workers.ensure_running(&user, &buckets, profile).await {
@@ -381,6 +573,17 @@ impl ProxyHttp for S3ProxyApp {
         upstream_request.remove_header("keep-alive");
         upstream_request.remove_header("te");
         upstream_request.remove_header("upgrade");
+
+        // If this request authenticated via a session credential, hand the
+        // worker its own per-spawn token so it can skip SigV4 re-validation.
+        // The trust chain is: (a) connection is loopback/UDS, (b) header
+        // present, (c) value matches the worker's env-loaded
+        // `S32P_WORKER_TOKEN`. All three are checked in the gateway.
+        if ctx.session_validated
+            && let Some(handle) = ctx.worker.as_ref()
+        {
+            upstream_request.insert_header("X-S32P-Validated", handle.worker_token.as_str())?;
+        }
 
         tracing::debug!(
             uid = ctx.uid.unwrap_or(0),
@@ -611,9 +814,25 @@ fn main() -> Result<()> {
 
     let workers = WorkerManager::new(cfg.workers.clone(), cfg.server.clone());
 
+    let sessions = Arc::new(SessionStore::new(
+        cfg.session.max_active,
+        Duration::from_secs(cfg.session.cleanup_interval_secs),
+    ));
+    // Cleanup task is started lazily from request_filter (same pattern as
+    // WorkerManager::start_sweeper) — pingora's Server::bootstrap() runs
+    // before the tokio runtime exists, so we can't spawn here.
+    tracing::info!(
+        ttl_secs = cfg.session.ttl_secs,
+        cleanup_interval_secs = cfg.session.cleanup_interval_secs,
+        max_active = cfg.session.max_active,
+        "session store initialized"
+    );
+
     let app = S3ProxyApp {
         directory,
         workers: workers.clone(),
+        sessions,
+        session_ttl: Duration::from_secs(cfg.session.ttl_secs),
         routing: cfg.routing.clone(),
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
     };

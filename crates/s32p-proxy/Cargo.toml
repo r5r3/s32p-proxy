@@ -46,3 +46,8 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 quick-xml = { workspace = true }
 url = { workspace = true }
+
+# session store
+uuid = { workspace = true, features = ["v4"] }
+rand = "0.8"
+base64 = "0.22"

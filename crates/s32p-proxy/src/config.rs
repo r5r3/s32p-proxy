@@ -10,6 +10,42 @@ pub struct Config {
     pub auth:    AuthConfig,
     pub workers: WorkersConfig,
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionConfig {
+    /// Lifetime of a CreateSession credential in seconds. AWS uses 300 (5 min).
+    #[serde(default = "default_session_ttl_secs")]
+    pub ttl_secs:              u64,
+    /// How often the proxy sweeps expired session entries from memory.
+    #[serde(default = "default_session_cleanup_interval_secs")]
+    pub cleanup_interval_secs: u64,
+    /// Hard cap on simultaneously-active sessions; further `CreateSession`
+    /// calls fail with `ServiceUnavailable` once exceeded.
+    #[serde(default = "default_session_max_active")]
+    pub max_active:            usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs:              default_session_ttl_secs(),
+            cleanup_interval_secs: default_session_cleanup_interval_secs(),
+            max_active:            default_session_max_active(),
+        }
+    }
+}
+
+fn default_session_ttl_secs() -> u64 {
+    300
+}
+fn default_session_cleanup_interval_secs() -> u64 {
+    60
+}
+fn default_session_max_active() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,6 +313,11 @@ pub enum RouteAction {
 
     /// Return S3 NotImplemented (but only after SigV4 validation, per your logic).
     NotImplemented { message: String },
+
+    /// Handle locally as S3 Express CreateSession. Mints ephemeral
+    /// credentials in the proxy's session store and returns the
+    /// `<CreateSessionResult>` XML body.
+    CreateSession,
 }
 
 impl Config {
@@ -454,6 +495,18 @@ impl Config {
                     if message.trim().is_empty() {
                         return Err(anyhow!(
                             "routing.class_map.{class}: not_implemented message must not be empty"
+                        ));
+                    }
+                }
+                RouteAction::CreateSession => {
+                    // The classifier emits `session` only for `GET /{bucket}?session`.
+                    // Operators can disable the feature by mapping it to `not_implemented`,
+                    // but routing it to a worker would be a misconfig: the session store
+                    // lives in the proxy, the worker can't mint credentials.
+                    if class != "session" {
+                        return Err(anyhow!(
+                            "routing.class_map.{class}: action 'create_session' is only \
+                             valid for the 'session' class (got '{class}')"
                         ));
                     }
                 }
