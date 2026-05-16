@@ -66,7 +66,7 @@ pub struct AuthConfig {
 
 /// User-facing cache controls. See `s32p_directory::CacheConfig` for the
 /// runtime type the proxy constructs from these values.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheToggle {
     /// `None` → use the per-backend default. `Some(true)` / `Some(false)`
     /// override it.
@@ -79,6 +79,24 @@ pub struct CacheToggle {
     pub negative_ttl_secs: u64,
     #[serde(default = "default_max_entries")]
     pub max_entries:       usize,
+}
+
+// Hand-written so omitting the whole `auth.cache:` section yields the
+// same values as omitting individual fields. `derive(Default)` here
+// would zero everything (u64::default = 0, usize::default = 0), and
+// `#[serde(default = "...")]` only fires when fields are missing
+// inside a *present* struct — not when the parent's `serde(default)`
+// triggers Default::default() for the whole struct.
+impl Default for CacheToggle {
+    fn default() -> Self {
+        Self {
+            enabled:           None,
+            user_ttl_secs:     default_user_ttl_secs(),
+            buckets_ttl_secs:  default_buckets_ttl_secs(),
+            negative_ttl_secs: default_negative_ttl_secs(),
+            max_entries:       default_max_entries(),
+        }
+    }
 }
 
 fn default_user_ttl_secs() -> u64 {
@@ -443,5 +461,48 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: omitting the entire `auth.cache:` section must yield
+    /// the same TTL/cap values as omitting individual fields. A bare
+    /// `derive(Default)` on `CacheToggle` zeroes everything and the
+    /// per-backend default-on (OpenBao) would silently build a cache
+    /// with TTL=0 — useless. The hand-written `Default` keeps the
+    /// two paths consistent.
+    #[test]
+    fn cache_toggle_default_matches_field_serde_defaults() {
+        let from_default = CacheToggle::default();
+        let from_empty_struct: CacheToggle =
+            serde_yaml::from_str("{}").expect("empty struct must deserialize via field defaults");
+        assert_eq!(from_default.enabled, from_empty_struct.enabled);
+        assert_eq!(from_default.user_ttl_secs, from_empty_struct.user_ttl_secs);
+        assert_eq!(from_default.buckets_ttl_secs, from_empty_struct.buckets_ttl_secs);
+        assert_eq!(from_default.negative_ttl_secs, from_empty_struct.negative_ttl_secs);
+        assert_eq!(from_default.max_entries, from_empty_struct.max_entries);
+        // And the values must be the documented defaults, not zero.
+        assert_eq!(from_default.user_ttl_secs, 30);
+        assert_eq!(from_default.max_entries, 4096);
+    }
+
+    /// Sibling regression: when `auth:` carries no `cache:` key at all,
+    /// the AuthConfig field's `#[serde(default)]` triggers
+    /// `<CacheToggle as Default>::default()` — must yield the documented
+    /// non-zero values, not a useless all-zero cache.
+    #[test]
+    fn auth_config_without_cache_section_uses_documented_defaults() {
+        let yaml = r#"
+backend: openbao
+"#;
+        let auth: AuthConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(auth.cache.enabled, None); // backend-aware default applies in main.rs
+        assert_eq!(auth.cache.user_ttl_secs, 30);
+        assert_eq!(auth.cache.buckets_ttl_secs, 30);
+        assert_eq!(auth.cache.negative_ttl_secs, 5);
+        assert_eq!(auth.cache.max_entries, 4096);
     }
 }

@@ -18,6 +18,8 @@ s32p-support = { path = "../s32p-support" }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 
+tracing = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 

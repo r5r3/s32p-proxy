@@ -87,22 +87,60 @@ impl<D: Directory + ?Sized> CachingDirectory<D> {
 impl<D: Directory + ?Sized> Directory for CachingDirectory<D> {
     async fn user_by_access_key(&self, access_key: &str) -> Result<Option<UserDoc>> {
         if let Some(hit) = read_fresh(&self.users, access_key).await {
+            // Hits are the hot path — keep them at trace level so a
+            // typical `RUST_LOG=info` deployment doesn't pay for them.
+            tracing::trace!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "users",
+                outcome = if hit.is_some() { "positive" } else { "negative" },
+                "cache hit",
+            );
             return Ok(hit);
         }
         let value = self.inner.user_by_access_key(access_key).await?;
-        let ttl = if value.is_some() { self.cfg.user_ttl } else { self.cfg.negative_ttl };
+        let (ttl, outcome) = if value.is_some() {
+            (self.cfg.user_ttl, "positive")
+        } else {
+            (self.cfg.negative_ttl, "negative")
+        };
+        // Misses are interesting for tuning — debug level so they show
+        // up under `RUST_LOG=s32p_directory::cache=debug`.
+        tracing::debug!(
+            target: "s32p_directory::cache",
+            access_key,
+            map = "users",
+            outcome,
+            ttl_secs = ttl.as_secs(),
+            "cache miss; populated from backend",
+        );
         insert_with_cap(&self.users, access_key, value.clone(), ttl, self.cfg.max_entries).await;
         Ok(value)
     }
 
     async fn buckets_for_access_key(&self, access_key: &str) -> Result<Vec<BucketView>> {
         if let Some(hit) = read_fresh(&self.buckets, access_key).await {
+            tracing::trace!(
+                target: "s32p_directory::cache",
+                access_key,
+                map = "buckets",
+                entries = hit.len(),
+                "cache hit",
+            );
             return Ok(hit);
         }
         let value = self.inner.buckets_for_access_key(access_key).await?;
         // No distinct negative TTL: an empty Vec is a valid positive
         // answer (e.g. a user with no granted buckets), and an unknown
         // access key already returns Ok(vec![]) in both backends today.
+        tracing::debug!(
+            target: "s32p_directory::cache",
+            access_key,
+            map = "buckets",
+            entries = value.len(),
+            ttl_secs = self.cfg.buckets_ttl.as_secs(),
+            "cache miss; populated from backend",
+        );
         insert_with_cap(
             &self.buckets,
             access_key,
@@ -129,15 +167,31 @@ async fn insert_with_cap<V>(
 ) {
     let mut m = map.write().await;
     if m.len() >= cap {
+        let before = m.len();
         let now = Instant::now();
         m.retain(|_, e| e.expires_at > now);
+        let pruned = before - m.len();
         // Still at the cap with all-fresh entries: evict the entry
         // with the soonest expiry. Bounded O(n) work, only on
         // pathological insert pressure.
         if m.len() >= cap
             && let Some(victim) = m.iter().min_by_key(|(_, e)| e.expires_at).map(|(k, _)| k.clone())
         {
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                cap,
+                pruned_expired = pruned,
+                evicted = %victim,
+                "cache at capacity; pruned expired and evicted soonest-expiring entry",
+            );
             m.remove(&victim);
+        } else if pruned > 0 {
+            tracing::debug!(
+                target: "s32p_directory::cache",
+                cap,
+                pruned_expired = pruned,
+                "cache at capacity; pruned expired entries",
+            );
         }
     }
     m.insert(key.to_string(), Entry { value, expires_at: Instant::now() + ttl });

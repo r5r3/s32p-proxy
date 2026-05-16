@@ -454,6 +454,11 @@ auth:
 - **Errors are never cached** — backend errors (network failures, KV decode errors) always pass through so the next attempt sees fresh state.
 - **Snapshot vs. cache.** ACL state is independently snapshotted into spawned workers via `S32P_BUCKET_ACL` (see §Security Notes); that snapshot freezes for the worker's lifetime. The cache only changes how fresh the *next* worker spawn's snapshot is — it does **not** propagate ACL changes to running workers. ACL changes therefore take effect at `max(buckets_ttl_secs, idle_timeout_secs)` worst-case.
 - **Single-flight is not enabled.** Under a cold cache, N concurrent first-requests for the same access key all miss and fan out to N backend calls. With a 30 s TTL and a typical access-key population this is fine; if profiling shows it matters, a per-key `tokio::sync::OnceCell` can be added later.
+- **Observability.** Hits log at `trace` and misses + evictions at `debug` under the `s32p_directory::cache` target. To see misses without spamming on hits:
+  ```bash
+  RUST_LOG=info,s32p_directory::cache=debug cargo run --bin s32p-proxy
+  ```
+  Each event carries the `access_key`, the affected map (`users`/`buckets`), and the TTL applied — useful for confirming the cache is actually warm in production and for tuning TTLs.
 
 ### YAML directory file format
 
