@@ -436,6 +436,25 @@ auth:
     prefix: "s32p"
 ```
 
+#### Directory cache (`auth.cache.*`)
+
+The proxy can hold a small in-process TTL cache in front of the directory backend. The cache decorates any backend (so YAML and OpenBao share the same code path) and only matters in practice for OpenBao — every uncached request would otherwise hit Vault.
+
+```yaml
+auth:
+  cache:
+    enabled: true            # optional; default depends on backend (see below)
+    user_ttl_secs: 30        # positive `user_by_access_key` results
+    buckets_ttl_secs: 30     # positive `buckets_for_access_key` results
+    negative_ttl_secs: 5     # cached "no such access key"
+    max_entries: 4096        # soft cap per map; over cap, prune expired then evict soonest-expiring
+```
+
+- **Defaults**: cache is **on by default for the OpenBao backend** and **off by default for the YAML backend** (YAML is an in-memory `HashMap` lookup; the cache adds no benefit, only lock overhead). Setting `enabled: true` or `enabled: false` overrides either default.
+- **Errors are never cached** — backend errors (network failures, KV decode errors) always pass through so the next attempt sees fresh state.
+- **Snapshot vs. cache.** ACL state is independently snapshotted into spawned workers via `S32P_BUCKET_ACL` (see §Security Notes); that snapshot freezes for the worker's lifetime. The cache only changes how fresh the *next* worker spawn's snapshot is — it does **not** propagate ACL changes to running workers. ACL changes therefore take effect at `max(buckets_ttl_secs, idle_timeout_secs)` worst-case.
+- **Single-flight is not enabled.** Under a cold cache, N concurrent first-requests for the same access key all miss and fan out to N backend calls. With a 30 s TTL and a typical access-key population this is fine; if profiling shows it matters, a per-key `tokio::sync::OnceCell` can be added later.
+
 ### YAML directory file format
 
 Example `/etc/s32p/directory.yaml`:

@@ -1,6 +1,9 @@
+pub mod cache;
 pub mod directory;
 pub mod openbao_client;
 
+// TTL cache decorator over the Directory trait.
+pub use cache::{CacheConfig, CachingDirectory};
 // Existing re-exports
 // Shared helpers / DTOs
 // layout.rs API (so admin can import from s32p_directory::DirectoryLayout etc if you want)

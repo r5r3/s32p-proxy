@@ -543,7 +543,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter).init();
 
     // Build directory backend
-    let directory: Arc<dyn Directory> = match cfg.auth.backend {
+    let inner_directory: Arc<dyn Directory> = match cfg.auth.backend {
         config::AuthBackend::Yaml => {
             let y = cfg.auth.yaml.as_ref().context("auth.yaml missing")?;
             Arc::new(YamlDirectory::from_path(&y.path)?)
@@ -570,6 +570,41 @@ fn main() -> Result<()> {
                 o.prefix.clone(),
             ))
         }
+    };
+
+    // Optional TTL cache in front of the directory backend.
+    //
+    // Default-on for OpenBao (every uncached request hits Vault); off for
+    // YAML (lookups are an in-memory HashMap clone — caching just adds a
+    // lock cost). The user can flip either default by setting
+    // `auth.cache.enabled` explicitly in YAML.
+    let cache_enabled = cfg
+        .auth
+        .cache
+        .enabled
+        .unwrap_or(matches!(cfg.auth.backend, config::AuthBackend::OpenBao));
+    let directory: Arc<dyn Directory> = if cache_enabled {
+        let cache_cfg = s32p_directory::CacheConfig {
+            user_ttl:     std::time::Duration::from_secs(cfg.auth.cache.user_ttl_secs),
+            buckets_ttl:  std::time::Duration::from_secs(cfg.auth.cache.buckets_ttl_secs),
+            negative_ttl: std::time::Duration::from_secs(cfg.auth.cache.negative_ttl_secs),
+            max_entries:  cfg.auth.cache.max_entries,
+        };
+        tracing::info!(
+            backend = ?cfg.auth.backend,
+            user_ttl_secs = cfg.auth.cache.user_ttl_secs,
+            buckets_ttl_secs = cfg.auth.cache.buckets_ttl_secs,
+            negative_ttl_secs = cfg.auth.cache.negative_ttl_secs,
+            max_entries = cfg.auth.cache.max_entries,
+            "directory cache enabled"
+        );
+        Arc::new(s32p_directory::CachingDirectory::new(inner_directory, cache_cfg))
+    } else {
+        tracing::info!(
+            backend = ?cfg.auth.backend,
+            "directory cache disabled"
+        );
+        inner_directory
     };
 
     let listen = cfg.server.listen.clone();

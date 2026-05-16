@@ -53,6 +53,45 @@ pub struct AuthConfig {
 
     /// OpenBao backend options (AppRole + KV v2 + indices)
     pub openbao: Option<OpenBaoAuthConfig>,
+
+    /// Optional TTL cache in front of the directory backend. The
+    /// `enabled` field is `Option<bool>` so the proxy can apply a
+    /// backend-aware default in `main.rs`: cache is on by default for
+    /// the OpenBao backend (every request would otherwise hit Vault),
+    /// off by default for the YAML backend (lookups are already free
+    /// in-memory).
+    #[serde(default)]
+    pub cache: CacheToggle,
+}
+
+/// User-facing cache controls. See `s32p_directory::CacheConfig` for the
+/// runtime type the proxy constructs from these values.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CacheToggle {
+    /// `None` → use the per-backend default. `Some(true)` / `Some(false)`
+    /// override it.
+    pub enabled:           Option<bool>,
+    #[serde(default = "default_user_ttl_secs")]
+    pub user_ttl_secs:     u64,
+    #[serde(default = "default_buckets_ttl_secs")]
+    pub buckets_ttl_secs:  u64,
+    #[serde(default = "default_negative_ttl_secs")]
+    pub negative_ttl_secs: u64,
+    #[serde(default = "default_max_entries")]
+    pub max_entries:       usize,
+}
+
+fn default_user_ttl_secs() -> u64 {
+    30
+}
+fn default_buckets_ttl_secs() -> u64 {
+    30
+}
+fn default_negative_ttl_secs() -> u64 {
+    5
+}
+fn default_max_entries() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Deserialize)]
