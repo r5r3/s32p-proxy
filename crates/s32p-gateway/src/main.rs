@@ -1135,12 +1135,23 @@ async fn handle_versioning(
 }
 
 async fn handle_other(
-    _req: Request<Incoming>,
+    req: Request<Incoming>,
     _app: Arc<App>,
     _class: &s32p_support::classifier::S3RequestClass,
 ) -> Resp {
-    // Preserve the previous general message
-    s32p_support::s3resp::not_implemented("only GET/HEAD /{bucket}/{key} is implemented", None)
+    // Catch-all for requests the classifier couldn't match. Echo method
+    // and request-target so the client sees which shape was rejected.
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+    let message = format!(
+        "unsupported request shape: {} {}",
+        req.method(),
+        path_and_query,
+    );
+    s32p_support::s3resp::not_implemented(&message, Some(req.uri().path()))
 }
 
 // Build a HEAD response from `lstat(2)` metadata. Used when `open(2)` returns
