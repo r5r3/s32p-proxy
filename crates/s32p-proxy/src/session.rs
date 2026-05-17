@@ -21,9 +21,16 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::time;
 
-/// Length of the ephemeral access key in bytes before base32 encoding.
-/// 13 bytes → ~21 base32 chars, comfortably in the 16–128 range AWS allows.
-const ACCESS_KEY_RAND_BYTES: usize = 13;
+/// Number of base32 chars *after* the `ASIA` prefix in the ephemeral
+/// access key. 16 chars × 5 bits = 80 bits of entropy — uncrackable for
+/// any realistic session TTL — and produces a 20-char total that matches
+/// the shape AWS itself emits (`AKIA…` / `ASIA…`). 5 bits per char fits a
+/// 5-byte input → 8-char output exactly, so we encode whole 5-byte
+/// chunks with no padding bits.
+const ACCESS_KEY_RAND_CHARS: usize = 16;
+/// Raw byte count that produces `ACCESS_KEY_RAND_CHARS` of base32 with no
+/// leftover bits: every 5 bytes encodes to 8 chars.
+const ACCESS_KEY_RAND_BYTES: usize = ACCESS_KEY_RAND_CHARS * 5 / 8;
 /// Length of the ephemeral secret in raw bytes before URL-safe base64-no-pad.
 /// 30 bytes → 40 chars, matching the AWS secret-shape.
 const SECRET_KEY_RAND_BYTES: usize = 30;
@@ -163,17 +170,27 @@ impl SessionStore {
 
 /// AWS access keys start with `AKIA` / `ASIA`; we mirror the `ASIA` prefix
 /// (used for temporary creds) so client logs / cached creds look familiar.
-/// The suffix is base32 (Crockford-style A–Z, 2–7) of CSPRNG bytes.
+/// The suffix is RFC 4648 base32 (A–Z, 2–7) of CSPRNG bytes — each 5-byte
+/// chunk packs into 8 chars with no bit overlap and no padding.
 fn gen_access_key() -> String {
+    const ALPHA: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut buf = [0u8; ACCESS_KEY_RAND_BYTES];
     OsRng.fill_bytes(&mut buf);
-    let mut out = String::from("ASIA");
-    for byte in buf {
-        // 2 chars per byte, each from a 32-char alphabet → ample entropy
-        // without dragging in a full base32 crate.
-        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-        out.push(ALPHA[(byte >> 3) as usize] as char);
-        out.push(ALPHA[(byte & 0x1f) as usize] as char);
+
+    let mut out = String::with_capacity(4 + ACCESS_KEY_RAND_CHARS);
+    out.push_str("ASIA");
+
+    // 5 bytes → 40 bits → 8 base32 chars. Big-endian accumulator; chars
+    // come off in the order: bits 39..35, 34..30, ..., 4..0.
+    for chunk in buf.chunks_exact(5) {
+        let acc = ((chunk[0] as u64) << 32)
+            | ((chunk[1] as u64) << 24)
+            | ((chunk[2] as u64) << 16)
+            | ((chunk[3] as u64) << 8)
+            | (chunk[4] as u64);
+        for shift in (0..8).rev() {
+            out.push(ALPHA[((acc >> (shift * 5)) & 0x1f) as usize] as char);
+        }
     }
     out
 }
@@ -192,7 +209,16 @@ mod tests {
     fn access_key_shape() {
         let k = gen_access_key();
         assert!(k.starts_with("ASIA"));
-        assert_eq!(k.len(), 4 + ACCESS_KEY_RAND_BYTES * 2);
+        assert_eq!(k.len(), 4 + ACCESS_KEY_RAND_CHARS);
+        // Every random-part char must come from the RFC 4648 base32
+        // alphabet — i.e. exactly one of `A-Z` or `2-7`. Anything outside
+        // that set would mean the encoder ran off the end of `ALPHA`
+        // (currently impossible by construction, but the test pins the
+        // contract so a future refactor can't silently introduce bias).
+        for c in k[4..].chars() {
+            let ok = c.is_ascii_uppercase() || ('2'..='7').contains(&c);
+            assert!(ok, "non-base32 char {c:?} in access key {k:?}");
+        }
     }
 
     #[test]
