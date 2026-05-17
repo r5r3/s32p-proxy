@@ -311,6 +311,22 @@ def proxy_harness(tmp_path_factory, request) -> ProxyHarness:
             bucket_id=f"bkt-{name}",
         ))
 
+    # Parallel pool of directory-bucket-shaped names for adapters that
+    # advertise Capability.DIRECTORY_BUCKET (boto3-directory, etc.).
+    # The `--x-s3` suffix is what botocore's endpoint ruleset checks to
+    # activate the S3 Express data plane (CreateSession + s3express
+    # signing). Our gateway accepts any bucket name; the suffix only
+    # exists to make boto3 cooperate. The `--use1-az4--` segment is
+    # cosmetic (mimics AWS's `<base>--<az>--x-s3` shape).
+    for i in range(BUCKET_POOL_SIZE):
+        name = f"test-dirbucket-{i:03d}--use1-az4--x-s3"
+        harness.directory.add_bucket(Bucket(
+            name=name,
+            data_path=bucket_data_root / name,
+            grants=(Grant("ak", TEST_ACCESS_KEY, "read_write"),),
+            bucket_id=f"bkt-dir-{i:03d}",
+        ))
+
     # ACL test buckets. These are separate from the pool because each one
     # has a fixed grant configuration that the test relies on; the pool
     # buckets are all read_write to TEST and would defeat the purpose.
@@ -413,7 +429,7 @@ def _wipe_bucket_contents(data_dir: Path) -> None:
 
 
 @pytest.fixture
-def _leased_bucket(proxy_harness) -> tuple[str, BackendFs]:
+def _leased_bucket(request, proxy_harness) -> tuple[str, BackendFs]:
     """Lease one bucket from the pool, wipe its *contents*, return (name, fs).
 
     The data dir itself is preserved (it was created at session start by
@@ -422,11 +438,36 @@ def _leased_bucket(proxy_harness) -> tuple[str, BackendFs]:
     test leave debris on disk for inspection while still giving the next
     test a clean slate. Tests should depend on `bucket` and/or `bucket_fs`
     rather than this fixture directly.
+
+    Capability-aware: when the active test is parametrized over a client
+    that advertises `Capability.DIRECTORY_BUCKET`, the lease comes from
+    the parallel `test-dirbucket-NNN--use1-az4--x-s3` pool — botocore's
+    endpoint ruleset only activates the S3 Express data plane for names
+    ending in `--x-s3`. Raw-SigV4 tests (test_session.py, test_rename.py,
+    test_append.py) don't parametrize over `_client_cls`, so the lookup
+    returns None and they fall through to the legacy pool unchanged.
     """
     global _bucket_counter
     idx = _bucket_counter % BUCKET_POOL_SIZE
     _bucket_counter += 1
-    name = f"test-bucket-{idx:03d}"
+
+    # Inspect the parametrized `_client_cls` via `callspec.params`,
+    # which is set at *collection time* — before any fixture runs.
+    # `request.node.funcargs` is populated later in the test phase and
+    # would still be empty here. Raw-SigV4 tests don't parametrize over
+    # `_client_cls` and have no callspec, so the lookup falls back to
+    # the legacy pool.
+    callspec = getattr(request.node, "callspec", None)
+    cls = callspec.params.get("_client_cls") if callspec is not None else None
+    use_directory = (
+        cls is not None
+        and Capability.DIRECTORY_BUCKET in cls.capabilities
+    )
+    name = (
+        f"test-dirbucket-{idx:03d}--use1-az4--x-s3"
+        if use_directory
+        else f"test-bucket-{idx:03d}"
+    )
 
     data_dir = proxy_harness.session_dir / "buckets" / name
     _wipe_bucket_contents(data_dir)

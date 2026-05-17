@@ -30,6 +30,17 @@ from __future__ import annotations
 import pytest
 
 from s32p_test.clients.base import S3Error
+from s32p_test.clients.capabilities import Capability
+
+
+# Skip the whole file on adapters that can't address the ACL bucket pool
+# (`acl-readonly`, `acl-rw`, …). Those names don't end in `--x-s3`, so
+# boto3 in directory-bucket mode can't route to them via CreateSession.
+# `BUCKET_ACL` is a reasonable proxy for "this client uses legacy bucket
+# names + supports ACLs" — the directory-bucket adapter drops both flags
+# together. If a future adapter splits them, revisit with a dedicated
+# capability flag.
+pytestmark = pytest.mark.requires_capability(Capability.BUCKET_ACL)
 
 
 # ----------------------------------------------------------------- helpers

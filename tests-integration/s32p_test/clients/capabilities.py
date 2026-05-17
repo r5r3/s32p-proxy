@@ -31,6 +31,12 @@ class Capability(Enum):
     # s32p extension
     RENAME_OBJECT = auto()
 
+    # S3 Express directory-bucket personality. Triggered client-side by
+    # boto3 / aws-cli when the bucket name ends in `--x-s3`. Advertised
+    # only by adapters that route requests through the directory-bucket
+    # data plane (CreateSession bootstrap + service=s3express signing).
+    DIRECTORY_BUCKET = auto()
+
     # Signing
     PRESIGN_GET = auto()
     PRESIGN_PUT = auto()
