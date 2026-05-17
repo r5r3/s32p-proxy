@@ -212,15 +212,61 @@ impl ProxyHttp for S3ProxyApp {
         // too because the worker can't redo it later — workers don't have a
         // Directory and can't see the session store.
         let (user, session_validated) = if let Some(entry) = self.sessions.lookup(&access_key) {
-            // Cross-bucket scope. A session minted for bucket A must not be
-            // accepted on bucket B. Reject before SigV4 to avoid leaking
-            // "this access_key is a valid session" via timing.
-            if class.bucket.as_deref() != Some(entry.bucket.as_str()) {
+            // Validate the session token bound at mint time. AWS S3 Express
+            // sends it as `x-amz-s3session-token` on every data-plane request;
+            // we require an exact, constant-time match against the value we
+            // stored. This is the second factor on top of the ephemeral
+            // secret: an attacker who scraped the access key from a log but
+            // never saw the token cannot use the session.
+            //
+            // Checked before bucket/SigV4 so a probing caller cannot
+            // distinguish "valid session, wrong everything else" from any
+            // other 403 via the response — all session-bound rejections
+            // share the same generic AccessDenied shape.
+            let provided_token = req
+                .headers
+                .get("x-amz-s3session-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let token_ok = provided_token.len() == entry.session_token.len()
+                && constant_time_eq::constant_time_eq(
+                    provided_token.as_bytes(),
+                    entry.session_token.as_bytes(),
+                );
+            if !token_ok {
+                tracing::debug!(
+                    real_access_key = entry.real_access_key.as_str(),
+                    token_present = !provided_token.is_empty(),
+                    "session-token validation failed; rejecting"
+                );
                 responses::respond_s3_error(
                     session,
                     StatusCode::FORBIDDEN,
                     responses::error_code::ACCESS_DENIED,
-                    "session credentials are scoped to a different bucket",
+                    "Access Denied",
+                    Some(req.uri.path()),
+                    None,
+                )
+                .await?;
+                return Ok(true);
+            }
+
+            // Cross-bucket scope. A session minted for bucket A must not be
+            // accepted on bucket B. The response is a generic AccessDenied:
+            // a probing caller must not be able to distinguish "valid session,
+            // wrong bucket" from any other 403 via the message body.
+            if class.bucket.as_deref() != Some(entry.bucket.as_str()) {
+                tracing::debug!(
+                    session_bucket = entry.bucket.as_str(),
+                    request_bucket = class.bucket.as_deref().unwrap_or("<none>"),
+                    real_access_key = entry.real_access_key.as_str(),
+                    "session credentials replayed against a different bucket; rejecting"
+                );
+                responses::respond_s3_error(
+                    session,
+                    StatusCode::FORBIDDEN,
+                    responses::error_code::ACCESS_DENIED,
+                    "Access Denied",
                     Some(req.uri.path()),
                     None,
                 )

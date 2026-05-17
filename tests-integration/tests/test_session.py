@@ -56,13 +56,22 @@ def _create_session_raw(
     mode: str | None = None,
     access_key: str | None = None,
     secret_key: str | None = None,
+    session_token: str | None = None,
 ) -> requests.Response:
     """Send a SigV4-signed `GET /{bucket}?session`. Optional `mode` is
-    `ReadOnly` | `ReadWrite`; AWS defaults to ReadWrite when absent."""
+    `ReadOnly` | `ReadWrite`; AWS defaults to ReadWrite when absent.
+
+    `session_token` is used by the "sessions can't beget sessions" test to
+    pass the proxy's token gate so the request reaches the action-level
+    rejection — a real long-term-cred CreateSession never carries this
+    header.
+    """
     url = f"{endpoint.base_url}/{bucket}?session"
     headers: dict[str, str] = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
     if mode is not None:
         headers["x-amz-create-session-mode"] = mode
+    if session_token is not None:
+        headers["x-amz-s3session-token"] = session_token
     signed = _sign(
         "GET",
         url,
@@ -103,10 +112,26 @@ def _parse_session(body: str) -> SessionCreds:
     )
 
 
-def _put_with_session(endpoint, bucket: str, key: str, body: bytes, creds: SessionCreds) -> requests.Response:
-    """PUT signed with session credentials (service=s3express)."""
+def _put_with_session(
+    endpoint,
+    bucket: str,
+    key: str,
+    body: bytes,
+    creds: SessionCreds,
+    *,
+    token_override: str | None = None,
+    omit_token: bool = False,
+) -> requests.Response:
+    """PUT signed with session credentials (service=s3express).
+
+    The proxy enforces `x-amz-s3session-token` matches what CreateSession
+    minted. `token_override` lets a test send a wrong value; `omit_token`
+    lets a test drop the header entirely.
+    """
     url = f"{endpoint.base_url}/{bucket}/{quote(key, safe='/')}"
     headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+    if not omit_token:
+        headers["x-amz-s3session-token"] = token_override if token_override is not None else creds.session_token
     signed = _sign(
         "PUT", url, headers, body,
         access_key=creds.access_key,
@@ -117,9 +142,19 @@ def _put_with_session(endpoint, bucket: str, key: str, body: bytes, creds: Sessi
     return requests.put(url, data=body, headers=signed, timeout=10)
 
 
-def _get_with_session(endpoint, bucket: str, key: str, creds: SessionCreds) -> requests.Response:
+def _get_with_session(
+    endpoint,
+    bucket: str,
+    key: str,
+    creds: SessionCreds,
+    *,
+    token_override: str | None = None,
+    omit_token: bool = False,
+) -> requests.Response:
     url = f"{endpoint.base_url}/{bucket}/{quote(key, safe='/')}"
     headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+    if not omit_token:
+        headers["x-amz-s3session-token"] = token_override if token_override is not None else creds.session_token
     signed = _sign(
         "GET", url, headers, b"",
         access_key=creds.access_key,
@@ -218,7 +253,10 @@ def test_cross_bucket_session_use_rejected(endpoint, proxy_harness):
 
     # GET against the *wrong* bucket → 403 from proxy.
     url = f"{endpoint.base_url}/{bucket_b}/whatever"
-    headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+    headers = {
+        "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+        "x-amz-s3session-token": creds.session_token,
+    }
     signed = _sign(
         "GET", url, headers, b"",
         access_key=creds.access_key,
@@ -234,16 +272,50 @@ def test_cross_bucket_session_use_rejected(endpoint, proxy_harness):
 def test_create_session_with_session_creds_rejected(endpoint, bucket):
     """Sessions cannot beget sessions — CreateSession itself requires the
     caller's long-term IAM credentials. A session-signed CreateSession
-    request must 400 InvalidRequest."""
+    request that *also* carries the correct session-token (so it gets past
+    the access-control gate) must 400 InvalidRequest at the action-level
+    check."""
     creds = _parse_session(_create_session_raw(endpoint, bucket).text)
 
     resp = _create_session_raw(
         endpoint, bucket,
         access_key=creds.access_key,
         secret_key=creds.secret_key,
+        session_token=creds.session_token,
     )
     assert resp.status_code == 400, resp.text
     assert "<Code>InvalidRequest</Code>" in resp.text, resp.text
+
+
+def test_session_request_without_token_rejected(endpoint, bucket, bucket_fs):
+    """Session-signed request that omits `x-amz-s3session-token` must be
+    rejected at the proxy with a generic 403. The token is the second factor
+    (the first is the ephemeral secret); a leaked access key alone is not
+    enough to use the session."""
+    creds = _parse_session(_create_session_raw(endpoint, bucket).text)
+
+    resp = _put_with_session(endpoint, bucket, "no-token.bin", b"x", creds, omit_token=True)
+    assert resp.status_code == 403, resp.text
+    assert "<Code>AccessDenied</Code>" in resp.text, resp.text
+    assert not bucket_fs.exists("no-token.bin")
+
+
+def test_session_request_with_wrong_token_rejected(endpoint, bucket, bucket_fs):
+    """Session-signed request that carries the wrong token value (e.g. a
+    token from a different session or an attacker's guess) must be rejected.
+    The same-length variant exercises the constant-time compare path."""
+    creds = _parse_session(_create_session_raw(endpoint, bucket).text)
+    # Same length, different value — exercises the byte-compare, not just
+    # the length-prefilter.
+    wrong_same_len = "0" * len(creds.session_token)
+    assert wrong_same_len != creds.session_token
+
+    resp = _put_with_session(
+        endpoint, bucket, "wrong-token.bin", b"x", creds, token_override=wrong_same_len
+    )
+    assert resp.status_code == 403, resp.text
+    assert "<Code>AccessDenied</Code>" in resp.text, resp.text
+    assert not bucket_fs.exists("wrong-token.bin")
 
 
 def test_unknown_session_access_key_rejected(endpoint, bucket):
