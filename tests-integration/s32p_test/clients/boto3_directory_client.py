@@ -56,13 +56,15 @@ class Boto3DirectoryClient(Boto3Client):
         Capability.COPY_OBJECT,
         Capability.DELETE_OBJECTS,
         Capability.MULTIPART,
-        # No PRESIGN_*: in directory-bucket mode every presigned URL is
-        # generated with the ephemeral session credentials minted by
-        # CreateSession (scope `…/s3express/aws4_request` + an
-        # `X-Amz-S3session-Token` query param). The proxy doesn't yet
-        # look up sessions for presigned URLs — `uid=0 username=<unknown>`
-        # in the proxy log on the 403. Tracked as a follow-up gap in
-        # `directory-bucket-support.md`.
+        # Presigned URLs in directory-bucket mode use ephemeral session
+        # credentials (scope `…/s3express/aws4_request` +
+        # `X-Amz-S3session-Token` query param). The proxy validates them
+        # via the same session-store path as header-SigV4: the token is
+        # accepted from either the header or the presigned-URL query.
+        Capability.PRESIGN_GET,
+        Capability.PRESIGN_PUT,
+        Capability.PRESIGN_HEAD,
+        Capability.PRESIGN_DELETE,
         Capability.UNSIGNED_PAYLOAD,
         Capability.CONDITIONAL_REQUESTS,
     }

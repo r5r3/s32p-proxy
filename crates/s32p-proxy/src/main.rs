@@ -223,11 +223,21 @@ impl ProxyHttp for S3ProxyApp {
             // distinguish "valid session, wrong everything else" from any
             // other 403 via the response — all session-bound rejections
             // share the same generic AccessDenied shape.
-            let provided_token = req
+            //
+            // Header-SigV4 requests carry the token in `x-amz-s3session-token`;
+            // presigned URLs carry it in the query as `X-Amz-S3session-Token`
+            // (boto3 / aws-cli SDK emit it this way for service=s3express).
+            // Either form is acceptable; check header first, fall back to
+            // query.
+            let header_token = req
                 .headers
                 .get("x-amz-s3session-token")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+                .map(str::to_string);
+            let provided_token = header_token
+                .or_else(|| presign_session_token_from_query(req.uri.query().unwrap_or("")))
+                .unwrap_or_default();
+            let provided_token = provided_token.as_str();
             let token_ok = provided_token.len() == entry.session_token.len()
                 && constant_time_eq::constant_time_eq(
                     provided_token.as_bytes(),
@@ -691,6 +701,26 @@ impl ProxyHttp for S3ProxyApp {
             );
         }
     }
+}
+
+/// Extract `X-Amz-S3session-Token` from a SigV4 presigned-URL query string.
+///
+/// Returns `None` if the param is absent or empty. Case-insensitive on the
+/// key (botocore emits `X-Amz-S3session-Token`, lowercase variants are
+/// accepted defensively). The value is percent-decoded by `form_urlencoded`.
+fn presign_session_token_from_query(q: &str) -> Option<String> {
+    if q.is_empty() {
+        return None;
+    }
+    for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
+        if k.eq_ignore_ascii_case("x-amz-s3session-token") {
+            let v = v.into_owned();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 async fn validate_sigv4_header_only_or_reject(

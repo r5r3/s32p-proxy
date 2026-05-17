@@ -209,6 +209,14 @@ impl QueryParams {
                 | "x-amz-signedheaders"
                 | "x-amz-signature"
                 | "x-amz-security-token"
+                // `x-amz-s3session-token` is the S3 Express equivalent of
+                // `x-amz-security-token`: it carries the ephemeral session
+                // token in presigned URLs minted from a CreateSession
+                // response. Same routing posture — ignore for
+                // classification, but the proxy reads it for session
+                // lookup (see `presign_session_token_from_query` in
+                // `s32p-proxy/src/main.rs`).
+                | "x-amz-s3session-token"
         )
     }
 
