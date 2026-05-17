@@ -94,6 +94,14 @@ class MountpointSession:
     refuses opens that would truncate. Ignored when `mode='ro'`
     (read-only mounts already block writes at the FUSE layer)."""
 
+    incremental_upload: bool = False
+    """Whether to pass `--incremental-upload`. When `True`, mountpoint-s3
+    turns large writes into a chain of `PUT … x-amz-write-offset-bytes:
+    <offset>` requests against the same key (S3 Express directory-bucket
+    append). This exercises the gateway's
+    `handle_put_object_append` path end-to-end. Ignored when
+    `mode='ro'`."""
+
     # Derived in __post_init__
     mount_dir: Path = field(init=False)
     log_path: Path = field(init=False)
@@ -149,10 +157,14 @@ class MountpointSession:
             # unlinks; `--allow-overwrite` enables truncating opens and
             # — load-bearing for these tests — omits the
             # `If-None-Match: *` header that mountpoint-s3 otherwise adds
-            # to every RenameObject call.
+            # to every RenameObject call. `--incremental-upload` switches
+            # writes from "buffer the whole file then PUT" to chained
+            # appends using `x-amz-write-offset-bytes`.
             argv.append("--allow-delete")
             if self.allow_overwrite:
                 argv.append("--allow-overwrite")
+            if self.incremental_upload:
+                argv.append("--incremental-upload")
         else:
             argv.append("--read-only")
         if self.debug:

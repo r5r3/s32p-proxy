@@ -40,6 +40,15 @@ pub mod error_code {
     /// tokens. mountpoint-s3 doesn't currently produce a token mismatch
     /// (it generates a fresh UUID per call), but other SDKs may.
     pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
+
+    /// Generic "bad request argument" used by S3. mountpoint-s3's
+    /// `PutObjectError::EmptyBody` is keyed on this code together with
+    /// the literal message prefix "Request body cannot be empty".
+    pub const INVALID_ARGUMENT: &str = "InvalidArgument";
+
+    /// `x-amz-write-offset-bytes` did not equal the current object size.
+    /// AWS S3 Express directory-bucket append surface.
+    pub const INVALID_WRITE_OFFSET: &str = "InvalidWriteOffset";
 }
 
 /// Minimal bucket info used by ListBuckets.

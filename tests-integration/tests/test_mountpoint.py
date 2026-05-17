@@ -432,6 +432,71 @@ def test_rename_into_existing_destination_blocked_without_overwrite(
     assert bucket_fs.read("src.bin") == b"new bytes\n"
 
 
+# ----------------------------------------------------------------- incremental upload
+
+
+@pytest.fixture
+def mount_incremental(tmp_path, endpoint, bucket):
+    """Read-write mount with `--incremental-upload`. Writes through this
+    mount turn into a chain of `PUT … x-amz-write-offset-bytes` requests
+    (S3 Express directory-bucket append) instead of a buffered single PUT
+    or multipart upload. Used to exercise the gateway's
+    `handle_put_object_append` end-to-end."""
+    session = MountpointSession(
+        endpoint_url=endpoint.base_url,
+        region=endpoint.region,
+        access_key=endpoint.access_key,
+        secret_key=endpoint.secret_key,
+        bucket=bucket,
+        mount_root=tmp_path,
+        mode="rw",
+        incremental_upload=True,
+    )
+    session.start()
+    try:
+        yield session
+    finally:
+        session.stop()
+
+
+def test_mount_incremental_large_write_chains_appends(mount_incremental, bucket_fs):
+    """Write > 8 MiB through the mount in one go. Mountpoint-s3's default
+    write-part-size is 8 MiB, so a single ~17 MiB write fans out into
+    three chained appends (offset 0, 8 MiB, 16 MiB). The test fails if
+    any chunk lands at the wrong offset, or if the inode-based ETag
+    chain breaks between chunks. Readback compares the full bytes —
+    a mid-chunk corruption is visible in the assertion.
+
+    Deterministic pattern (xor of two prime-period sequences) so a
+    failure report points at a specific offset rather than "binaries
+    differ"."""
+    mount = mount_incremental
+
+    # 17 MiB. Big enough to span 3 default 8 MiB chunks; small enough to
+    # write in well under a second on a loopback mount.
+    size = 17 * 1024 * 1024
+    payload = bytearray(size)
+    for i in range(size):
+        payload[i] = ((i * 13) ^ (i * 7 >> 8)) & 0xFF
+    payload = bytes(payload)
+
+    target = mount.path / "big.bin"
+    target.write_bytes(payload)
+
+    assert _wait_for_backend_file(bucket_fs, "big.bin"), mount.log_tail()
+    got = bucket_fs.read("big.bin")
+    assert len(got) == size, (len(got), size, mount.log_tail())
+    if got != payload:
+        # Locate the first byte that differs so the failure points at a
+        # concrete offset (and lets us infer which chunk was corrupted).
+        for i in range(size):
+            if got[i] != payload[i]:
+                raise AssertionError(
+                    f"byte {i} differs: backend=0x{got[i]:02x} expected=0x{payload[i]:02x}\n"
+                    f"--- mount-s3 log ---\n{mount.log_tail()}"
+                )
+
+
 # ----------------------------------------------------------------- read-only
 
 

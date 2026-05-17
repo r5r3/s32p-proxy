@@ -141,6 +141,8 @@ pub enum OpenMode {
     WriteCreateTruncate,
     /// read+write, create if missing
     ReadWriteCreate,
+    /// write-only, must already exist, no truncate; for appendable PUT.
+    WriteExistingNoTrunc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +218,9 @@ fn open_file_io(path: &Path, mode: OpenMode, direct: bool) -> io::Result<File> {
         OpenMode::ReadWriteCreate => {
             oo.read(true).write(true).create(true);
         }
+        OpenMode::WriteExistingNoTrunc => {
+            oo.write(true).create(false).truncate(false);
+        }
     }
 
     if direct {
@@ -241,7 +246,7 @@ pub fn open_file(
     {
         if let Some(s) = striping {
             let should_create = match mode {
-                OpenMode::Read => false,
+                OpenMode::Read | OpenMode::WriteExistingNoTrunc => false,
                 OpenMode::WriteCreateTruncate => true,
                 OpenMode::ReadWriteCreate => !path.exists(),
             };
@@ -316,6 +321,20 @@ pub fn ftruncate_fd(fd: RawFd, len: u64) -> Result<()> {
 
 pub fn ftruncate_file(file: &File, len: u64) -> Result<()> {
     ftruncate_fd(file.as_raw_fd(), len)
+}
+
+/// Take an exclusive advisory lock (`flock(LOCK_EX)`) on the given file.
+/// The lock is released automatically when the file descriptor is closed.
+///
+/// Used by the appendable-PUT path to serialize the
+/// "stat current size → write at offset" window between concurrent
+/// appends to the same key. Same idiom as multipart's `meta.json` lock.
+pub fn flock_exclusive(file: &File) -> io::Result<()> {
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Best-effort preallocation for [start, start+len). Falls back to ftruncate(end) if fallocate(range) is unsupported.

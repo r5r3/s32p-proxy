@@ -74,7 +74,7 @@ use crate::{
     buffer::{BufPool, PooledBuf, SliceOwner},
     fs_helpers::{
         LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path,
-        join_object_path, open_file, statx_info,
+        flock_exclusive, join_object_path, open_file, statx_info,
     },
     streaming::{
         StreamCfg, WriteObjectDest, copy_file_to_file, stream_range_body, write_object_body,
@@ -422,6 +422,25 @@ async fn handle(
             "rejecting write on read_only-granted bucket"
         );
         return Ok(s32p_support::s3resp::access_denied("access denied", Some(req.uri().path())));
+    }
+
+    // `x-amz-write-offset-bytes` is only valid on PutObject. Reject up
+    // front on every other route so a stray header can't reach
+    // CopyObject / UploadPart / DeleteObject / etc. and silently get
+    // ignored.
+    if req.headers().contains_key("x-amz-write-offset-bytes")
+        && !matches!(
+            class.op,
+            s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::PutObject)
+        )
+    {
+        return Ok(s32p_support::s3resp::s3_error(
+            http::StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+            "x-amz-write-offset-bytes is only valid on PutObject",
+            Some(req.uri().path()),
+            None,
+        ));
     }
 
     let resp = match &class.op {
@@ -2663,6 +2682,39 @@ async fn handle_put_object(
         }
     };
 
+    // S3 Express directory-bucket append (PutObject with
+    // `x-amz-write-offset-bytes`). The header must equal the current
+    // object size; the body is streamed at that offset without
+    // truncating. Mountpoint-s3 in `--incremental-upload` mode drives
+    // this path. offset == 0 is treated as a normal create-or-replace
+    // PUT and falls through to the regular code path below.
+    let write_offset = match parse_write_offset_header(req.headers()) {
+        Ok(v) => v,
+        Err(reason) => {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                reason,
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    if let Some(offset) = write_offset
+        && offset > 0
+    {
+        return handle_put_object_append(
+            req,
+            app.clone(),
+            obj_path,
+            offset,
+            logical_len,
+            is_aws_chunked,
+        )
+        .await;
+    }
+
     // check preconditions
     let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
@@ -2752,6 +2804,246 @@ async fn handle_put_object(
     };
 
     let etag = format!("\"{}\"", meta.ino());
+    s32p_support::s3resp::put_object_ok(&etag)
+}
+
+/// Parse the optional `x-amz-write-offset-bytes` header.
+///
+/// Returns `Ok(None)` if absent. Strict base-10 `u64`; rejects whitespace,
+/// signs, hex, or multiple values. Error string is plain prose suitable
+/// for the response body.
+fn parse_write_offset_header(headers: &http::HeaderMap) -> Result<Option<u64>, &'static str> {
+    let mut iter = headers.get_all("x-amz-write-offset-bytes").iter();
+    let Some(v) = iter.next() else {
+        return Ok(None);
+    };
+    if iter.next().is_some() {
+        return Err("x-amz-write-offset-bytes specified more than once");
+    }
+    let s = v.to_str().map_err(|_| "x-amz-write-offset-bytes is not valid ASCII")?;
+    // Require strict digits: no leading sign, no whitespace, no underscores.
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("x-amz-write-offset-bytes must be a non-negative integer");
+    }
+    let n: u64 = s.parse().map_err(|_| "x-amz-write-offset-bytes is out of range")?;
+    Ok(Some(n))
+}
+
+/// Streamed append PUT (`x-amz-write-offset-bytes > 0`).
+///
+/// Order of checks mirrors what mountpoint-s3's
+/// `parse_put_object_single_error` expects:
+///
+///   1. directory-marker keys rejected (InvalidRequest 400)
+///   2. open existing file — NotFound → NoSuchKey 404
+///   3. flock(LOCK_EX) on the opened fd
+///   4. stat under the lock; offset != size → InvalidWriteOffset 400
+///   5. If-Match / If-None-Match etc. → PreconditionFailed 412
+///   6. empty body → InvalidArgument 400 with the literal AWS prefix
+///      "Request body cannot be empty" (mountpoint string-matches it)
+///   7. stream-write at `offset`, no truncate, no padding
+///
+/// The inode-based ETag is stable across appends, so the response ETag
+/// equals the pre-append ETag. Mountpoint's chained `If-Match` loop
+/// works unchanged.
+async fn handle_put_object_append(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    obj_path: PathBuf,
+    offset: u64,
+    logical_len: u64,
+    is_aws_chunked: bool,
+) -> Resp {
+    let cfg = app.cfg.clone();
+    let uri_path = req.uri().path().to_owned();
+
+    // Directory-marker keys can't be appended to: they're directories on
+    // disk, not regular files, and AWS rejects the combination too.
+    if req.uri().path().ends_with('/') {
+        return s32p_support::s3resp::invalid_request(
+            "x-amz-write-offset-bytes is not valid on a directory marker",
+            Some(&uri_path),
+        );
+    }
+
+    // Parse preconditions up front so a malformed header still maps to
+    // InvalidRequest (matches the non-append PUT branch).
+    let cond = match parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            return s32p_support::s3resp::invalid_request(
+                &format!("invalid conditional headers: {e}"),
+                Some(&uri_path),
+            );
+        }
+    };
+
+    // HTTP layer must still announce a Content-Length (or aws-chunked
+    // payload metadata, captured by compute_logical_len). Mirror the
+    // ordinary PUT check.
+    if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing Content-Length",
+            Some(&uri_path),
+            None,
+        );
+    }
+
+    // Open the destination. `WriteExistingNoTrunc` => O_WRONLY without
+    // O_CREAT / O_TRUNC, so a missing key surfaces as NotFound and we
+    // emit NoSuchKey — matching mountpoint's
+    // `test_append_non_existing_object` expectation. TryDirect lets the
+    // streaming layer use O_DIRECT only when the offset+length happen to
+    // be aligned (`direct_io_ok_for_aligned_range`); otherwise the open
+    // falls back to buffered.
+    let direct = if cfg.direct_io { OpenDirect::TryDirect } else { OpenDirect::Buffered };
+    let (file, _used_direct) = match open_file(&obj_path, OpenMode::WriteExistingNoTrunc, direct, None) {
+        Ok(t) => t,
+        Err(e) => {
+            // open_file wraps the underlying io::Error in anyhow; reach
+            // through to classify by ErrorKind.
+            let io_kind = e.downcast_ref::<std::io::Error>().map(|ie| ie.kind());
+            return match io_kind {
+                Some(std::io::ErrorKind::NotFound) => {
+                    s32p_support::s3resp::no_such_key("not found", Some(&uri_path))
+                }
+                Some(std::io::ErrorKind::PermissionDenied) => {
+                    s32p_support::s3resp::access_denied("permission denied", Some(&uri_path))
+                }
+                _ => s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(&uri_path),
+                    None,
+                ),
+            };
+        }
+    };
+
+    // Take an exclusive advisory lock on the opened fd. This serializes
+    // against another in-flight append on the same inode and is released
+    // when `file` drops at end of scope. The competing parallel-appender
+    // wakes up, re-stats, and gets InvalidWriteOffset on its own pass.
+    if let Err(e) = flock_exclusive(&file) {
+        return s32p_support::s3resp::internal_error(
+            &format!("flock failed: {e}"),
+            Some(&uri_path),
+            None,
+        );
+    }
+
+    // Stat *under the lock* so the size check and the write share a
+    // consistent view of the file.
+    let cur_meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &format!("fstat after flock failed: {e}"),
+                Some(&uri_path),
+                None,
+            );
+        }
+    };
+    if cur_meta.is_dir() {
+        // We opened in WriteExistingNoTrunc which can't succeed on a
+        // directory under most kernels, but guard explicitly so the
+        // failure mode is the documented one.
+        return s32p_support::s3resp::invalid_request(
+            "x-amz-write-offset-bytes target is a directory",
+            Some(&uri_path),
+        );
+    }
+
+    let cur_size = cur_meta.len();
+    if offset != cur_size {
+        tracing::debug!(
+            offset,
+            cur_size,
+            path = %obj_path.display(),
+            "append rejected: x-amz-write-offset-bytes != current size"
+        );
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_WRITE_OFFSET,
+            "the write offset does not match the current object size",
+            Some(&uri_path),
+            None,
+        );
+    }
+
+    // Run write preconditions against the file we actually have open.
+    // Inode-based, unquoted etag for consistency with the non-append
+    // PUT path.
+    let existing_etag = format!("{}", cur_meta.ino());
+    let existing_lm = cur_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    match evaluate_write_preconditions(&cond, Some((existing_etag.as_str(), existing_lm))) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified => {} // not used for PUT
+        PreconditionOutcome::PreconditionFailed => {
+            tracing::debug!(
+                path = %obj_path.display(),
+                "append rejected: precondition failed"
+            );
+            return s32p_support::s3resp::precondition_failed(
+                "PUT precondition failed",
+                Some(&uri_path),
+            );
+        }
+    }
+
+    // Empty body is rejected with the literal AWS error message prefix
+    // that mountpoint-s3's `parse_put_object_single_error` matches on
+    // (see mountpoint-s3-client/src/s3_crt_client/put_object.rs:318-320).
+    if logical_len == 0 {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+            "Request body cannot be empty",
+            Some(&uri_path),
+            None,
+        );
+    }
+
+    let (_parts, body) = req.into_parts();
+
+    // Stream at fixed offset. WriteObjectDest::File never truncates and
+    // never pads; the StreamCfg / O_DIRECT decisions happen inside
+    // write_object_body based on alignment.
+    let file = Arc::new(file);
+    if let Err(e) = write_object_body(
+        body,
+        WriteObjectDest::File { file: file.clone(), start_off: offset },
+        logical_len,
+        is_aws_chunked,
+        StreamCfg {
+            chunk_size: cfg.chunk_size,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
+        },
+        app.uring.clone(),
+        app.pool.clone(),
+    )
+    .await
+    {
+        return s32p_support::s3resp::internal_error(&e.to_string(), Some(&uri_path), None);
+    }
+
+    // Inode is stable across in-place append, so the ETag is unchanged.
+    // We still re-stat (under the lock) to source the response from a
+    // single authoritative read.
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &format!("fstat after append failed: {e}"),
+                Some(&uri_path),
+                None,
+            );
+        }
+    };
+    let etag = format!("\"{}\"", meta.ino());
+    // `file` (and its flock) drop here.
     s32p_support::s3resp::put_object_ok(&etag)
 }
 
