@@ -29,6 +29,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 aligned-buffer = "0.2"
 libc = { workspace = true }
+dashmap = "6"
 
 base64 = "0.22"
 serde_json = { workspace = true }

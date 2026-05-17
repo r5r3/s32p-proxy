@@ -87,6 +87,12 @@ class MountpointSession:
     force_path_style: bool = True
     extra_args: tuple[str, ...] = ()
     debug: bool = True
+    allow_overwrite: bool = True
+    """Whether to pass `--allow-overwrite`. Default `True` matches the
+    rest of the rw mount tests; flip to `False` to exercise the path
+    where mountpoint-s3 sends `If-None-Match: *` on every rename and
+    refuses opens that would truncate. Ignored when `mode='ro'`
+    (read-only mounts already block writes at the FUSE layer)."""
 
     # Derived in __post_init__
     mount_dir: Path = field(init=False)
@@ -139,10 +145,14 @@ class MountpointSession:
         if self.force_path_style:
             argv.append("--force-path-style")
         if self.mode == "rw":
-            # mount-s3 is read-only by default. `--allow-delete` and
-            # `--allow-overwrite` are the two flags that flip it to a
-            # standard rw POSIX-style mount.
-            argv.extend(["--allow-delete", "--allow-overwrite"])
+            # mount-s3 is read-only by default. `--allow-delete` enables
+            # unlinks; `--allow-overwrite` enables truncating opens and
+            # — load-bearing for these tests — omits the
+            # `If-None-Match: *` header that mountpoint-s3 otherwise adds
+            # to every RenameObject call.
+            argv.append("--allow-delete")
+            if self.allow_overwrite:
+                argv.append("--allow-overwrite")
         else:
             argv.append("--read-only")
         if self.debug:

@@ -33,6 +33,13 @@ pub mod error_code {
 
     // for precondition checks
     pub const PRECONDITION_FAILED: &str = "PreconditionFailed";
+
+    /// A retry of an idempotent operation (`x-amz-client-token`) reused
+    /// the same token for a *different* request payload. AWS surfaces
+    /// this as 409 with this code in services that support idempotency
+    /// tokens. mountpoint-s3 doesn't currently produce a token mismatch
+    /// (it generates a fresh UUID per call), but other SDKs may.
+    pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
 }
 
 /// Minimal bucket info used by ListBuckets.

@@ -5,6 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod buffer;
 mod fs_helpers;
+mod idempotency;
 mod multipart;
 pub mod streaming;
 mod uring_io;
@@ -289,6 +290,9 @@ struct App {
     pool:                    Arc<BufPool>,
     uring:                   Arc<UringIO>,
     virtual_hosted_suffixes: Vec<String>,
+    /// Per-worker idempotency cache for `x-amz-client-token` on
+    /// RenameObject. See `idempotency.rs`.
+    idempotency:             Arc<idempotency::IdempotencyCache>,
 }
 
 fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
@@ -340,6 +344,11 @@ async fn handle(
     app: Arc<App>,
     peer: Option<PeerAddr>,
 ) -> Result<Resp, Infallible> {
+    // Lazy-start background sweepers. `start_cleanup` no-ops after the
+    // first call (compare_exchange). Doing it here means the tokio
+    // runtime is up; the gateway's `main` runs before the runtime.
+    app.idempotency.start_cleanup();
+
     let method = req.method().clone();
     let uri_log = req.uri().to_string();
     let host_log = req
@@ -2446,14 +2455,6 @@ async fn handle_list_objects_v1(
 // PutObject and other write operations
 // -------------------------
 
-fn header_eq(headers: &HeaderMap, name: &str, expected: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
-        .unwrap_or(false)
-}
-
 fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
     let v = headers
         .get(name)
@@ -3101,75 +3102,189 @@ async fn handle_rename_object(
         }
     };
 
+    // Conditional + idempotency headers. mountpoint-s3 emits
+    // `x-amz-client-token` on every rename and `If-None-Match: *` when
+    // mounted without `--allow-overwrite`. The other three are sent only
+    // when the caller passes the corresponding `RenameObjectParams` field
+    // (no current mount-s3 path does, but the params struct supports it).
+    let if_match = header_str(req.headers(), "if-match");
+    let if_none_match = header_str(req.headers(), "if-none-match");
+    let if_source_match = header_str(req.headers(), "x-amz-rename-source-if-match");
+    let client_token = header_str(req.headers(), "x-amz-client-token");
+
+    // Idempotency check runs *before* any filesystem work so a replay
+    // returns the cached response without re-stating the source (which
+    // would now be missing post-rename and produce a spurious NoSuchKey).
+    let fingerprint =
+        rename_fingerprint(dst_bucket, &src_key, dst_key, &if_match, &if_none_match, &if_source_match);
+    let mut guard: Option<idempotency::EntryGuard> = match client_token.as_deref() {
+        Some(token) => match app.idempotency.enter(token, &fingerprint).await {
+            idempotency::Lookup::Replay { status, body } => {
+                return s32p_support::s3resp::response_bytes(
+                    status,
+                    "application/xml",
+                    body,
+                    [],
+                );
+            }
+            idempotency::Lookup::Conflict => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::CONFLICT,
+                    s32p_support::s3xml::error_code::IDEMPOTENT_PARAMETER_MISMATCH,
+                    "client token reused for a different request",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            idempotency::Lookup::BypassCacheFull => {
+                tracing::warn!(
+                    "rename idempotency cache at capacity; running without dedup"
+                );
+                None
+            }
+            idempotency::Lookup::Pending(g) => Some(g),
+        },
+        None => None,
+    };
+
+    // After this point, every early return must `abandon()` the guard so a
+    // subsequent retry can execute. The `abort!` macro centralizes that.
+    macro_rules! abort {
+        ($resp:expr) => {{
+            if let Some(g) = guard.take() {
+                g.abandon();
+            }
+            return $resp;
+        }};
+    }
+
     // Don't allow reserved multipart prefix in either source or destination.
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
         || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
     {
-        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+        abort!(s32p_support::s3resp::access_denied(
+            "reserved key prefix",
+            Some(req.uri().path())
+        ));
     }
 
     let src_path = match join_object_path(&cfg.posix_root, dst_bucket, &src_key) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+        Err(e) => abort!(s32p_support::s3resp::access_denied(&e.to_string(), None)),
     };
 
     let dst_path = match join_object_path(&cfg.posix_root, dst_bucket, dst_key) {
         Ok(p) => p,
-        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+        Err(e) => abort!(s32p_support::s3resp::access_denied(&e.to_string(), None)),
     };
 
-    // Ensure source exists (file or directory).
-    match std::fs::metadata(&src_path) {
-        Ok(_) => {}
+    // Source must exist (file or directory). Capture the inode for the
+    // `x-amz-rename-source-if-match` comparison below.
+    let src_meta = match std::fs::metadata(&src_path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key("not found", None);
+            abort!(s32p_support::s3resp::no_such_key("not found", None));
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", None);
+            abort!(s32p_support::s3resp::access_denied("permission denied", None));
         }
         Err(e) => {
-            return s32p_support::s3resp::internal_error(
+            abort!(s32p_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            );
+            ));
         }
     };
+    let src_etag = format_inode_etag(src_meta.ino());
 
-    // Create destination parent directories.
-    if let Some(parent) = dst_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return s32p_support::s3resp::access_denied(
-                &format!("failed to create destination directories: {e}"),
-                None,
-            );
+    if let Some(want) = &if_source_match {
+        if !etag_matches(&src_etag, want) {
+            abort!(s32p_support::s3resp::precondition_failed(
+                "x-amz-rename-source-if-match did not match source",
+                Some(req.uri().path()),
+            ));
         }
     }
 
-    match std::fs::rename(&src_path, &dst_path) {
+    // Stat destination once for both `If-Match` and the
+    // specific-ETag form of `If-None-Match`. `*` is handled atomically
+    // below via `renameat2(RENAME_NOREPLACE)` so we don't depend on
+    // this stat being race-free.
+    let dst_etag_opt = std::fs::metadata(&dst_path)
+        .ok()
+        .map(|m| format_inode_etag(m.ino()));
+
+    if let Some(want) = &if_match {
+        match &dst_etag_opt {
+            Some(have) if etag_matches(have, want) => {}
+            _ => abort!(s32p_support::s3resp::precondition_failed(
+                "If-Match did not match destination",
+                Some(req.uri().path()),
+            )),
+        }
+    }
+
+    let use_noreplace = if_none_match.as_deref() == Some("*");
+    if let (Some(want), Some(have)) = (&if_none_match, &dst_etag_opt) {
+        // `*` reaches here only when the destination exists — fail. A
+        // specific ETag fails iff it matches the current dst ETag.
+        if want == "*" || etag_matches(have, want) {
+            abort!(s32p_support::s3resp::precondition_failed(
+                "If-None-Match precondition failed",
+                Some(req.uri().path()),
+            ));
+        }
+    }
+
+    if let Some(parent) = dst_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            abort!(s32p_support::s3resp::access_denied(
+                &format!("failed to create destination directories: {e}"),
+                None,
+            ));
+        }
+    }
+
+    let rename_result = if use_noreplace {
+        crate::fs_helpers::rename_noreplace(&src_path, &dst_path)
+    } else {
+        std::fs::rename(&src_path, &dst_path)
+    };
+
+    match rename_result {
         Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Only reachable via the `rename_noreplace` path
+            // (`If-None-Match: *`). This closes the TOCTOU between the
+            // stat above and the rename — a destination that appeared in
+            // the meantime still produces 412.
+            abort!(s32p_support::s3resp::precondition_failed(
+                "If-None-Match: destination already exists",
+                Some(req.uri().path()),
+            ));
+        }
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            // Required by your spec: error on cross-device rename (EXDEV).
-            return s32p_support::s3resp::s3_error(
+            abort!(s32p_support::s3resp::s3_error(
                 StatusCode::BAD_REQUEST,
                 s32p_support::s3xml::error_code::INVALID_REQUEST,
                 "cross-device rename is not supported",
                 Some(req.uri().path()),
                 None,
-            );
+            ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return s32p_support::s3resp::no_such_key("not found", None);
+            abort!(s32p_support::s3resp::no_such_key("not found", None));
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return s32p_support::s3resp::access_denied("permission denied", None);
+            abort!(s32p_support::s3resp::access_denied("permission denied", None));
         }
         Err(e) => {
-            return s32p_support::s3resp::internal_error(
+            abort!(s32p_support::s3resp::internal_error(
                 &e.to_string(),
                 Some(req.uri().path()),
                 None,
-            );
+            ));
         }
     }
 
@@ -3180,8 +3295,71 @@ async fn handle_rename_object(
         }
     }
 
-    // Success: 200 with empty body.
-    s32p_support::s3resp::response_bytes(StatusCode::OK, "application/xml", Vec::new(), [])
+    // Publish the successful response to the idempotency cache. A retry
+    // with the same `x-amz-client-token` + same fingerprint now gets
+    // `Lookup::Replay` and skips the filesystem path entirely.
+    let body: Vec<u8> = Vec::new();
+    if let Some(g) = guard.take() {
+        g.commit(fingerprint, StatusCode::OK, body.clone());
+    }
+    s32p_support::s3resp::response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+
+/// Read a header as a borrowed `String`. Returns `None` for missing or
+/// non-ASCII values (the latter shouldn't happen for the headers we care
+/// about; defensive against malformed clients).
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+/// Format the inode-derived ETag. Matches the shape HEAD/GET use elsewhere
+/// in the gateway (`format!("\"{}\"", meta.ino())`), so a client that
+/// caches the ETag from a prior HEAD and replays it in `If-Match` will
+/// compare byte-equal here.
+fn format_inode_etag(ino: u64) -> String {
+    format!("\"{}\"", ino)
+}
+
+/// Compare two ETag-like values for equality, tolerating optional
+/// surrounding double-quotes on either side. AWS specifies quoted ETags
+/// on the wire, but some clients omit them; accepting both means a
+/// client's stored ETag round-trips byte-identically into `If-Match`
+/// regardless of how they captured it.
+fn etag_matches(have: &str, want: &str) -> bool {
+    fn unquote(s: &str) -> &str {
+        s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
+    }
+    unquote(have.trim()) == unquote(want.trim())
+}
+
+/// Fingerprint for the idempotency cache. Two requests with the same
+/// `x-amz-client-token` are considered "the same operation" iff their
+/// fingerprints are byte-equal; otherwise the second is a token reuse
+/// and returns 409 `IdempotentParameterMismatch`.
+///
+/// Fields are NUL-separated so a stray slash or colon inside a key (S3
+/// keys may contain any UTF-8) can't collide with a field boundary.
+/// Bucket name is included even though our renames are always
+/// same-bucket, so a future cross-process token shared across workers
+/// (not currently possible — cache is per-worker) wouldn't accidentally
+/// merge requests bound to different buckets.
+fn rename_fingerprint(
+    dst_bucket: &str,
+    src_key: &str,
+    dst_key: &str,
+    if_match: &Option<String>,
+    if_none_match: &Option<String>,
+    if_source_match: &Option<String>,
+) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        dst_bucket,
+        src_key,
+        dst_key,
+        if_match.as_deref().unwrap_or(""),
+        if_none_match.as_deref().unwrap_or(""),
+        if_source_match.as_deref().unwrap_or(""),
+    )
 }
 
 // -------------------------
@@ -3620,11 +3798,25 @@ async fn async_main() -> Result<()> {
     // Single global io_uring writer sized to the whole buffer pool.
     let uring = Arc::new(UringIO::spawn(cfg.pool_size.max(1))?);
 
+    // Per-worker idempotency cache for `x-amz-client-token` on
+    // RenameObject. Hardcoded defaults: 300s TTL matches AWS's typical
+    // idempotency window for STS-shaped tokens; 60s sweep cadence keeps
+    // memory from accumulating between requests; 4096-entry cap bounds
+    // worst case (~1 MiB) under pathological clients.
+    let idempotency = idempotency::IdempotencyCache::new(
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(60),
+        4096,
+    );
+    // Sweeper is started lazily from the first request handler — the
+    // tokio runtime is up by then. Mirrors `SessionStore::start_cleanup`.
+
     let app = Arc::new(App {
         cfg: cfg.clone(),
         pool,
         uring,
         virtual_hosted_suffixes: cfg.virtual_hosted_suffixes.clone(),
+        idempotency,
     });
 
     if let Some(sock_path) = cfg.bind_uds.clone() {

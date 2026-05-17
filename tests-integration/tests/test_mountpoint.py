@@ -369,6 +369,72 @@ def test_directory_rename_refused_at_fuse_layer(mount, bucket_fs):
 # ----------------------------------------------------------------- read-only
 
 
+# ----------------------------------------------------------------- no-overwrite rename
+
+
+@pytest.fixture
+def mount_no_overwrite(tmp_path, endpoint, bucket):
+    """Read-write mount **without** `--allow-overwrite`. This is the
+    mountpoint-s3 default and the shape that surfaces the
+    `If-None-Match: *` precondition on every rename. Used by the
+    rename-collision test."""
+    session = MountpointSession(
+        endpoint_url=endpoint.base_url,
+        region=endpoint.region,
+        access_key=endpoint.access_key,
+        secret_key=endpoint.secret_key,
+        bucket=bucket,
+        mount_root=tmp_path,
+        mode="rw",
+        allow_overwrite=False,
+    )
+    session.start()
+    try:
+        yield session
+    finally:
+        session.stop()
+
+
+def test_rename_into_existing_destination_blocked_without_overwrite(
+    mount_no_overwrite, bucket_fs
+):
+    """End-to-end coverage of the `If-None-Match: *` path: a default-mode
+    mountpoint-s3 mount issues that header on every rename. With the
+    destination already populated, the gateway must return 412
+    PreconditionFailed and mountpoint must surface it as a FUSE error —
+    not silently overwrite. The data-loss footgun this defends against:
+    `mv new old` clobbers `old` without the user realizing."""
+    mount = mount_no_overwrite
+    bucket_fs.write("src.bin", b"new bytes\n")
+    bucket_fs.write("dst.bin", b"original bytes\n")
+
+    src = mount.path / "src.bin"
+    dst = mount.path / "dst.bin"
+
+    deadline = time.monotonic() + _FS_VISIBLE_TIMEOUT_S
+    while time.monotonic() < deadline and not (src.exists() and dst.exists()):
+        time.sleep(_FS_POLL_S)
+    assert src.exists() and dst.exists(), mount.log_tail()
+
+    with pytest.raises(OSError) as exc:
+        os.rename(src, dst)
+    # mountpoint-s3 1.21 surfaces `RenameDestinationExists` as EEXIST.
+    # Accept a small family in case a minor version picks a different
+    # POSIX errno for the same logical condition.
+    assert exc.value.errno in (
+        17,  # EEXIST   — "File exists" (mountpoint-s3 1.21's choice)
+        1,   # EPERM    — "Operation not permitted"
+        13,  # EACCES   — "Permission denied"
+    ), exc.value
+
+    # Backend untouched: dst still has its original bytes, src still has new.
+    assert bucket_fs.read("dst.bin") == b"original bytes\n"
+    assert bucket_fs.read("src.bin") == b"new bytes\n"
+
+
+# ----------------------------------------------------------------- read-only
+
+
 def test_readonly_mount_rejects_writes(mount_ro):
     """Writes through a `--read-only` mount must fail at the FUSE layer
     (EROFS), before any request reaches the proxy. Enforced by mount-s3,
