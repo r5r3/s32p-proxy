@@ -2488,10 +2488,37 @@ fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
     Ok((bucket, key))
 }
 
-/// Returns (is_streaming_sigv4, logical_len)
+/// Returns (is_streaming, logical_len).
+///
+/// "Streaming" here means the request body is `aws-chunked`-framed and the
+/// decoder must strip framing before writing payload bytes. AWS uses four
+/// `x-amz-content-sha256` tokens for this, all sharing the `STREAMING-`
+/// prefix:
+///
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`          (signed chunks, no trailer)
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`  (signed chunks + trailer)
+/// - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`          (no per-chunk sig, trailer with checksum)
+/// - `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD[-TRAILER]` (SigV4a equivalents)
+///
+/// They share one wire format: `<hex-size>[;chunk-signature=…]\r\n<payload>\r\n …
+/// 0\r\n<trailers>\r\n\r\n`. The decoder in `streaming::aws_chunked` ignores
+/// the optional `;chunk-signature=` extension and reads trailers-until-blank,
+/// so the same code path covers all four. The wire-name is *only* used to
+/// decide which length header to trust:
+///
+/// - streaming → `x-amz-decoded-content-length` (logical body)
+/// - non-streaming (`UNSIGNED-PAYLOAD`, an explicit hex digest, …)
+///   → `Content-Length`
+///
+/// Matching on the `STREAMING-` prefix (case-insensitive — AWS docs are
+/// uppercase but the canonical-request layer is byte-exact, leaving the
+/// header value the SDK chooses) covers the current taxonomy and any future
+/// `STREAMING-*-TRAILER` variants without another code change.
 fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64)> {
-    let is_streaming =
-        header_eq(headers, "x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD");
+    let is_streaming = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"));
 
     let logical_len = if is_streaming {
         parse_u64_header(headers, "x-amz-decoded-content-length")?
@@ -2622,7 +2649,7 @@ async fn handle_put_object(
     }
 
     // pick decoded length for streaming payloads
-    let (is_streaming_sigv4, logical_len) = match compute_logical_len(req.headers()) {
+    let (is_aws_chunked, logical_len) = match compute_logical_len(req.headers()) {
         Ok(v) => v,
         Err(e) => {
             return s32p_support::s3resp::s3_error(
@@ -2697,7 +2724,7 @@ async fn handle_put_object(
         body,
         WriteObjectDest::Path { path: obj_path.clone(), striping },
         logical_len,
-        is_streaming_sigv4,
+        is_aws_chunked,
         StreamCfg {
             chunk_size: cfg.chunk_size,
             inflight:   cfg.inflight,
@@ -3749,5 +3776,56 @@ mod tests {
     fn parse_bucket_acl_accepts_dots_and_hyphens() {
         let m = parse_bucket_acl("my-bucket.0:ro");
         assert_eq!(m.get("my-bucket.0"), Some(&AclLevel::ReadOnly));
+    }
+
+    fn hdrs(content_sha256: &str, body_len: u64, decoded_len: Option<u64>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-amz-content-sha256", content_sha256.parse().unwrap());
+        h.insert("content-length", body_len.to_string().parse().unwrap());
+        if let Some(d) = decoded_len {
+            h.insert("x-amz-decoded-content-length", d.to_string().parse().unwrap());
+        }
+        h
+    }
+
+    /// All four AWS-defined `STREAMING-*` payload markers must route to the
+    /// aws-chunked decoder. The test pins the contract: gateway compatibility
+    /// with mountpoint-s3 (which sends `STREAMING-UNSIGNED-PAYLOAD-TRAILER`),
+    /// the AWS CLI v2 (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`), and any
+    /// SigV4a-signing future client (`STREAMING-AWS4-ECDSA-…`) is now part of
+    /// the surface we promise.
+    #[test]
+    fn compute_logical_len_recognizes_all_streaming_variants() {
+        for v in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+            "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+        ] {
+            let h = hdrs(v, 1234, Some(1000));
+            let (is_streaming, logical) = compute_logical_len(&h).unwrap();
+            assert!(is_streaming, "{v} must classify as streaming");
+            // Streaming bodies trust x-amz-decoded-content-length, not
+            // the on-the-wire content-length.
+            assert_eq!(logical, 1000, "{v} must use decoded-content-length");
+        }
+    }
+
+    #[test]
+    fn compute_logical_len_non_streaming_uses_content_length() {
+        // Bare `UNSIGNED-PAYLOAD` is a raw body; `decoded-content-length`
+        // is absent and `Content-Length` is the truth.
+        let h = hdrs("UNSIGNED-PAYLOAD", 1234, None);
+        let (is_streaming, logical) = compute_logical_len(&h).unwrap();
+        assert!(!is_streaming);
+        assert_eq!(logical, 1234);
+
+        // A hex SHA-256 (signed-payload, non-streaming) is also raw on the wire.
+        let sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let h = hdrs(sha, 5678, None);
+        let (is_streaming, logical) = compute_logical_len(&h).unwrap();
+        assert!(!is_streaming);
+        assert_eq!(logical, 5678);
     }
 }

@@ -704,7 +704,7 @@ pub async fn write_object_body(
     body: Incoming,
     dest: WriteObjectDest,
     logical_len: u64,
-    is_streaming_sigv4: bool,
+    is_aws_chunked: bool,
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
@@ -806,7 +806,7 @@ pub async fn write_object_body(
         }
     }
 
-    let mut src = if is_streaming_sigv4 {
+    let mut src = if is_aws_chunked {
         Src::Aws(aws_chunked::Decoder::new(data_stream))
     } else {
         Src::Plain(PlainFrameReader::new(data_stream))

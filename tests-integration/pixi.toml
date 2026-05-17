@@ -33,6 +33,7 @@ boto3 = ">=1.43.7,<2"               # primary S3 SDK
 pyyaml = ">=6.0.3,<7"               # build/edit directory.yaml
 requests = ">=2.34.1,<3"            # raw HTTP for SigV4 / presign tests
 awscli = ">=2.34.46,<3"             # backs the aws-cli client adapter
+mountpoint-s3 = ">=1.21.0,<2"       # FUSE mount of an S3 bucket; directory-bucket-aware
 
 [feature.dev.dependencies]
 ruff = "*"

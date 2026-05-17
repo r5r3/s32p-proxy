@@ -667,7 +667,7 @@ async fn handle_upload_part(
         );
     }
 
-    let (is_streaming_sigv4, logical_len) = match crate::compute_logical_len(req.headers()) {
+    let (is_aws_chunked, logical_len) = match crate::compute_logical_len(req.headers()) {
         Ok(v) => v,
         Err(e) => {
             return s32p_support::s3resp::s3_error(
@@ -828,7 +828,7 @@ async fn handle_upload_part(
             body,
             WriteObjectDest::File { file: file.clone(), start_off: off },
             logical_len,
-            is_streaming_sigv4,
+            is_aws_chunked,
             part_cfg,
             app.uring.clone(),
             app.pool.clone(),
@@ -908,7 +908,7 @@ async fn handle_upload_part(
             body,
             WriteObjectDest::Path { path: tmp_path.clone(), striping: part_striping },
             logical_len,
-            is_streaming_sigv4,
+            is_aws_chunked,
             StreamCfg {
                 chunk_size: cfg.chunk_size,
                 inflight:   cfg.inflight,
