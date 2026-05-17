@@ -254,6 +254,121 @@ def test_readonly_mount_reads_succeed(mount_ro):
     assert target.read_bytes() == b"readable\n"
 
 
+# ----------------------------------------------------------------- rename
+
+
+# mountpoint-s3 1.x added support for the S3 Express `RenameObject` op
+# (directory-bucket flavor of `mv`). On `--bucket-type directory` it
+# will issue `PUT /{bucket}/{newkey}?renameObject` with the
+# `x-amz-rename-source` header — exactly the surface the gateway
+# implements (`tests/test_rename.py` covers it standalone). These
+# tests prove the round-trip through FUSE → mount-s3 → proxy → gateway.
+#
+# Directory rename: AWS S3 Express doesn't have a "rename prefix" op,
+# so mount-s3 either rejects it (EINVAL/EPERM) or walks the prefix and
+# renames each key. We test it to document what happens, not to
+# guarantee any particular outcome — if a future mount-s3 version
+# changes the strategy the test makes that visible.
+
+
+def test_rename_file_via_mount(mount, bucket_fs):
+    """`os.rename(a, b)` on a file inside the mount must produce the
+    same backend state as a server-side `RenameObject`: new path
+    contains the bytes, old path is gone."""
+    bucket_fs.write("orig.txt", b"rename me\n")
+    src = mount.path / "orig.txt"
+    dst = mount.path / "renamed.txt"
+
+    assert _wait_for_mount_path(src), mount.log_tail()
+    os.rename(src, dst)
+
+    # Backend reflects the rename.
+    deadline = time.monotonic() + _FS_VISIBLE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if bucket_fs.exists("renamed.txt") and not bucket_fs.exists("orig.txt"):
+            break
+        time.sleep(_FS_POLL_S)
+    assert bucket_fs.exists("renamed.txt"), mount.log_tail()
+    assert bucket_fs.read("renamed.txt") == b"rename me\n"
+    assert not bucket_fs.exists("orig.txt"), mount.log_tail()
+
+
+def test_rename_file_across_dirs_via_mount(mount, bucket_fs):
+    """Renaming across directories must work the same way. Tests both
+    that the target parent directory is created on the backend (S3 has
+    no real directories — the gateway must just place the object) and
+    that the source parent is pruned afterwards (existing gateway
+    behavior, documented in directory-bucket-support.md)."""
+    bucket_fs.write("src-dir/orig.txt", b"crossing dirs\n")
+    src = mount.path / "src-dir" / "orig.txt"
+    dst_dir = mount.path / "dst-dir"
+    dst = dst_dir / "renamed.txt"
+
+    assert _wait_for_mount_path(src), mount.log_tail()
+    # mount-s3 needs the target dir to exist as a FUSE node; in S3 land
+    # this is a no-op (directories are virtual), but FUSE doesn't know
+    # that. `exist_ok=True` because mount-s3 may already have created an
+    # implicit dir node for the empty bucket.
+    dst_dir.mkdir(exist_ok=True)
+
+    os.rename(src, dst)
+
+    deadline = time.monotonic() + _FS_VISIBLE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if bucket_fs.exists("dst-dir/renamed.txt") and not bucket_fs.exists("src-dir/orig.txt"):
+            break
+        time.sleep(_FS_POLL_S)
+    assert bucket_fs.exists("dst-dir/renamed.txt"), mount.log_tail()
+    assert bucket_fs.read("dst-dir/renamed.txt") == b"crossing dirs\n"
+    assert not bucket_fs.exists("src-dir/orig.txt"), mount.log_tail()
+
+
+def test_directory_rename_refused_at_fuse_layer(mount, bucket_fs):
+    """mount-s3 refuses to rename a directory (= shared key prefix) at
+    the FUSE layer with `EPERM`. The refusal happens *before* any S3
+    request — mount-s3 issues a HEAD + ListObjectsV2 on the source,
+    sees the `<name>/` prefix shape, and rejects with "inode is a
+    directory and cannot be renamed".
+
+    AWS S3 Express has no atomic prefix-rename, so refusing is the
+    only correct behavior at the SDK level — pretending to support it
+    would mean an unsafe walk-and-rename loop that can leave half-moved
+    state on partial failure. We assert the refusal so a future
+    mount-s3 version that introduces a walk-rename mode shows up as a
+    test failure (good — we'd then want to decide whether to mirror it
+    server-side).
+    """
+    bucket_fs.write("old-dir/a.txt", b"AAA\n")
+    bucket_fs.write("old-dir/b.txt", b"BBB\n")
+    src = mount.path / "old-dir"
+    dst = mount.path / "new-dir"
+
+    deadline = time.monotonic() + _FS_VISIBLE_TIMEOUT_S
+    while time.monotonic() < deadline and not src.exists():
+        time.sleep(_FS_POLL_S)
+    assert src.exists(), mount.log_tail()
+
+    with pytest.raises(OSError) as exc:
+        os.rename(src, dst)
+    # mount-s3 1.21 returns EPERM (1); accept the related "not
+    # permitted/supported" family so a minor mount-s3 version bump that
+    # picks a different (still-refusing) errno doesn't flake the test.
+    assert exc.value.errno in (
+        1,    # EPERM:   operation not permitted (mount-s3 1.21's choice)
+        22,   # EINVAL:  invalid argument
+        38,   # ENOSYS:  rename op not implemented
+        95,   # ENOTSUP: operation not supported
+    ), exc.value
+
+    # Defense in depth: the backend must be untouched.
+    assert bucket_fs.exists("old-dir/a.txt"), mount.log_tail()
+    assert bucket_fs.exists("old-dir/b.txt"), mount.log_tail()
+    assert not bucket_fs.exists("new-dir/a.txt"), mount.log_tail()
+
+
+# ----------------------------------------------------------------- read-only
+
+
 def test_readonly_mount_rejects_writes(mount_ro):
     """Writes through a `--read-only` mount must fail at the FUSE layer
     (EROFS), before any request reaches the proxy. Enforced by mount-s3,

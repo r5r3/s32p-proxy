@@ -7,8 +7,9 @@ patterns and routes through `s3express` service signing + a prior
 that data plane for one verb.
 
 Wire format: PUT /{bucket}/{dst_key}?renameObject with
-`x-amz-rename-source: /{bucket}/{src_key}` (or `/{src_key}` for the
-same-bucket shorthand). Success: 200 with empty body.
+`x-amz-rename-source: {src_key}` (URL-encoded, optional leading `/`).
+The bucket is always the destination bucket — RenameObject is
+same-bucket only by spec. Success: 200 with empty body.
 
 Handler:    crates/s32p-gateway/src/main.rs::handle_rename_object
 Classifier: crates/s32p-support/src/classifier.rs → WriteOp::RenameObject
@@ -32,24 +33,18 @@ def _rename_raw(
     bucket: str,
     dst_key: str,
     src_key: str | None,
-    src_bucket: str | None = None,
 ) -> requests.Response:
     """Issue a SigV4-signed `PUT /{bucket}/{dst_key}?renameObject`.
 
-    The helper always emits the explicit `/bucket/key` form of
-    `x-amz-rename-source`. The gateway's parser also accepts a `/key`
-    shorthand, but only when the key contains no `/` (anything past the
-    first separator is parsed as the bucket) — not worth a public knob.
+    `x-amz-rename-source` is the URL-encoded source key (same bucket
+    as the destination — that's the only shape AWS S3 Express defines).
 
-    - `src_key=None` omits the `x-amz-rename-source` header (negative test).
-    - `src_bucket=None` defaults to `bucket`; pass a different name for
-      the cross-bucket rejection test.
+    `src_key=None` omits the header entirely (negative test).
     """
     url = f"{endpoint.base_url}/{bucket}/{quote(dst_key, safe='/')}?renameObject"
     headers: dict[str, str] = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
     if src_key is not None:
-        sb = src_bucket if src_bucket is not None else bucket
-        headers["x-amz-rename-source"] = "/" + sb + "/" + quote(src_key, safe="/")
+        headers["x-amz-rename-source"] = quote(src_key, safe="/")
 
     creds = botocore.credentials.Credentials(
         endpoint.access_key, endpoint.secret_key
@@ -129,21 +124,23 @@ def test_rename_missing_source_returns_404(endpoint, bucket, bucket_fs):
     assert "<Code>NoSuchKey</Code>" in resp.text, resp.text
 
 
-def test_rename_cross_bucket_returns_400(endpoint, bucket, bucket_fs):
-    """S3 RenameObject is same-bucket only. The handler rejects with
-    InvalidRequest as soon as the parsed source bucket differs from the
-    destination — before looking at the filesystem."""
-    bucket_fs.write("src.bin", b"x")
+def test_rename_unknown_source_returns_404(endpoint, bucket, bucket_fs):
+    """RenameObject is same-bucket by spec — `x-amz-rename-source` is a
+    key, not `bucket/key`. A source key that doesn't resolve to a real
+    file inside the destination bucket must return `NoSuchKey` 404
+    (filesystem `metadata` miss), not 400. This pins the spec-strict
+    parser behavior (an earlier parser interpreted a leading
+    slash-segment as a bucket name and emitted InvalidRequest)."""
+    bucket_fs.write("real.bin", b"x")
 
     resp = _rename_raw(
         endpoint, bucket=bucket,
-        dst_key="dst.bin", src_key="src.bin",
-        src_bucket="some-other-bucket",
+        dst_key="dst.bin", src_key="not-there.bin",
     )
 
-    assert resp.status_code == 400, resp.text
-    assert "<Code>InvalidRequest</Code>" in resp.text, resp.text
-    assert bucket_fs.exists("src.bin"), "source must not be touched"
+    assert resp.status_code == 404, resp.text
+    assert "<Code>NoSuchKey</Code>" in resp.text, resp.text
+    assert bucket_fs.exists("real.bin"), "unrelated source must not be touched"
 
 
 def test_rename_missing_header_falls_through_to_other(endpoint, bucket):

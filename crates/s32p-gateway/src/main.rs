@@ -3019,7 +3019,13 @@ async fn handle_copy_object(
 // RenameObject
 // -------------------------
 
-fn parse_rename_source(dst_bucket: &str, headers: &HeaderMap) -> Result<(String, String)> {
+/// Parse `x-amz-rename-source` into the source object key.
+///
+/// AWS S3 Express `RenameObject` is always same-bucket; the header
+/// carries the source key only — no bucket prefix, leading `/`
+/// optional. That matches what mountpoint-s3 and the AWS SDKs send.
+/// See <https://docs.aws.amazon.com/AmazonS3/latest/API/API_RenameObject.html>.
+fn parse_rename_source(headers: &HeaderMap) -> Result<String> {
     let raw = headers
         .get("x-amz-rename-source")
         .ok_or_else(|| anyhow!("missing x-amz-rename-source"))?
@@ -3027,39 +3033,19 @@ fn parse_rename_source(dst_bucket: &str, headers: &HeaderMap) -> Result<(String,
         .map_err(|_| anyhow!("invalid x-amz-rename-source"))?
         .trim();
 
-    // Strip any query component.
+    // Defensive: spec doesn't allow a query component, but strip one if
+    // a buggy client adds it.
     let raw = raw.split_once('?').map(|(p, _)| p).unwrap_or(raw);
     let raw = raw.trim_start_matches('/');
     if raw.is_empty() {
         return Err(anyhow!("invalid x-amz-rename-source"));
     }
 
-    // Decode percent-escapes segment-by-segment (same behavior as CopyObject parsing).
-    let decoded: String = s32p_support::uri_encoding::percent_decode_path_segments_lossy(raw);
-
-    // Accept both:
-    //  - "/key"           (same bucket as destination)
-    //  - "/bucket/key"    (explicit bucket)
-    let mut it = decoded.splitn(2, '/');
-    let first: &str = it.next().unwrap_or("");
-    let second: Option<&str> = it.next();
-
-    if let Some(rest) = second {
-        // "/bucket/key" form
-        let bucket: String = first.to_string();
-        let key: String = rest.to_string();
-        if bucket.is_empty() || key.is_empty() {
-            return Err(anyhow!("invalid x-amz-rename-source (expected /bucket/key or /key)"));
-        }
-        Ok((bucket, key))
-    } else {
-        // "/key" form
-        let key: String = first.to_string();
-        if key.is_empty() {
-            return Err(anyhow!("invalid x-amz-rename-source (expected /bucket/key or /key)"));
-        }
-        Ok((dst_bucket.to_string(), key))
+    let key = s32p_support::uri_encoding::percent_decode_path_segments_lossy(raw);
+    if key.is_empty() {
+        return Err(anyhow!("invalid x-amz-rename-source"));
     }
+    Ok(key)
 }
 
 async fn handle_rename_object(
@@ -3102,7 +3088,7 @@ async fn handle_rename_object(
         }
     }
 
-    let (src_bucket, src_key) = match parse_rename_source(dst_bucket, req.headers()) {
+    let src_key = match parse_rename_source(req.headers()) {
         Ok(v) => v,
         Err(e) => {
             return s32p_support::s3resp::s3_error(
@@ -3115,17 +3101,6 @@ async fn handle_rename_object(
         }
     };
 
-    // S3 RenameObject is within the same bucket; reject cross-bucket.
-    if src_bucket != dst_bucket {
-        return s32p_support::s3resp::s3_error(
-            StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
-            "cross-bucket rename is not supported",
-            Some(req.uri().path()),
-            None,
-        );
-    }
-
     // Don't allow reserved multipart prefix in either source or destination.
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
         || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
@@ -3133,7 +3108,7 @@ async fn handle_rename_object(
         return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
     }
 
-    let src_path = match join_object_path(&cfg.posix_root, &src_bucket, &src_key) {
+    let src_path = match join_object_path(&cfg.posix_root, dst_bucket, &src_key) {
         Ok(p) => p,
         Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
     };
