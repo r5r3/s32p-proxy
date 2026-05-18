@@ -47,8 +47,45 @@ _MOUNT_READY_TIMEOUT_S = 15.0
 _UMOUNT_TIMEOUT_S = 10.0
 
 # Name of the remote inside our generated rclone.conf. Arbitrary — only
-# referenced as `s32p:<bucket>` on the mount command line.
-_REMOTE_NAME = "s32p"
+# referenced as `s32p:<bucket>` on rclone command lines.
+REMOTE_NAME = "s32p"
+
+
+def write_rclone_config(
+    path: Path,
+    *,
+    endpoint_url: str,
+    region: str,
+    access_key: str,
+    secret_key: str,
+) -> None:
+    """Write a minimal generic-S3 rclone.conf to `path`.
+
+    Shared by `RcloneMountSession` (for `rclone mount`) and the
+    compatibility-check tests (for `rclone test info` etc.). Provider
+    `Other` + `force_path_style = true` matches what a user pointing
+    rclone at MinIO/Ceph/our proxy would write by hand. Secret is
+    in plain text — rclone's `obscure` step is base64, not encryption,
+    so it adds no security for a tempdir config.
+    """
+    body = (
+        f"[{REMOTE_NAME}]\n"
+        "type = s3\n"
+        "provider = Other\n"
+        f"access_key_id = {access_key}\n"
+        f"secret_access_key = {secret_key}\n"
+        f"endpoint = {endpoint_url}\n"
+        f"region = {region}\n"
+        "force_path_style = true\n"
+        # The proxy returns NotImplemented for CreateBucket (bucket admin
+        # is s32p-ctl only). Some rclone operations — `mkdir`,
+        # `test info`'s implicit "ensure the path exists" probe —
+        # otherwise PUT the bucket up front and fail with 501. Setting
+        # this skips both the existence check and the create attempt.
+        "no_check_bucket = true\n"
+    )
+    path.write_text(body)
+    path.chmod(0o600)
 
 
 def is_available() -> bool:
@@ -111,33 +148,19 @@ class RcloneMountSession:
     # ---------- helpers ----------
 
     def _write_config(self) -> None:
-        """Render a minimal rclone.conf at `config_path`.
-
-        Secret is written in plain text (rclone's `obscure` step is just
-        base64 — not security, only "no shoulder-surfing"). For a test
-        config in a tmpdir, plain text is fine.
-        """
-        body = (
-            f"[{_REMOTE_NAME}]\n"
-            "type = s3\n"
-            "provider = Other\n"
-            f"access_key_id = {self.access_key}\n"
-            f"secret_access_key = {self.secret_key}\n"
-            f"endpoint = {self.endpoint_url}\n"
-            f"region = {self.region}\n"
-            # Path-style is the safe default against a proxy that may not
-            # have a wildcard-DNS virtual-hosted suffix configured for the
-            # current run. The harness picks endpoint URL accordingly.
-            "force_path_style = true\n"
+        write_rclone_config(
+            self.config_path,
+            endpoint_url=self.endpoint_url,
+            region=self.region,
+            access_key=self.access_key,
+            secret_key=self.secret_key,
         )
-        self.config_path.write_text(body)
-        self.config_path.chmod(0o600)
 
     def _build_argv(self) -> list[str]:
         argv: list[str] = [
             "rclone",
             "mount",
-            f"{_REMOTE_NAME}:{self.bucket}",
+            f"{REMOTE_NAME}:{self.bucket}",
             str(self.mount_dir),
             "--config", str(self.config_path),
             "--log-file", str(self.log_path),
