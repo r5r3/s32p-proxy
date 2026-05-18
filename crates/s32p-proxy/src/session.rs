@@ -133,6 +133,7 @@ impl SessionStore {
         self.inner.remove(access_key);
     }
 
+    #[cfg(test)]
     pub fn active_count(&self) -> usize {
         self.inner.len()
     }
