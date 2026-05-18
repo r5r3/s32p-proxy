@@ -56,6 +56,7 @@ class Boto3DirectoryClient(Boto3Client):
         Capability.COPY_OBJECT,
         Capability.DELETE_OBJECTS,
         Capability.MULTIPART,
+        Capability.UPLOAD_PART_COPY,
         # Presigned URLs in directory-bucket mode use ephemeral session
         # credentials (scope `…/s3express/aws4_request` +
         # `X-Amz-S3session-Token` query param). The proxy validates them

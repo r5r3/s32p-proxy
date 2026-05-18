@@ -416,12 +416,7 @@ pub fn classify_with_headers(
         && query.is_only_effective("session")
         && query.validate_xid("CreateSession")
     {
-        return S3RequestClass {
-            bucket,
-            key,
-            query,
-            op: S3Op::Session(SessionOp::CreateSession),
-        };
+        return S3RequestClass { bucket, key, query, op: S3Op::Session(SessionOp::CreateSession) };
     }
 
     // HeadBucket: HEAD /{bucket} (or /{bucket}/) with *no* query params (allow x-id)

@@ -268,6 +268,24 @@ class S3Client(ABC):
         """Returns the part ETag."""
         raise NotImplementedError(f"{self.name}: MULTIPART not implemented")
 
+    def upload_part_copy(
+        self,
+        dst_bucket: str,
+        dst_key: str,
+        upload_id: str,
+        part_number: int,
+        src_bucket: str,
+        src_key: str,
+        *,
+        copy_source_range: tuple[int, int] | None = None,
+        conditions: CopyConditions | None = None,
+    ) -> str:
+        """Server-side copy of a byte range from a source object into the
+        in-progress multipart upload. `copy_source_range` is `(start, end_inclusive)`
+        matching AWS's `x-amz-copy-source-range: bytes=A-B` semantics; absent means
+        the whole source. Returns the part ETag."""
+        raise NotImplementedError(f"{self.name}: UPLOAD_PART_COPY not implemented")
+
     def complete_multipart(
         self, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]
     ) -> PutResult:

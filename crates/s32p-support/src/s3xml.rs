@@ -358,6 +358,23 @@ pub fn copy_object_result_body(last_modified: &str, etag: &str) -> Result<Vec<u8
     Ok(xml.into_bytes())
 }
 
+/// Build XML body for UploadPartCopy (PUT with x-amz-copy-source inside a multipart upload).
+///
+/// Per the S3 spec, the response is a `<CopyPartResult>` carrying just `<ETag>` and
+/// `<LastModified>`. Checksum fields exist in AWS's schema but only when the upload
+/// is configured with `ChecksumAlgorithm`; we don't compute checksums and therefore
+/// omit them entirely (rather than emitting empty tags).
+pub fn copy_part_result_body(last_modified: &str, etag: &str) -> Result<Vec<u8>> {
+    let doc = CopyPartResultDoc {
+        xmlns:         S3_XMLNS,
+        last_modified: last_modified.to_string(),
+        etag:          etag.to_string(),
+    };
+
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
 /* -------------------------
  * DeleteObjects (multi-delete) response
  * ------------------------- */
@@ -902,6 +919,21 @@ struct CopyObjectResultDoc {
     checksum_sha1:   Option<String>,
     #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
     checksum_sha256: Option<String>,
+}
+
+// --- internal DTO for CopyPartResult (UploadPartCopy response) ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyPartResult")]
+struct CopyPartResultDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+
+    #[serde(rename = "ETag")]
+    etag: String,
 }
 
 // --- internal DTOs for DeleteObjects response ---

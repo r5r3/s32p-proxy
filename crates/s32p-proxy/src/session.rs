@@ -11,14 +11,17 @@
 //! is acceptable for non-secret randomness but inappropriate for IAM-shaped
 //! secrets).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::{RngCore, rngs::OsRng};
 use tokio::time;
 
 /// Number of base32 chars *after* the `ASIA` prefix in the ephemeral
@@ -101,13 +104,13 @@ impl SessionStore {
         let now_inst = Instant::now();
         let now_sys = SystemTime::now();
         let entry = SessionEntry {
-            access_key:        gen_access_key(),
-            secret_key:        gen_secret_key(),
-            session_token:     uuid::Uuid::new_v4().to_string(),
-            real_access_key:   real_access_key.to_string(),
-            bucket:            bucket.to_string(),
+            access_key: gen_access_key(),
+            secret_key: gen_secret_key(),
+            session_token: uuid::Uuid::new_v4().to_string(),
+            real_access_key: real_access_key.to_string(),
+            bucket: bucket.to_string(),
             mode,
-            expires_at_inst:   now_inst + ttl,
+            expires_at_inst: now_inst + ttl,
             expires_at_system: now_sys + ttl,
         };
         self.inner.insert(entry.access_key.clone(), entry.clone());

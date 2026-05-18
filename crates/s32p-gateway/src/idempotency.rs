@@ -25,14 +25,20 @@
 //!   (`Lookup::BypassCacheFull`) rather than failing. Graceful
 //!   degradation under a hostile or buggy client.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use http::StatusCode;
-use tokio::sync::{Mutex, OwnedMutexGuard};
-use tokio::time;
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard},
+    time,
+};
 
 /// Outcome of looking a `(token, fingerprint)` pair up in the cache.
 ///
@@ -71,12 +77,7 @@ impl EntryGuard {
     /// `(token, fingerprint)` get `Lookup::Replay`; with a different
     /// fingerprint, `Lookup::Conflict`.
     pub fn commit(mut self, fingerprint: String, status: StatusCode, body: Vec<u8>) {
-        *self.guard = EntryState::Done {
-            completed_at: Instant::now(),
-            fingerprint,
-            status,
-            body,
-        };
+        *self.guard = EntryState::Done { completed_at: Instant::now(), fingerprint, status, body };
         // Dropping `self.guard` here releases the per-entry mutex so any
         // concurrent retry blocked on `enter` wakes and sees `Done`.
     }
@@ -152,11 +153,9 @@ impl IdempotencyCache {
                     Lookup::Conflict
                 }
             }
-            EntryState::Pending => Lookup::Pending(EntryGuard {
-                cache: self.clone(),
-                token: token.to_string(),
-                guard,
-            }),
+            EntryState::Pending => {
+                Lookup::Pending(EntryGuard { cache: self.clone(), token: token.to_string(), guard })
+            }
         }
     }
 
@@ -296,9 +295,7 @@ mod tests {
         // Give A a head start so B enters second.
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let b = tokio::spawn(async move {
-            cache_b.enter("tok-1", "fp-1").await
-        });
+        let b = tokio::spawn(async move { cache_b.enter("tok-1", "fp-1").await });
 
         a.await.unwrap();
         match b.await.unwrap() {
@@ -315,11 +312,7 @@ mod tests {
         // Tight TTL + tight cleanup interval so the sweeper fires within
         // the test window. The cache only sweeps `Done` entries; `Pending`
         // would be preserved (a live caller still holds the guard).
-        let cache = IdempotencyCache::new(
-            Duration::from_millis(40),
-            Duration::from_millis(20),
-            16,
-        );
+        let cache = IdempotencyCache::new(Duration::from_millis(40), Duration::from_millis(20), 16);
         cache.start_cleanup();
 
         let g = match cache.enter("tok-1", "fp-1").await {

@@ -75,6 +75,7 @@ class AwsCliClient(S3Client):
         Capability.METADATA,
         Capability.UNSIGNED_PAYLOAD,
         Capability.MULTIPART,
+        Capability.UPLOAD_PART_COPY,
         Capability.CONDITIONAL_REQUESTS,
         Capability.PRESIGN_GET,
         # Skipped for now (each is a follow-up):
@@ -351,6 +352,34 @@ class AwsCliClient(S3Client):
                 "--body", str(body_path),
             ) or {}
         return result["ETag"].strip('"')
+
+    def upload_part_copy(
+        self,
+        dst_bucket: str,
+        dst_key: str,
+        upload_id: str,
+        part_number: int,
+        src_bucket: str,
+        src_key: str,
+        *,
+        copy_source_range: tuple[int, int] | None = None,
+        conditions: CopyConditions | None = None,
+    ) -> str:
+        args = [
+            "upload-part-copy",
+            "--bucket", dst_bucket,
+            "--key", dst_key,
+            "--upload-id", upload_id,
+            "--part-number", str(part_number),
+            "--copy-source", f"{src_bucket}/{src_key}",
+        ]
+        if copy_source_range is not None:
+            start, end_inclusive = copy_source_range
+            args += ["--copy-source-range", f"bytes={start}-{end_inclusive}"]
+        if conditions is not None and conditions.source is not None:
+            args += _copy_source_conditional_args(conditions.source)
+        result = self._run(*args) or {}
+        return result["CopyPartResult"]["ETag"].strip('"')
 
     def complete_multipart(
         self, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]

@@ -73,8 +73,8 @@ use crate::fs_helpers::stripe_count_for_size;
 use crate::{
     buffer::{BufPool, PooledBuf, SliceOwner},
     fs_helpers::{
-        LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path,
-        flock_exclusive, join_object_path, open_file, statx_info,
+        LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path, flock_exclusive,
+        join_object_path, open_file, statx_info,
     },
     streaming::{
         StreamCfg, WriteObjectDest, copy_file_to_file, stream_range_body, write_object_body,
@@ -295,7 +295,7 @@ struct App {
     idempotency:             Arc<idempotency::IdempotencyCache>,
 }
 
-fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
+pub(crate) fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
     // We reserve keys whose FIRST path segment is exactly mpu_dir_name.
     // Examples that match:
     //   ".s32p-mpu"
@@ -549,8 +549,7 @@ fn require_sigv4(
         // Constant-time-ish comparison is overkill at this trust boundary
         // (the channel is loopback/UDS), but use a length-then-compare to
         // avoid early-exit on the first differing byte costing nothing.
-        let token_match =
-            provided.len() == cfg.worker_token.len() && provided == cfg.worker_token;
+        let token_match = provided.len() == cfg.worker_token.len() && provided == cfg.worker_token;
         if !token_match {
             tracing::warn!("X-S32P-Validated header token mismatch");
             return Err(s32p_support::SigV4Rejection {
@@ -1240,16 +1239,9 @@ async fn handle_other(
 ) -> Resp {
     // Catch-all for requests the classifier couldn't match. Echo method
     // and request-target so the client sees which shape was rejected.
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(req.uri().path());
-    let message = format!(
-        "unsupported request shape: {} {}",
-        req.method(),
-        path_and_query,
-    );
+    let path_and_query =
+        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path());
+    let message = format!("unsupported request shape: {} {}", req.method(), path_and_query,);
     s32p_support::s3resp::not_implemented(&message, Some(req.uri().path()))
 }
 
@@ -2483,7 +2475,7 @@ fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
     v.parse::<u64>().map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
 }
 
-fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
+pub(crate) fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
     let raw = headers
         .get("x-amz-copy-source")
         .ok_or_else(|| anyhow!("missing x-amz-copy-source"))?
@@ -2899,27 +2891,26 @@ async fn handle_put_object_append(
     // be aligned (`direct_io_ok_for_aligned_range`); otherwise the open
     // falls back to buffered.
     let direct = if cfg.direct_io { OpenDirect::TryDirect } else { OpenDirect::Buffered };
-    let (file, _used_direct) = match open_file(&obj_path, OpenMode::WriteExistingNoTrunc, direct, None) {
-        Ok(t) => t,
-        Err(e) => {
-            // open_file wraps the underlying io::Error in anyhow; reach
-            // through to classify by ErrorKind.
-            let io_kind = e.downcast_ref::<std::io::Error>().map(|ie| ie.kind());
-            return match io_kind {
-                Some(std::io::ErrorKind::NotFound) => {
-                    s32p_support::s3resp::no_such_key("not found", Some(&uri_path))
-                }
-                Some(std::io::ErrorKind::PermissionDenied) => {
-                    s32p_support::s3resp::access_denied("permission denied", Some(&uri_path))
-                }
-                _ => s32p_support::s3resp::internal_error(
-                    &e.to_string(),
-                    Some(&uri_path),
-                    None,
-                ),
-            };
-        }
-    };
+    let (file, _used_direct) =
+        match open_file(&obj_path, OpenMode::WriteExistingNoTrunc, direct, None) {
+            Ok(t) => t,
+            Err(e) => {
+                // open_file wraps the underlying io::Error in anyhow; reach
+                // through to classify by ErrorKind.
+                let io_kind = e.downcast_ref::<std::io::Error>().map(|ie| ie.kind());
+                return match io_kind {
+                    Some(std::io::ErrorKind::NotFound) => {
+                        s32p_support::s3resp::no_such_key("not found", Some(&uri_path))
+                    }
+                    Some(std::io::ErrorKind::PermissionDenied) => {
+                        s32p_support::s3resp::access_denied("permission denied", Some(&uri_path))
+                    }
+                    _ => {
+                        s32p_support::s3resp::internal_error(&e.to_string(), Some(&uri_path), None)
+                    }
+                };
+            }
+        };
 
     // Take an exclusive advisory lock on the opened fd. This serializes
     // against another in-flight append on the same inode and is released
@@ -3407,17 +3398,18 @@ async fn handle_rename_object(
     // Idempotency check runs *before* any filesystem work so a replay
     // returns the cached response without re-stating the source (which
     // would now be missing post-rename and produce a spurious NoSuchKey).
-    let fingerprint =
-        rename_fingerprint(dst_bucket, &src_key, dst_key, &if_match, &if_none_match, &if_source_match);
+    let fingerprint = rename_fingerprint(
+        dst_bucket,
+        &src_key,
+        dst_key,
+        &if_match,
+        &if_none_match,
+        &if_source_match,
+    );
     let mut guard: Option<idempotency::EntryGuard> = match client_token.as_deref() {
         Some(token) => match app.idempotency.enter(token, &fingerprint).await {
             idempotency::Lookup::Replay { status, body } => {
-                return s32p_support::s3resp::response_bytes(
-                    status,
-                    "application/xml",
-                    body,
-                    [],
-                );
+                return s32p_support::s3resp::response_bytes(status, "application/xml", body, []);
             }
             idempotency::Lookup::Conflict => {
                 return s32p_support::s3resp::s3_error(
@@ -3429,9 +3421,7 @@ async fn handle_rename_object(
                 );
             }
             idempotency::Lookup::BypassCacheFull => {
-                tracing::warn!(
-                    "rename idempotency cache at capacity; running without dedup"
-                );
+                tracing::warn!("rename idempotency cache at capacity; running without dedup");
                 None
             }
             idempotency::Lookup::Pending(g) => Some(g),
@@ -3454,10 +3444,7 @@ async fn handle_rename_object(
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
         || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
     {
-        abort!(s32p_support::s3resp::access_denied(
-            "reserved key prefix",
-            Some(req.uri().path())
-        ));
+        abort!(s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path())));
     }
 
     let src_path = match join_object_path(&cfg.posix_root, dst_bucket, &src_key) {
@@ -3503,9 +3490,7 @@ async fn handle_rename_object(
     // specific-ETag form of `If-None-Match`. `*` is handled atomically
     // below via `renameat2(RENAME_NOREPLACE)` so we don't depend on
     // this stat being race-free.
-    let dst_etag_opt = std::fs::metadata(&dst_path)
-        .ok()
-        .map(|m| format_inode_etag(m.ino()));
+    let dst_etag_opt = std::fs::metadata(&dst_path).ok().map(|m| format_inode_etag(m.ino()));
 
     if let Some(want) = &if_match {
         match &dst_etag_opt {

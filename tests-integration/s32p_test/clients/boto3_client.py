@@ -37,6 +37,7 @@ class Boto3Client(S3Client):
         Capability.DELETE_OBJECTS,
         Capability.METADATA,
         Capability.MULTIPART,
+        Capability.UPLOAD_PART_COPY,
         Capability.OBJECT_ACL,
         Capability.BUCKET_ACL,
         Capability.PRESIGN_GET,
@@ -278,6 +279,33 @@ class Boto3Client(S3Client):
             )
         )
         return resp["ETag"].strip('"')
+
+    def upload_part_copy(
+        self,
+        dst_bucket: str,
+        dst_key: str,
+        upload_id: str,
+        part_number: int,
+        src_bucket: str,
+        src_key: str,
+        *,
+        copy_source_range: tuple[int, int] | None = None,
+        conditions: CopyConditions | None = None,
+    ) -> str:
+        kw: dict = {
+            "Bucket": dst_bucket,
+            "Key": dst_key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+            "CopySource": {"Bucket": src_bucket, "Key": src_key},
+        }
+        if copy_source_range is not None:
+            start, end_inclusive = copy_source_range
+            kw["CopySourceRange"] = f"bytes={start}-{end_inclusive}"
+        if conditions is not None and conditions.source is not None:
+            kw.update(_copy_source_conditional_kwargs(conditions.source))
+        resp = self._wrap(lambda: self._s3.upload_part_copy(**kw))
+        return resp["CopyPartResult"]["ETag"].strip('"')
 
     def complete_multipart(
         self, bucket: str, key: str, upload_id: str, parts: list[tuple[int, str]]

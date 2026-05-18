@@ -23,6 +23,7 @@ class Capability(Enum):
 
     # Multipart
     MULTIPART = auto()
+    UPLOAD_PART_COPY = auto()  # server-side copy as a multipart part
 
     # ACL (s32p maps these onto POSIX state; many clients can drive them)
     OBJECT_ACL = auto()

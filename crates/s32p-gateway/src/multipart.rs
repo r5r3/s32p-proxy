@@ -61,6 +61,13 @@ struct UploadMeta {
     // Set as soon as we have 2 parts with the same size.
     assumed_part_size: Option<u64>,
 
+    // Best-effort hint at the final object size. Set on the first part if it's
+    // an UploadPartCopy with no `x-amz-copy-source-range` (single-source whole-file
+    // copy — the dominant UPC workflow); used to size `direct.bin`'s Lustre stripe
+    // count once at create. `Option` + serde-default so older meta.json files load.
+    #[serde(default)]
+    total_size_hint: Option<u64>,
+
     // part_number -> info
     parts: BTreeMap<u32, PartMeta>,
 }
@@ -396,6 +403,7 @@ async fn handle_create_mpu(
         initiated,
         state: UploadState::Active,
         assumed_part_size: None,
+        total_size_hint: None,
         parts: BTreeMap::new(),
     };
 
@@ -625,6 +633,13 @@ async fn handle_upload_part(
     upload_id: &str,
     part_number: u32,
 ) -> Resp {
+    // UploadPartCopy: URL shape is identical to UploadPart; only the
+    // `x-amz-copy-source` header distinguishes them. Dispatch here so the
+    // classifier doesn't need to grow header awareness.
+    if req.headers().get("x-amz-copy-source").is_some() {
+        return handle_upload_part_copy(req, app, bucket, key, upload_id, part_number).await;
+    }
+
     let cfg = app.cfg.clone();
 
     if bucket.is_empty() || key.is_empty() {
@@ -788,7 +803,16 @@ async fn handle_upload_part(
         let direct_striping = {
             let part_size = meta.assumed_part_size.unwrap_or(logical_len);
             let stripe_size = std::cmp::min(cfg.chunk_size as u64, part_size);
-            Some(LustreStriping::new(stripe_size, cfg.lustre_max_stripe_count))
+            // Prefer the total-size hint (set by an UploadPartCopy first part with
+            // no copy-source-range); fall back to the configured max otherwise.
+            // No-op when direct.bin already exists (striping is fixed at create).
+            let stripe_count = match meta.total_size_hint {
+                Some(total) => {
+                    stripe_count_for_size(total, stripe_size, cfg.lustre_max_stripe_count)
+                }
+                None => cfg.lustre_max_stripe_count,
+            };
+            Some(LustreStriping::new(stripe_size, stripe_count))
         };
         #[cfg(not(feature = "lustre"))]
         let direct_striping: Option<LustreStriping> = None;
@@ -983,6 +1007,495 @@ async fn handle_upload_part(
         }
 
         s32p_support::s3resp::upload_part_ok(&etag)
+    }
+}
+
+/// UploadPartCopy: PUT /{bucket}/{key}?partNumber=N&uploadId=… with `x-amz-copy-source`.
+///
+/// AWS wire shape: empty body; source identified by `x-amz-copy-source`,
+/// optional `x-amz-copy-source-range` for partial-part copy, four
+/// `x-amz-copy-source-if-*` conditional headers. Response is
+/// `<CopyPartResult>` with the part ETag and last-modified.
+///
+/// Implementation reuses the same lock/meta/placement plumbing as
+/// `handle_upload_part`; the only differences are the source-side
+/// stat/precondition/range work and the use of `copy_range_to_range` for the
+/// actual data move (the request body is empty).
+///
+/// When this is the first part of the upload AND no `copy-source-range` is
+/// set, the source size is recorded as `meta.total_size_hint` — that hint
+/// later drives Lustre stripe-count selection at `direct.bin` create time.
+async fn handle_upload_part_copy(
+    req: Request<Incoming>,
+    app: Arc<crate::App>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if part_number == 0 {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "invalid partNumber",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    if let Err(e) = sanitize_upload_id(upload_id) {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            &e.to_string(),
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    let (src_bucket, src_key) = match crate::parse_copy_source(req.headers()) {
+        Ok(v) => v,
+        Err(e) => {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    // Reject reserved hidden-mpu prefix on either side. CopyObject does the same.
+    if crate::is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
+        || crate::is_reserved_first_segment(key, &cfg.mpu_dir_name)
+    {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    // Destination bucket must exist.
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    // Source bucket must exist.
+    match bucket_exists_dir(&cfg.posix_root, &src_bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let src_path = match join_object_path(&cfg.posix_root, &src_bucket, &src_key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    let src_meta = match fs::metadata(&src_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key("source not found", None);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return s32p_support::s3resp::access_denied("permission denied", None);
+        }
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+    if src_meta.is_dir() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "UploadPartCopy source must be an object, not a directory",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    let src_size = src_meta.len();
+    let src_etag_unquoted = src_meta.ino().to_string();
+    let src_etag = format!("\"{}\"", src_etag_unquoted);
+    let src_mtime = src_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // Source-side conditional headers (`x-amz-copy-source-if-*`).
+    let cond = match parse_conditional_headers(req.headers()) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("invalid conditional headers: {e}");
+            return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+        }
+    };
+    match s32p_support::preconditions::evaluate_copy_source_preconditions(
+        &cond,
+        &src_etag_unquoted,
+        src_mtime,
+    ) {
+        PreconditionOutcome::Proceed => {}
+        PreconditionOutcome::NotModified | PreconditionOutcome::PreconditionFailed => {
+            return s32p_support::s3resp::precondition_failed(
+                "UploadPartCopy copy-source precondition failed",
+                Some(req.uri().path()),
+            );
+        }
+    }
+
+    // Range:
+    //   - absent      → copy the whole source.
+    //   - `bytes=A-B` → copy that slice (inclusive end).
+    // AWS does not honor the suffix (`bytes=-N`) or open-ended (`bytes=N-`) forms
+    // here, but `parse_range_header` accepts them; we keep the looser parse since
+    // any non-malformed slice within the source still produces a well-defined copy.
+    let has_copy_source_range = req.headers().get("x-amz-copy-source-range").is_some();
+    let range = match req.headers().get("x-amz-copy-source-range").and_then(|v| v.to_str().ok()) {
+        Some(s) => match s32p_support::utils::parse_range_header(s, src_size) {
+            Ok(Some(r)) => r,
+            Ok(None) => s32p_support::utils::ByteRange { start: 0, end_excl: src_size },
+            Err(e) => {
+                let msg = format!("invalid x-amz-copy-source-range: {e}");
+                return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+            }
+        },
+        None => s32p_support::utils::ByteRange { start: 0, end_excl: src_size },
+    };
+    let logical_len = range.end_excl.saturating_sub(range.start);
+
+    let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
+        Ok(p) => p,
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+    let dir = upload_dir(&bucket_root, &cfg.mpu_dir_name, upload_id);
+    if !dir.exists() {
+        return no_such_upload(Some(req.uri().path()));
+    }
+
+    // Phase 1: lock + read meta (plan placement), persist hint and any
+    // assumed_part_size promotion before we touch bytes.
+    let _lk = match lock_exclusive(&upload_lock_path(&dir)) {
+        Ok(lk) => lk,
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    let mut meta = match read_meta(&dir) {
+        Ok(m) => m,
+        Err(_) => return no_such_upload(Some(req.uri().path())),
+    };
+    if meta.bucket != bucket || meta.key != key {
+        return no_such_upload(Some(req.uri().path()));
+    }
+    if !matches!(meta.state, UploadState::Active) {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::CONFLICT,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "upload is not active",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // total_size_hint heuristic — first part is a whole-source UPC ⇒ destination
+    // total size ≈ source size. First-write-wins; never overwrite a later UPC.
+    let mut meta_dirty = false;
+    if meta.total_size_hint.is_none() && meta.parts.is_empty() && !has_copy_source_range {
+        meta.total_size_hint = Some(src_size);
+        meta_dirty = true;
+    }
+
+    // Same assumed_part_size promotion as in handle_upload_part — feed `logical_len`.
+    if meta.assumed_part_size.is_none() {
+        let should_set_assumed = if part_number == 1 {
+            true
+        } else {
+            meta.parts.values().any(|p| p.size == logical_len)
+        };
+        if should_set_assumed {
+            meta.assumed_part_size = Some(logical_len);
+            meta_dirty = true;
+        }
+    }
+
+    if meta_dirty {
+        if let Err(e) = write_meta_atomic(&dir, &meta) {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    }
+
+    // Placement decision — same rules as handle_upload_part.
+    let direct_off = if let Some(s) = meta.assumed_part_size {
+        if logical_len <= s { Some((part_number as u64 - 1) * s) } else { None }
+    } else {
+        compute_sequential_direct_offset(&meta, part_number)
+    };
+
+    drop(_lk);
+
+    let now = s32p_support::s3xml::format_s3_time_system(SystemTime::now());
+
+    // Open source for sequential read. No O_DIRECT: copy_range_to_range works
+    // at byte granularity, and source may have arbitrary stripe layout.
+    let src_file = match open_file(&src_path, OpenMode::Read, OpenDirect::Buffered, None) {
+        Ok((f, _)) => Arc::new(f),
+        Err(e) => {
+            return s32p_support::s3resp::internal_error(
+                &format!("open source: {e}"),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    let stream_cfg = StreamCfg {
+        chunk_size: cfg.chunk_size,
+        inflight:   cfg.inflight,
+        direct_io:  false, // see comment on open: byte-level copy, buffered dest
+    };
+
+    if let Some(off) = direct_off {
+        // Direct placement: copy into direct.bin at (pn-1)*assumed.
+        #[cfg(feature = "lustre")]
+        let direct_striping = {
+            let part_size = meta.assumed_part_size.unwrap_or(logical_len);
+            let stripe_size = std::cmp::min(cfg.chunk_size as u64, part_size);
+            let stripe_count = match meta.total_size_hint {
+                Some(total) => {
+                    stripe_count_for_size(total, stripe_size, cfg.lustre_max_stripe_count)
+                }
+                None => cfg.lustre_max_stripe_count,
+            };
+            Some(LustreStriping::new(stripe_size, stripe_count))
+        };
+        #[cfg(not(feature = "lustre"))]
+        let direct_striping: Option<LustreStriping> = None;
+
+        let direct_path = upload_direct_path(&dir);
+        let dst_file = match open_file(
+            &direct_path,
+            OpenMode::ReadWriteCreate,
+            OpenDirect::Buffered,
+            direct_striping,
+        ) {
+            Ok((f, _)) => Arc::new(f),
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &format!("open direct.bin: {e}"),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+
+        if let Err(e) = copy_range_to_range(
+            src_file,
+            range.start,
+            dst_file,
+            off,
+            logical_len,
+            stream_cfg,
+            app.uring.clone(),
+            app.pool.clone(),
+        )
+        .await
+        {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        // Phase 3: lock + re-read + update meta.
+        let _lk2 = match lock_exclusive(&upload_lock_path(&dir)) {
+            Ok(lk) => lk,
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+
+        let mut meta2 = match read_meta(&dir) {
+            Ok(m) => m,
+            Err(_) => return no_such_upload(Some(req.uri().path())),
+        };
+        if !matches!(meta2.state, UploadState::Active) {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::CONFLICT,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "upload is not active",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        meta2.parts.insert(
+            part_number,
+            PartMeta {
+                size:          logical_len,
+                etag:          src_etag.clone(),
+                last_modified: now.clone(),
+                stored:        PartStored::Direct { off },
+            },
+        );
+        recompute_assumed_part_size(&mut meta2);
+
+        if let Err(e) = write_meta_atomic(&dir, &meta2) {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        s32p_support::s3resp::upload_part_copy_ok(&src_etag, &now)
+    } else {
+        // File placement: write into parts/part-NNNNN.bin via a tmp+rename.
+        let parts_dir = upload_parts_dir(&dir);
+        let name = part_file_name(part_number);
+        let final_path = parts_dir.join(&name);
+        let tmp_path = parts_dir.join(format!("{name}.tmp"));
+
+        #[cfg(feature = "lustre")]
+        let part_striping = Some(LustreStriping::new(
+            cfg.chunk_size as u64,
+            stripe_count_for_size(logical_len, cfg.chunk_size as u64, cfg.lustre_max_stripe_count),
+        ));
+        #[cfg(not(feature = "lustre"))]
+        let part_striping: Option<LustreStriping> = None;
+
+        let dst_file = match open_file(
+            &tmp_path,
+            OpenMode::ReadWriteCreate,
+            OpenDirect::Buffered,
+            part_striping,
+        ) {
+            Ok((f, _)) => Arc::new(f),
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &format!("open part tmp: {e}"),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+
+        if let Err(e) = copy_range_to_range(
+            src_file,
+            range.start,
+            dst_file,
+            0,
+            logical_len,
+            stream_cfg,
+            app.uring.clone(),
+            app.pool.clone(),
+        )
+        .await
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &final_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        // Phase 3: lock + re-read + update meta.
+        let _lk2 = match lock_exclusive(&upload_lock_path(&dir)) {
+            Ok(lk) => lk,
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+
+        let mut meta2 = match read_meta(&dir) {
+            Ok(m) => m,
+            Err(_) => return no_such_upload(Some(req.uri().path())),
+        };
+        if !matches!(meta2.state, UploadState::Active) {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::CONFLICT,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "upload is not active",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        meta2.parts.insert(
+            part_number,
+            PartMeta {
+                size:          logical_len,
+                etag:          src_etag.clone(),
+                last_modified: now.clone(),
+                stored:        PartStored::File { name },
+            },
+        );
+        recompute_assumed_part_size(&mut meta2);
+
+        if let Err(e) = write_meta_atomic(&dir, &meta2) {
+            return s32p_support::s3resp::internal_error(
+                &e.to_string(),
+                Some(req.uri().path()),
+                None,
+            );
+        }
+
+        s32p_support::s3resp::upload_part_copy_ok(&src_etag, &now)
     }
 }
 
@@ -1238,7 +1751,17 @@ async fn handle_complete(
     let direct_striping = {
         let part_size = meta.assumed_part_size.unwrap_or(cfg.chunk_size as u64);
         let stripe_size = std::cmp::min(cfg.chunk_size as u64, part_size);
-        Some(LustreStriping::new(stripe_size, cfg.lustre_max_stripe_count))
+        // Prefer the (known-good) final size on the fast path; otherwise the
+        // total-size hint set by UploadPartCopy; otherwise the configured max.
+        // No-op when direct.bin was created during UploadPart (striping fixed).
+        let stripe_count = if can_fast && final_size > 0 {
+            stripe_count_for_size(final_size, stripe_size, cfg.lustre_max_stripe_count)
+        } else if let Some(total) = meta.total_size_hint {
+            stripe_count_for_size(total, stripe_size, cfg.lustre_max_stripe_count)
+        } else {
+            cfg.lustre_max_stripe_count
+        };
+        Some(LustreStriping::new(stripe_size, stripe_count))
     };
     #[cfg(not(feature = "lustre"))]
     let direct_striping: Option<LustreStriping> = None;

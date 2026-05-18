@@ -3,7 +3,12 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{fs, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -303,28 +308,25 @@ impl ProxyHttp for S3ProxyApp {
             // Re-check the real user via Directory every request. If the
             // operator revoked the long-term identity since the session was
             // minted, the session must die with it.
-            let real_user = match self
-                .directory
-                .user_by_access_key(&entry.real_access_key)
-                .await
-                .map_err(|e| {
-                    Error::explain(ErrorType::InternalError, format!("directory error: {e:#}"))
-                })? {
-                Some(u) => u,
-                None => {
-                    self.sessions.invalidate(&access_key);
-                    responses::respond_s3_error(
-                        session,
-                        StatusCode::FORBIDDEN,
-                        responses::error_code::ACCESS_DENIED,
-                        "session owner has been removed",
-                        Some(req.uri.path()),
-                        None,
-                    )
-                    .await?;
-                    return Ok(true);
-                }
-            };
+            let real_user =
+                match self.directory.user_by_access_key(&entry.real_access_key).await.map_err(
+                    |e| Error::explain(ErrorType::InternalError, format!("directory error: {e:#}")),
+                )? {
+                    Some(u) => u,
+                    None => {
+                        self.sessions.invalidate(&access_key);
+                        responses::respond_s3_error(
+                            session,
+                            StatusCode::FORBIDDEN,
+                            responses::error_code::ACCESS_DENIED,
+                            "session owner has been removed",
+                            Some(req.uri.path()),
+                            None,
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
 
             // Validate SigV4 with the *ephemeral* secret bound to this
             // session. Same verifier as the long-term path; only the secret
@@ -430,24 +432,22 @@ impl ProxyHttp for S3ProxyApp {
                 req.headers.get("x-amz-create-session-mode").and_then(|v| v.to_str().ok()),
             );
 
-            let entry = match self
-                .sessions
-                .create(&user.access_key, &bucket, mode, self.session_ttl)
-            {
-                Some(e) => e,
-                None => {
-                    responses::respond_s3_error(
-                        session,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        responses::error_code::SERVICE_UNAVAILABLE,
-                        "session store is at capacity",
-                        Some(req.uri.path()),
-                        None,
-                    )
-                    .await?;
-                    return Ok(true);
-                }
-            };
+            let entry =
+                match self.sessions.create(&user.access_key, &bucket, mode, self.session_ttl) {
+                    Some(e) => e,
+                    None => {
+                        responses::respond_s3_error(
+                            session,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            responses::error_code::SERVICE_UNAVAILABLE,
+                            "session store is at capacity",
+                            Some(req.uri.path()),
+                            None,
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                };
 
             let body = s32p_support::s3xml::create_session_result_body(
                 &entry.access_key,

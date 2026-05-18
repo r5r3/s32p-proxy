@@ -518,6 +518,19 @@ pub fn upload_part_ok(etag: &str) -> HttpResponse {
     resp
 }
 
+/// UploadPartCopy success — 200 with `<CopyPartResult>` body carrying part ETag
+/// and last-modified. Mirror of `copy_object_ok` for the multipart-copy path.
+pub fn upload_part_copy_ok(etag: &str, last_modified: &str) -> HttpResponse {
+    let body = s3xml::copy_part_result_body(last_modified, etag).unwrap_or_else(|_| {
+        b"<Error><Code>InternalError</Code><Message>xml build failed</Message></Error>".to_vec()
+    });
+
+    let mut resp =
+        response_bytes(StatusCode::OK, "application/xml", body, [("etag", etag.to_string())]);
+    resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
+    resp
+}
+
 pub fn list_multipart_uploads_ok(
     bucket: &str,
     uploads: &[s3xml::MultipartUploadInfo],

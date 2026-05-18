@@ -473,14 +473,14 @@ impl WorkerManager {
         let child = cmd.spawn().context("failed to spawn launcher/worker")?;
 
         let handle = Arc::new(WorkerHandle {
-            key:            WorkerKey::new(user.access_key.as_str(), profile_name),
-            username:       user.username.clone(),
-            endpoint:       endpoint.clone(),
-            posix_root:     staged_root.clone(),
+            key: WorkerKey::new(user.access_key.as_str(), profile_name),
+            username: user.username.clone(),
+            endpoint: endpoint.clone(),
+            posix_root: staged_root.clone(),
             worker_token,
-            tempdir:        Mutex::new(Some(tempdir)),
+            tempdir: Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
-            child:          Mutex::new(child),
+            child: Mutex::new(child),
         });
 
         wait_until_ready(&endpoint, Duration::from_secs(20)).await?;
