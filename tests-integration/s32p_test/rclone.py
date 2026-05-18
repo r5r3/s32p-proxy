@@ -58,6 +58,7 @@ def write_rclone_config(
     region: str,
     access_key: str,
     secret_key: str,
+    directory_markers: bool = False,
 ) -> None:
     """Write a minimal generic-S3 rclone.conf to `path`.
 
@@ -67,6 +68,12 @@ def write_rclone_config(
     rclone at MinIO/Ceph/our proxy would write by hand. Secret is
     in plain text — rclone's `obscure` step is base64, not encryption,
     so it adds no security for a tempdir config.
+
+    `directory_markers=True` opts rclone into the trailing-slash
+    zero-byte-object convention for representing empty directories
+    (`backend/s3/s3.go`: it's the only condition under which the S3
+    backend reports `CanHaveEmptyDirectories=true`). Flip it on for
+    tests that want to exercise the marker create/list path.
     """
     body = (
         f"[{REMOTE_NAME}]\n"
@@ -84,6 +91,8 @@ def write_rclone_config(
         # this skips both the existence check and the create attempt.
         "no_check_bucket = true\n"
     )
+    if directory_markers:
+        body += "directory_markers = true\n"
     path.write_text(body)
     path.chmod(0o600)
 
