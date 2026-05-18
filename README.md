@@ -138,18 +138,21 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
   - `GetBucketLocation`
   - `ListObjectsV1` (`GET /{bucket}`, legacy form) and `ListObjectsV2` (`GET /{bucket}?list-type=2`)
 - **Write**
-  - `PutObject` (streaming upload)
+  - `PutObject` (streaming upload). Append is supported via the S3 Express extension `x-amz-write-offset-bytes: N`: the request body is written at byte offset `N` of the existing object; `N` must equal the current size (no overwrite, no holes), otherwise `412 PreconditionFailed`.
   - `CopyObject` (server-side copy; size-limited by configuration)
   - `DeleteObject`
   - `DeleteObjects` (`POST /?delete`)
-  - `RenameObject` (`PUT ?renameObject` with `x-amz-rename-source`; same-bucket only)
+  - `RenameObject` (`PUT ?renameObject` with `x-amz-rename-source`; same-bucket only). Idempotent: re-running an already-applied rename returns success.
 - **Multipart**
   - `CreateMultipartUpload` (`POST ?uploads`)
   - `UploadPart` (`PUT ?partNumber=N&uploadId=...`)
+  - `UploadPartCopy` (`PUT ?partNumber=N&uploadId=...` with `x-amz-copy-source`; optional `x-amz-copy-source-range` and the four `x-amz-copy-source-if-*` headers). When the first part of an upload is a whole-source `UploadPartCopy` (no `copy-source-range`), the source's size is recorded as a `total_size_hint` on the upload and used to size the assembly file's Lustre stripe count.
   - `ListParts` (`GET ?uploadId=...`)
   - `ListMultipartUploads` (`GET /bucket?uploads`)
   - `CompleteMultipartUpload` (`POST ?uploadId=...`)
   - `AbortMultipartUpload` (`DELETE ?uploadId=...`)
+- **Directory bucket (S3 Express) handshake**
+  - `CreateSession` (`GET /{bucket}?session`) — issues short-lived session credentials and a `x-amz-s3session-token`. Subsequent data-plane requests sign with `service=s3express` and pass the session token either as the `x-amz-s3session-token` header or, for presigned URLs, as the equivalent query parameter. The proxy validates both paths against an in-memory session store; workers re-validate on every request.
 - **ACL**
   - `GetObjectAcl`, `GetBucketAcl` (`GET ?acl`)
   - `PutObjectAcl`, `PutBucketAcl` (`PUT ?acl`) — accepted as a no-op when the requested ACL matches the current POSIX state; mismatches are rejected. The directory ACLs in `s32p-ctl` remain authoritative.
@@ -158,7 +161,7 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
 
 - Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
 - Rejects most query parameters for now, except those required for:
-  - `?location`, `?list-type=2`, `?delete`, `?acl`, `?renameObject`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
+  - `?location`, `?list-type=2`, `?delete`, `?acl`, `?renameObject`, `?session`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
 - **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as "effective" query parameters for routing/handling. A small fixed set of other keys is also treated as non-effective: `x-id`, `content-type`, `cache-control`, `content-encoding`, `content-disposition`, `expires`, `x-amz-storage-class`.
 - `ListObjectsV2` supports Lustre Lazy Size on MDS (LSOM) when built with the Lustre feature.
 - When built with `--features lustre`, the gateway creates new files with Lustre striping via `llapi_file_create()`.
@@ -167,7 +170,7 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
     - `stripe_size = S32P_CHUNK_SIZE_MB × 1 MiB` (env var is in MiB; default `4` → 4 MiB)
     - `stripe_count = ceil(file_size / stripe_size)`, capped by `S32P_LUSTRE_MAX_STRIPE_COUNT`
   - **Multipart uploads**:
-    - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`, `stripe_count = S32P_LUSTRE_MAX_STRIPE_COUNT`
+    - `direct.bin`: `stripe_size = min(stripe_size_serial, part_size)`. `stripe_count` is sized from whatever total-size estimate is available — the upload's `total_size_hint` (set when the first part is a whole-source `UploadPartCopy`) or, in `CompleteMultipartUpload`'s fast path, the now-known final size — via `ceil(estimate / stripe_size)` and capped by `S32P_LUSTRE_MAX_STRIPE_COUNT`. With no estimate, the count falls back to the configured max. Striping is fixed at file creation; the hint matters only the first time `direct.bin` is opened.
     - individual part files are striped like serial uploads.
 - `ETag` for final objects is generated from the inode number.
 - **No object-level metadata storage.** `s32p-gateway` does not persist `x-amz-meta-*` headers or a client-supplied `Content-Type`; PUT silently drops them and HEAD/GET return only what can be derived from the file (size, inode-as-ETag, mtime). This is by design — the bidirectional POSIX interop story (a POSIX user creates a file under `bucket.data_path` and an S3 client reads it intact) breaks if metadata lives in xattrs or sidecars, since POSIX-created files would then be "incomplete" and `mv`/`cp` could orphan sidecars. Same principle as `PutObjectAcl` being a no-op when the requested ACL matches current POSIX state.
@@ -453,7 +456,7 @@ auth:
 - **Defaults**: cache is **on by default for the OpenBao backend** and **off by default for the YAML backend** (YAML is an in-memory `HashMap` lookup; the cache adds no benefit, only lock overhead). Setting `enabled: true` or `enabled: false` overrides either default.
 - **Errors are never cached** — backend errors (network failures, KV decode errors) always pass through so the next attempt sees fresh state.
 - **Snapshot vs. cache.** ACL state is independently snapshotted into spawned workers via `S32P_BUCKET_ACL` (see §Security Notes); that snapshot freezes for the worker's lifetime. The cache only changes how fresh the *next* worker spawn's snapshot is — it does **not** propagate ACL changes to running workers. ACL changes therefore take effect at `max(buckets_ttl_secs, idle_timeout_secs)` worst-case.
-- **Single-flight is not enabled.** Under a cold cache, N concurrent first-requests for the same access key all miss and fan out to N backend calls. With a 30 s TTL and a typical access-key population this is fine; if profiling shows it matters, a per-key `tokio::sync::OnceCell` can be added later.
+- **Single-flight deduplication.** Under a cold cache, N concurrent first-requests for the same access key all see the miss but only one actually hits the backend; the rest wait on a per-key `Arc<Mutex<()>>` and pick up the now-cached result. This bounds backend fan-out by the number of *distinct* access keys, not by request concurrency.
 - **Observability.** Hits log at `trace` and misses + evictions at `debug` under the `s32p_directory::cache` target. To see misses without spamming on hits:
   ```bash
   RUST_LOG=info,s32p_directory::cache=debug cargo run --bin s32p-proxy
@@ -832,7 +835,6 @@ ACL notes:
 - Multipart notes / current constraints:
   - `CompleteMultipartUpload` currently requires **contiguous part numbers starting at 1**.
   - Completion does not validate client-provided part ETags (the gateway uses a stable, upload-time ETag per part).
-  - Multipart copy / UploadPartCopy is not implemented.
 - More production hardening:
   - rate limiting / max concurrent starts
   - negative caching for repeated invalid requests
