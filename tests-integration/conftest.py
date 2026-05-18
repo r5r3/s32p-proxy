@@ -17,7 +17,6 @@ import os
 import pwd
 import shutil
 import socket
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 

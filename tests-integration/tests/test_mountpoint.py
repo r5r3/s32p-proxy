@@ -1,23 +1,32 @@
-"""End-to-end tests against `mount-s3` (Mountpoint for Amazon S3).
+"""End-to-end tests against FUSE mount clients (mount-s3 + rclone).
 
-The directory-bucket compatibility goal is "a real mountpoint-s3 deployment
-talks to the proxy without modification." mount-s3 was picked over
-boto3/aws-cli for this suite because it's the only client we drive that
-selects the *directory-bucket personality* on its own — `--bucket-type
-directory` makes it sign with `service=s3express`, use the
-`s3.endpoint_resolution_us` metric path, etc. The whole AWS-CRT-based
-data plane goes through code paths that boto3 in general-purpose mode
-never touches.
+We drive two FUSE mount clients against the proxy:
+
+  * `mount-s3` (Mountpoint for Amazon S3) — exercises the directory-bucket
+    `ExpressOneZone` personality (`--bucket-type directory`, s3express
+    signing, CRT data plane).
+  * `rclone` — exercises generic SigV4 S3-compat path-style traffic, the
+    shape every "rclone against MinIO/Ceph/our proxy" user runs.
+
+The generic data-plane tests (`test_write_via_mount_lands_on_backend`,
+`test_read_via_mount_sees_backend_files`, listing, delete, roundtrip,
+read-only) are parametrized over both backends via the `mount_backend`
+fixture — the same assertion runs once per client, ensuring both code
+paths land bytes correctly on the POSIX backend. Client-specific tests
+(personality marker, `If-None-Match` collision, `--incremental-upload`,
+the directory-rename FUSE refusal, mount-s3's `RenameObject` path) stay
+mount-s3 only via `@pytest.mark.parametrize("mount_backend",
+["mount-s3"], indirect=True)`.
 
 What this suite proves
 ----------------------
 - mount-s3 with `--bucket-type directory` activates the
   `ExpressOneZone` personality (visible in its own log).
-- All data-plane ops the personality emits (ListObjectsV2, HeadObject,
-  CreateMultipartUpload/UploadPart/CompleteMultipartUpload, DeleteObject)
-  reach the proxy, route to the worker, and produce the expected bytes
-  on disk.
-- A `--read-only` mount enforces no-write at the FUSE layer.
+- Both clients' data-plane ops (ListObjectsV2, HeadObject, the various
+  PUT/upload paths, DeleteObject) reach the proxy, route to the worker,
+  and produce the expected bytes on disk.
+- A `--read-only` mount enforces no-write at the FUSE layer (both
+  clients).
 
 What this suite does NOT prove
 ------------------------------
@@ -31,8 +40,9 @@ What this suite does NOT prove
   through the mount; the gateway-side `RenameObject` is covered by
   `tests/test_rename.py`.
 
-Skipped automatically when `mount-s3` isn't installed or `/dev/fuse`
-isn't usable (CI without `--privileged`, kernels with no fuse module).
+Per-backend availability is checked inside the `mount` fixture: a test
+parametrized over a backend whose binary isn't installed (or whose
+`/dev/fuse` isn't usable) is skipped rather than failing.
 """
 
 from __future__ import annotations
@@ -42,12 +52,19 @@ import time
 
 import pytest
 
-from s32p_test.mountpoint import MountpointSession, is_available
+from s32p_test.mountpoint import MountpointSession
+from s32p_test.mountpoint import is_available as mountpoint_is_available
+from s32p_test.rclone import RcloneMountSession, endpoint_url_for_rclone
+from s32p_test.rclone import is_available as rclone_is_available
 
 
+# Module-level guard: if neither backend is available there is nothing
+# this file can do. Per-backend availability is re-checked inside the
+# `mount` fixture so a one-backend-missing system still runs the
+# tests for the other.
 pytestmark = pytest.mark.skipif(
-    not is_available(),
-    reason="mount-s3 not installed or /dev/fuse not available",
+    not (mountpoint_is_available() or rclone_is_available()),
+    reason="neither mount-s3 nor rclone is available (or /dev/fuse is missing)",
 )
 
 
@@ -64,24 +81,71 @@ _FS_POLL_S = 0.05
 # ----------------------------------------------------------------- fixtures
 
 
+# Backends the generic mount tests run against. The fixture is parametrized
+# here once; tests that need a specific backend override with
+# `@pytest.mark.parametrize("mount_backend", ["mount-s3"], indirect=True)`.
+_MOUNT_BACKENDS = ("mount-s3", "rclone")
+
+
+@pytest.fixture(params=_MOUNT_BACKENDS)
+def mount_backend(request) -> str:
+    """Parametrized over `mount-s3` and `rclone`. A test that depends on
+    `mount` (or `mount_ro`) without overriding this fixture runs once per
+    backend. Backends whose binary is not installed cause the individual
+    parametrization to be skipped — see `_make_mount_session`."""
+    return request.param
+
+
+def _make_mount_session(
+    backend: str, *, tmp_path, endpoint, bucket, mode: str,
+):
+    """Construct (but don't start) a mount session for `backend`.
+
+    Skips the test when the requested backend isn't usable on this host
+    (binary missing, `/dev/fuse` absent). Per-backend skipping — not
+    per-module — lets a one-backend-missing system still run the other
+    half of the matrix.
+    """
+    if backend == "mount-s3":
+        if not mountpoint_is_available():
+            pytest.skip("mount-s3 not installed or /dev/fuse not available")
+        return MountpointSession(
+            endpoint_url=endpoint.base_url,
+            region=endpoint.region,
+            access_key=endpoint.access_key,
+            secret_key=endpoint.secret_key,
+            bucket=bucket,
+            mount_root=tmp_path,
+            mode=mode,
+        )
+    if backend == "rclone":
+        if not rclone_is_available():
+            pytest.skip("rclone not installed or /dev/fuse not available")
+        return RcloneMountSession(
+            endpoint_url=endpoint_url_for_rclone(endpoint.base_url),
+            region=endpoint.region,
+            access_key=endpoint.access_key,
+            secret_key=endpoint.secret_key,
+            bucket=bucket,
+            mount_root=tmp_path,
+            mode=mode,
+        )
+    raise ValueError(f"unknown mount backend: {backend!r}")
+
+
 @pytest.fixture
-def mount(tmp_path, endpoint, bucket):
-    """Mount the per-test `bucket` via mount-s3 in directory-bucket mode.
+def mount(tmp_path, endpoint, bucket, mount_backend):
+    """Mount the per-test `bucket` via the parametrized backend.
 
     `tmp_path` scopes the mount directory + log + creds file to the test,
     so a failure leaves disposable debris instead of polluting the
-    session tempdir. The fixture handles `mount.stop()` even when the
-    test raises; auto-unmount inside mount-s3 covers the SIGTERM path
-    and `_force_unmount` covers the SIGKILL fallback.
+    session tempdir. The fixture handles `stop()` even when the test
+    raises; mount-s3's auto-unmount and rclone's SIGTERM handler cover
+    the clean path, with a fusermount fallback for the SIGKILL case.
     """
-    session = MountpointSession(
-        endpoint_url=endpoint.base_url,
-        region=endpoint.region,
-        access_key=endpoint.access_key,
-        secret_key=endpoint.secret_key,
-        bucket=bucket,
-        mount_root=tmp_path,
-        mode="rw",
+    session = _make_mount_session(
+        mount_backend, tmp_path=tmp_path, endpoint=endpoint,
+        bucket=bucket, mode="rw",
     )
     session.start()
     try:
@@ -91,18 +155,13 @@ def mount(tmp_path, endpoint, bucket):
 
 
 @pytest.fixture
-def mount_ro(tmp_path, endpoint, bucket, bucket_fs):
+def mount_ro(tmp_path, endpoint, bucket, bucket_fs, mount_backend):
     """Read-only mount of the per-test bucket. Pre-seeds one file so the
     test has something to read without needing rw access."""
     bucket_fs.write("seed.bin", b"readable\n")
-    session = MountpointSession(
-        endpoint_url=endpoint.base_url,
-        region=endpoint.region,
-        access_key=endpoint.access_key,
-        secret_key=endpoint.secret_key,
-        bucket=bucket,
-        mount_root=tmp_path,
-        mode="ro",
+    session = _make_mount_session(
+        mount_backend, tmp_path=tmp_path, endpoint=endpoint,
+        bucket=bucket, mode="ro",
     )
     session.start()
     try:
@@ -141,6 +200,7 @@ def _wait_for_mount_path(target, timeout: float = _FS_VISIBLE_TIMEOUT_S) -> bool
 # ----------------------------------------------------------------- personality
 
 
+@pytest.mark.parametrize("mount_backend", ["mount-s3"], indirect=True)
 def test_mount_selects_directory_bucket_personality(mount):
     """`--bucket-type directory` must make mount-s3 pick the
     ExpressOneZone personality. The marker is the only externally
@@ -150,7 +210,8 @@ def test_mount_selects_directory_bucket_personality(mount):
     Without this assertion, a future regression that mis-detects the
     bucket as general-purpose would still pass the data-plane tests
     below (they don't care which signing service was used) — this test
-    is the one that locks in directory-bucket mode."""
+    is the one that locks in directory-bucket mode. mount-s3-only —
+    rclone has no equivalent personality split."""
     log = mount.log_tail(n=64 * 1024)
     assert "personality ExpressOneZone" in log, log
 
@@ -271,10 +332,14 @@ def test_readonly_mount_reads_succeed(mount_ro):
 # changes the strategy the test makes that visible.
 
 
+@pytest.mark.parametrize("mount_backend", ["mount-s3"], indirect=True)
 def test_rename_file_via_mount(mount, bucket_fs):
     """`os.rename(a, b)` on a file inside the mount must produce the
     same backend state as a server-side `RenameObject`: new path
-    contains the bytes, old path is gone."""
+    contains the bytes, old path is gone. mount-s3-only because the
+    assertion is specifically about its `RenameObject` path; rclone
+    implements rename as CopyObject + DeleteObject and would exercise
+    a different code path on the gateway side."""
     bucket_fs.write("orig.txt", b"rename me\n")
     src = mount.path / "orig.txt"
     dst = mount.path / "renamed.txt"
@@ -293,12 +358,14 @@ def test_rename_file_via_mount(mount, bucket_fs):
     assert not bucket_fs.exists("orig.txt"), mount.log_tail()
 
 
+@pytest.mark.parametrize("mount_backend", ["mount-s3"], indirect=True)
 def test_rename_file_across_dirs_via_mount(mount, bucket_fs):
     """Renaming across directories must work the same way. Tests both
     that the target parent directory is created on the backend (S3 has
     no real directories — the gateway must just place the object) and
     that the source parent is pruned afterwards (existing gateway
-    behavior, documented in directory-bucket-support.md)."""
+    behavior). mount-s3-only — same rationale as
+    `test_rename_file_via_mount`."""
     bucket_fs.write("src-dir/orig.txt", b"crossing dirs\n")
     src = mount.path / "src-dir" / "orig.txt"
     dst_dir = mount.path / "dst-dir"
@@ -323,6 +390,7 @@ def test_rename_file_across_dirs_via_mount(mount, bucket_fs):
     assert not bucket_fs.exists("src-dir/orig.txt"), mount.log_tail()
 
 
+@pytest.mark.parametrize("mount_backend", ["mount-s3"], indirect=True)
 def test_directory_rename_refused_at_fuse_layer(mount, bucket_fs):
     """mount-s3 refuses to rename a directory (= shared key prefix) at
     the FUSE layer with `EPERM`. The refusal happens *before* any S3
@@ -336,7 +404,8 @@ def test_directory_rename_refused_at_fuse_layer(mount, bucket_fs):
     state on partial failure. We assert the refusal so a future
     mount-s3 version that introduces a walk-rename mode shows up as a
     test failure (good — we'd then want to decide whether to mirror it
-    server-side).
+    server-side). mount-s3-only — rclone does walk-and-rename, which is
+    a different (legitimate) policy choice.
     """
     bucket_fs.write("old-dir/a.txt", b"AAA\n")
     bucket_fs.write("old-dir/b.txt", b"BBB\n")
@@ -377,7 +446,10 @@ def mount_no_overwrite(tmp_path, endpoint, bucket):
     """Read-write mount **without** `--allow-overwrite`. This is the
     mountpoint-s3 default and the shape that surfaces the
     `If-None-Match: *` precondition on every rename. Used by the
-    rename-collision test."""
+    rename-collision test. mount-s3-only — rclone has no equivalent
+    of `--allow-overwrite`, the header behavior is mount-s3-specific."""
+    if not mountpoint_is_available():
+        pytest.skip("mount-s3 not installed or /dev/fuse not available")
     session = MountpointSession(
         endpoint_url=endpoint.base_url,
         region=endpoint.region,
@@ -441,7 +513,10 @@ def mount_incremental(tmp_path, endpoint, bucket):
     mount turn into a chain of `PUT … x-amz-write-offset-bytes` requests
     (S3 Express directory-bucket append) instead of a buffered single PUT
     or multipart upload. Used to exercise the gateway's
-    `handle_put_object_append` end-to-end."""
+    `handle_put_object_append` end-to-end. mount-s3-only — rclone has no
+    equivalent of the `--incremental-upload` mode."""
+    if not mountpoint_is_available():
+        pytest.skip("mount-s3 not installed or /dev/fuse not available")
     session = MountpointSession(
         endpoint_url=endpoint.base_url,
         region=endpoint.region,

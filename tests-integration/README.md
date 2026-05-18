@@ -63,11 +63,23 @@ tests-integration/
 │
 └── tests/
     ├── test_get_put_delete.py      # smoke round-trip + metadata xfail
+    ├── test_mountpoint.py          # FUSE mount tests (mount-s3 + rclone)
     └── interop/                    # POSIX <-> S3 contracts
         ├── test_basic.py           # write/read both ways, rename, listing
         ├── test_symlinks.py        # live + broken symlink behavior
         └── test_advanced.py        # reserved .s32p-mpu, no LIST-GC, perms, copy
 ```
+
+`test_mountpoint.py` parametrizes its data-plane tests over both FUSE
+mount clients (mount-s3 and rclone) via the `mount_backend` fixture, so
+each generic test (write/read/list/delete/roundtrip/read-only) runs
+once per backend. Client-specific tests — the mount-s3 directory-bucket
+personality marker, `--incremental-upload`, the `If-None-Match`
+collision path, and the `RenameObject` walk — stay pinned to mount-s3
+with `@pytest.mark.parametrize("mount_backend", ["mount-s3"],
+indirect=True)`. Per-backend availability is checked inside the `mount`
+fixture, so a one-binary-missing host still runs the other half of the
+matrix instead of skipping the whole file.
 
 ## Adding a test
 
