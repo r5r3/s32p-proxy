@@ -42,6 +42,10 @@ This repository is a Rust workspace with multiple crates:
 - `s32p-support`: shared support library (common config/types/errors/helpers used across crates)
 - `s32p-gateway`: the per-access-key worker gateway binary (launched by the proxy; it runs as alternative to VersityGW)
 
+Outside the workspace:
+
+- `tests-integration/`: pixi-managed pytest harness. Spawns the real proxy + workers, drives them through a matrix of S3 clients (boto3 path-style + virtual-hosted, aws-cli, mount-s3 + rclone FUSE mounts) plus AWS-compat probes. Run with `cd tests-integration && pixi run test`. Layout + how to extend in `tests-integration/README.md`.
+
 ---
 
 ## Architecture
@@ -112,17 +116,21 @@ This repository is a Rust workspace with multiple crates:
     - `read` (e.g. `GetObject`, `HeadObject`, `ListObjectsV1`/`V2`, `ListBuckets`, `GetBucketLocation`, `HeadBucket`, `GetObjectAcl`, `GetBucketAcl`)
     - `write` (e.g. `PutObject`, `CopyObject`, `DeleteObject`, `DeleteObjects`, `RenameObject`, `PutObjectAcl`, `PutBucketAcl`)
     - `multipart` (initiate/upload-part/list-parts/complete/abort + list uploads)
-    - `versioning` (detected, but not implemented yet)
-    - `object_lock` (detected, but not implemented yet)
+    - `versioning` (detected; read-side probes answered AWS-shape via `aws_compat`, write-side falls back to 501)
+    - `object_lock` (same shape as versioning — feature-disabled responses via `aws_compat`)
     - `bucket_admin` (`CreateBucket`/`DeleteBucket`; detected and routed to NotImplemented — bucket lifecycle is operator-only via `s32p-ctl`)
+    - `session` (S3 Express `CreateSession`)
     - `other`
 
 - **Config-driven routing** (`etc/s32p-proxy.yaml`)
   - Routes based on the classifier class keys above.
-  - Each class maps to one action:
+  - Each class maps to one of four actions:
     - `proxy` (selects a worker profile)
-    - `not_implemented` (local S3 NotImplemented response, but only after SigV4 validation)
+    - `not_implemented` (uniform 501 NotImplemented response, after SigV4 validation)
+    - `aws_compat` (per-`S3Op` AWS-shaped feature-disabled responses — `200` with empty `<VersioningConfiguration/>` for `GetBucketVersioning`, `404 ObjectLockConfigurationNotFoundError` for `GetBucketObjectLockConfiguration`, `400 InvalidRequest "Bucket is missing Object Lock Configuration"` for `PutObjectRetention` / `PutObjectLegalHold`, etc. — falling back to 501 for ops AWS always implements like `PutBucketVersioning`)
+    - `create_session` (local handling of S3 Express `CreateSession`)
   - If a specific class key is not configured, the proxy falls back to the `other` route.
+  - **Always-on pre-routing gate:** any request carrying server-side-encryption headers (SSE-C / SSE-S3 / SSE-KMS / SSE-KMS-DSSE) is rejected with `400 InvalidRequest` before routing — the gateway has no encryption path and silent plaintext storage would be a data-confidentiality bug. See `s3_compatibility_analysis.md` for the per-variant table.
 
 ### Gateway (`s32p-gateway`)
 
@@ -830,8 +838,9 @@ ACL notes:
 
 ## Known limitations / TODO
 
-- **Versioning-related** requests are detected and currently return `NotImplemented`
-- **Object Lock–related** requests are detected and currently return `NotImplemented`
+- **Versioning** is not implemented; read-side probes (`GetBucketVersioning`) answer with AWS's "Unversioned" 200 shape via `aws_compat` so client state-detection works, but write-side ops (`PutBucketVersioning`, `ListObjectVersions`, anything with `?versionId=`) fall back to `501 NotImplemented`.
+- **Object Lock** is not implemented; reads answer with the matching AWS feature-disabled shape (`404 ObjectLockConfigurationNotFoundError` for the bucket config, `404 NoSuchObjectLockConfiguration` for per-object retention/legal-hold), writes reject with `400 InvalidRequest "Bucket is missing Object Lock Configuration"`.
+- **Server-side encryption** (SSE-C, SSE-S3, SSE-KMS, SSE-KMS-DSSE) is rejected at the proxy with `400 InvalidRequest` — no encryption path exists, and silently storing plaintext would mislead the client.
 - Multipart notes / current constraints:
   - `CompleteMultipartUpload` currently requires **contiguous part numbers starting at 1**.
   - Completion does not validate client-provided part ETags (the gateway uses a stable, upload-time ETag per part).
