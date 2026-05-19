@@ -1143,8 +1143,8 @@ async fn handle_upload_part_copy(
         );
     }
     let src_size = src_meta.len();
-    let src_etag_unquoted = src_meta.ino().to_string();
-    let src_etag = format!("\"{}\"", src_etag_unquoted);
+    let src_etag_unquoted = crate::format_inode_etag_unquoted(src_meta.ino());
+    let src_etag = crate::format_inode_etag(src_meta.ino());
     let src_mtime = src_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
     // Source-side conditional headers (`x-amz-copy-source-if-*`).
@@ -1710,7 +1710,7 @@ async fn handle_complete(
     // actual precondition check
     let existing = match fs::metadata(&dst_path) {
         Ok(m) => {
-            let etag_existing = format!("{}", m.ino()); // adapt to your etag logic
+            let etag_existing = crate::format_inode_etag_unquoted(m.ino());
             let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             Some((etag_existing, lm))
         }
@@ -1962,7 +1962,7 @@ async fn handle_complete(
                                                 );
                                             }
                                         };
-                                        let etag = format!("\"{}\"", m.ino());
+                                        let etag = crate::format_inode_etag(m.ino());
                                         return s32p_support::s3resp::complete_multipart_upload_ok(
                                             &location, bucket, key, &etag,
                                         );
@@ -1994,7 +1994,7 @@ async fn handle_complete(
                             );
                         }
                     };
-                    let etag = format!("\"{}\"", m.ino());
+                    let etag = crate::format_inode_etag(m.ino());
                     return s32p_support::s3resp::complete_multipart_upload_ok(
                         &location, bucket, key, &etag,
                     );
@@ -2302,7 +2302,7 @@ async fn handle_complete(
             );
         }
     };
-    let etag = format!("\"{}\"", m.ino());
+    let etag = crate::format_inode_etag(m.ino());
 
     s32p_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag)
 }

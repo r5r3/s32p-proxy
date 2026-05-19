@@ -1262,8 +1262,8 @@ fn head_response_from_lstat(req: &Request<Incoming>, lmeta: &std::fs::Metadata) 
     let size = lmeta.len();
     let lm_st = lmeta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let last_modified = fmt_http_date(lm_st);
-    let etag_unquoted = lmeta.ino().to_string();
-    let etag = format!("\"{}\"", etag_unquoted);
+    let etag_unquoted = format_inode_etag_unquoted(lmeta.ino());
+    let etag = format_inode_etag(lmeta.ino());
 
     let cond = match parse_conditional_headers(req.headers()) {
         Ok(c) => c,
@@ -1395,9 +1395,9 @@ async fn handle_get_object(
     let lm_st = meta.modified().unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
     let last_modified = fmt_http_date(lm_st);
 
-    // inode-based ETag
-    let etag_unquoted = meta.ino().to_string();
-    let etag = format!("\"{}\"", etag_unquoted);
+    // inode-based ETag (see `format_inode_etag` for the `-1` suffix rationale).
+    let etag_unquoted = format_inode_etag_unquoted(meta.ino());
+    let etag = format_inode_etag(meta.ino());
 
     // are preconditions matched?
     let cond = match parse_conditional_headers(req.headers()) {
@@ -2084,7 +2084,7 @@ async fn handle_list_objects_v2(
                         contents.push(s32p_support::s3xml::ListObjectInfo {
                             key,
                             last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
-                            etag: format!("\"{}\"", stx.ino),
+                            etag: format_inode_etag(stx.ino),
                             size: 0,
                             owner: if fetch_owner { Some(owner_info(stx.uid)) } else { None },
                         });
@@ -2117,7 +2117,7 @@ async fn handle_list_objects_v2(
         }
 
         let last_modified = s32p_support::s3xml::format_s3_time_system(stx.mtime);
-        let etag = format!("\"{}\"", stx.ino);
+        let etag = format_inode_etag(stx.ino);
         let size = stx.size;
 
         let owner = if fetch_owner { Some(owner_info(stx.uid)) } else { None };
@@ -2382,7 +2382,7 @@ async fn handle_list_objects_v1(
                         contents.push(s32p_support::s3xml::ListObjectInfo {
                             key,
                             last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
-                            etag: format!("\"{}\"", stx.ino),
+                            etag: format_inode_etag(stx.ino),
                             size: 0,
                             owner: Some(owner_info(stx.uid)),
                         });
@@ -2412,7 +2412,7 @@ async fn handle_list_objects_v1(
         }
 
         let last_modified = s32p_support::s3xml::format_s3_time_system(stx.mtime);
-        let etag = format!("\"{}\"", stx.ino);
+        let etag = format_inode_etag(stx.ino);
         let size = stx.size;
 
         // v1 always carries Owner in Contents.
@@ -2664,7 +2664,7 @@ async fn handle_put_object(
                 );
             }
         };
-        let etag = format!("\"{}\"", meta.ino());
+        let etag = format_inode_etag(meta.ino());
         return s32p_support::s3resp::put_object_ok(&etag);
     }
 
@@ -2724,11 +2724,13 @@ async fn handle_put_object(
         }
     };
 
-    // Determine existing object state (etag + last_modified) if present
+    // Determine existing object state (etag + last_modified) if present.
+    // Use the unquoted-etag helper so the precondition string round-trips
+    // byte-equal against an `If-Match` header the client formed from a
+    // prior HEAD/GET response.
     let existing = match fs::metadata(&obj_path) {
         Ok(m) => {
-            // reuse your existing etag computation logic; if it's inode-based, compute it here too.
-            let etag_existing = format!("{}", m.ino()); // adapt to your actual etag logic
+            let etag_existing = format_inode_etag_unquoted(m.ino());
             let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             Some((etag_existing, lm))
         }
@@ -2791,7 +2793,7 @@ async fn handle_put_object(
         return s32p_support::s3resp::internal_error(&e.to_string(), Some(parts.uri.path()), None);
     }
 
-    // Build ETag (consistent with reads: inode-based ETag)
+    // Build ETag (consistent with reads: inode-based ETag via the shared helper).
     let meta = match std::fs::metadata(&obj_path) {
         Ok(m) => m,
         Err(e) => {
@@ -2803,7 +2805,7 @@ async fn handle_put_object(
         }
     };
 
-    let etag = format!("\"{}\"", meta.ino());
+    let etag = format_inode_etag(meta.ino());
     s32p_support::s3resp::put_object_ok(&etag)
 }
 
@@ -2973,8 +2975,9 @@ async fn handle_put_object_append(
 
     // Run write preconditions against the file we actually have open.
     // Inode-based, unquoted etag for consistency with the non-append
-    // PUT path.
-    let existing_etag = format!("{}", cur_meta.ino());
+    // PUT path — must match `format_inode_etag_unquoted` so an `If-Match`
+    // formed from a prior HEAD/GET round-trips.
+    let existing_etag = format_inode_etag_unquoted(cur_meta.ino());
     let existing_lm = cur_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     match evaluate_write_preconditions(&cond, Some((existing_etag.as_str(), existing_lm))) {
         PreconditionOutcome::Proceed => {}
@@ -3041,7 +3044,7 @@ async fn handle_put_object_append(
             );
         }
     };
-    let etag = format!("\"{}\"", meta.ino());
+    let etag = format_inode_etag(meta.ino());
     // `file` (and its flock) drop here.
     s32p_support::s3resp::put_object_ok(&etag)
 }
@@ -3182,7 +3185,7 @@ async fn handle_copy_object(
                     );
                 }
             };
-            let etag = format!("\"{}\"", dst_meta.ino());
+            let etag = format_inode_etag(dst_meta.ino());
             let last_modified = s32p_support::s3xml::format_s3_time_system(
                 dst_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             );
@@ -3200,8 +3203,8 @@ async fn handle_copy_object(
         }
     };
 
-    // Source preconditions
-    let src_etag_unquoted = format!("{}", src_meta.ino()); // adapt to your etag logic
+    // Source preconditions (etag string must match what HEAD/GET on the source emits).
+    let src_etag_unquoted = format_inode_etag_unquoted(src_meta.ino());
     let src_last_modified = src_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     match evaluate_copy_source_preconditions(&cond, &src_etag_unquoted, src_last_modified) {
         PreconditionOutcome::Proceed => {}
@@ -3223,7 +3226,7 @@ async fn handle_copy_object(
             if m.is_dir() {
                 None // treat directories as non-existent for object operations
             } else {
-                let etag_existing = format!("{}", m.ino());
+                let etag_existing = format_inode_etag_unquoted(m.ino());
                 let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 Some((etag_existing, lm))
             }
@@ -3299,7 +3302,7 @@ async fn handle_copy_object(
         }
     };
 
-    let etag = format!("\"{}\"", dst_meta.ino());
+    let etag = format_inode_etag(dst_meta.ino());
     let last_modified = s32p_support::s3xml::format_s3_time_system(
         dst_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
     );
@@ -3597,12 +3600,28 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
-/// Format the inode-derived ETag. Matches the shape HEAD/GET use elsewhere
-/// in the gateway (`format!("\"{}\"", meta.ino())`), so a client that
-/// caches the ETag from a prior HEAD and replays it in `If-Match` will
-/// compare byte-equal here.
-fn format_inode_etag(ino: u64) -> String {
-    format!("\"{}\"", ino)
+/// Format the inode-derived ETag with a `-1` multipart-style suffix. The
+/// suffix exists so AWS SDK for .NET (which treats any ETag containing
+/// `-` as a multipart aggregate and skips its MD5-vs-ETag check on
+/// PutObject/UploadPart responses and on GetObject stream wrapping)
+/// doesn't reject our inode-based ETags as bad MD5s. The inode itself
+/// stays load-bearing (Lustre/POSIX-interop story per README); the
+/// suffix is purely a "skip integrity check" signal to strict clients.
+/// All stat-derived ETag emissions and all precondition-comparison
+/// strings in the gateway go through this helper (or its unquoted twin
+/// `format_inode_etag_unquoted`) so the literal byte-string round-trips
+/// consistently through `If-Match`.
+pub(crate) fn format_inode_etag(ino: u64) -> String {
+    format!("\"{}-1\"", ino)
+}
+
+/// Unquoted form of `format_inode_etag` for use as `current_etag_unquoted`
+/// in the precondition evaluators (`evaluate_read_preconditions` /
+/// `evaluate_write_preconditions` / `evaluate_copy_source_preconditions`).
+/// Must stay in lockstep with `format_inode_etag` — same digits, same
+/// suffix — so a client cached `If-Match: "<ino>-1"` matches.
+pub(crate) fn format_inode_etag_unquoted(ino: u64) -> String {
+    format!("{}-1", ino)
 }
 
 /// Compare two ETag-like values for equality, tolerating optional
@@ -3783,7 +3802,7 @@ async fn handle_delete_object(
 
     let existing = match fs::metadata(&obj_path) {
         Ok(m) => {
-            let etag_existing = format!("{}", m.ino()); // adapt to your etag logic
+            let etag_existing = format_inode_etag_unquoted(m.ino());
             let lm = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             Some((etag_existing, lm, m.len()))
         }
