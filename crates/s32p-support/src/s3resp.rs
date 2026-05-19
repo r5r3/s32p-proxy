@@ -119,6 +119,21 @@ pub fn versioning_not_configured() -> HttpResponse {
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
+/// 400 InvalidRequest for requests that carry SSE-C (server-side
+/// encryption with customer-provided keys) headers. The gateway has no
+/// at-rest encryption path, so silently dropping these headers would
+/// store the body in plaintext while the client believes it sent an
+/// encrypted PUT — a data-confidentiality footgun. Reject at the
+/// proxy with an AWS-shaped 400 + InvalidRequest so the failure
+/// surfaces immediately, before any worker is spawned.
+pub fn sse_c_not_supported(resource: Option<&str>) -> HttpResponse {
+    invalid_request(
+        "Server-side encryption with customer-provided keys (SSE-C) \
+         is not supported by this proxy",
+        resource,
+    )
+}
+
 /// Convenience: InvalidRequest (400).
 pub fn invalid_request(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(StatusCode::BAD_REQUEST, s3xml::error_code::INVALID_REQUEST, message, resource, None)

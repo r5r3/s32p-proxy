@@ -251,6 +251,35 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
     Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
 }
 
+/// Header names that signal a request is using SSE-C (server-side encryption
+/// with customer-provided keys). Six headers in total: three for the *target*
+/// object (PUT/GET/HEAD/UploadPart/CreateMultipartUpload), three for the
+/// *source* object on CopyObject / UploadPartCopy when the source itself was
+/// uploaded with SSE-C.
+///
+/// `detect_sse_c_headers` matches on these names case-insensitively (HTTP
+/// header names are case-insensitive and `http::HeaderMap` already normalizes
+/// to lowercase, but the constants are written in the canonical AWS casing
+/// for grep-ability against AWS docs).
+pub const SSE_C_HEADER_NAMES: &[&str] = &[
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-copy-source-server-side-encryption-customer-algorithm",
+    "x-amz-copy-source-server-side-encryption-customer-key",
+    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+];
+
+/// True iff any SSE-C header is present in the request. We use this to
+/// short-circuit at the proxy: our gateway does not implement SSE-C, and
+/// silently dropping these headers would let the client believe its data
+/// is encrypted at rest when it isn't (the data path stores plaintext).
+/// Returning a clear 400 InvalidRequest at the proxy fails the request
+/// before any bytes hit the worker.
+pub fn detect_sse_c_headers(headers: &http::HeaderMap) -> bool {
+    SSE_C_HEADER_NAMES.iter().any(|name| headers.contains_key(*name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +352,57 @@ mod tests {
 
         // Invalid end < start
         assert!(parse_range_header("bytes=100-50", 200).is_err());
+    }
+
+    #[test]
+    fn detect_sse_c_headers_empty_map() {
+        let h = http::HeaderMap::new();
+        assert!(!detect_sse_c_headers(&h));
+    }
+
+    #[test]
+    fn detect_sse_c_headers_unrelated_headers_only() {
+        let mut h = http::HeaderMap::new();
+        h.insert("host", "example.com".parse().unwrap());
+        h.insert("x-amz-date", "20250101T000000Z".parse().unwrap());
+        // SSE-S3 (not SSE-C) — different header, must not trigger.
+        h.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+        assert!(!detect_sse_c_headers(&h));
+    }
+
+    #[test]
+    fn detect_sse_c_headers_target_algorithm() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption-customer-algorithm", "AES256".parse().unwrap());
+        assert!(detect_sse_c_headers(&h));
+    }
+
+    #[test]
+    fn detect_sse_c_headers_target_key_only() {
+        // Some clients only set the key+md5 (the algorithm comes via the
+        // SDK as a default header); the proxy must reject as long as *any*
+        // SSE-C header is present.
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption-customer-key", "AAAA".parse().unwrap());
+        assert!(detect_sse_c_headers(&h));
+    }
+
+    #[test]
+    fn detect_sse_c_headers_copy_source_variant() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "x-amz-copy-source-server-side-encryption-customer-algorithm",
+            "AES256".parse().unwrap(),
+        );
+        assert!(detect_sse_c_headers(&h));
+    }
+
+    #[test]
+    fn detect_sse_c_headers_case_insensitive_via_headermap() {
+        // http::HeaderMap normalizes names; insert with mixed case still
+        // resolves to lowercase, so the lookup matches our constants.
+        let mut h = http::HeaderMap::new();
+        h.insert("X-Amz-Server-Side-Encryption-Customer-Key", "AAAA".parse().unwrap());
+        assert!(detect_sse_c_headers(&h));
     }
 }

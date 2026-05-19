@@ -376,6 +376,28 @@ impl ProxyHttp for S3ProxyApp {
         ctx.set_user(&user);
         ctx.session_validated = session_validated;
 
+        // 2.0) SSE-C reject. Server-side encryption with customer-provided
+        // keys is not implemented in the gateway; forwarding a request that
+        // carries SSE-C headers would silently store plaintext while the
+        // client believes it sent an encrypted body — a data-confidentiality
+        // footgun. Reject at the proxy with an AWS-shaped 400 InvalidRequest
+        // before any routing decision, so the failure surfaces immediately
+        // regardless of which class/action the request would otherwise hit.
+        // No SigV4 pre-check needed — this is a structural header-shape gate
+        // that exposes no routing or user state.
+        if s32p_support::utils::detect_sse_c_headers(&req.headers) {
+            tracing::info!(
+                method = req.method.as_str(),
+                path = req.uri.path(),
+                access_key = %user.access_key,
+                "rejected SSE-C request (server-side encryption with customer-provided \
+                 keys is not supported by this proxy)"
+            );
+            let resp = s32p_support::s3resp::sse_c_not_supported(Some(req.uri.path()));
+            responses::respond_hyper(session, resp, /* close = */ true).await?;
+            return Ok(true);
+        }
+
         // 2a) If routing says NotImplemented: validate SigV4 first (unless we
         // already validated via session), then reply with NotImplemented.
         // Validating up front prevents unauthenticated callers from probing

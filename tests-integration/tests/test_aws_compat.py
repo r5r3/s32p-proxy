@@ -145,3 +145,54 @@ def test_aws_compat_unmapped_op_falls_back_to_501(boto3_raw, bucket):
     err = exc.value.response
     assert err["ResponseMetadata"]["HTTPStatusCode"] == 501
     assert err["Error"]["Code"] == "NotImplemented", err
+
+
+# ---------------------------------------------------------------- SSE-C reject
+
+
+def test_put_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
+    """SSE-C (server-side encryption with customer-provided keys) is
+    structurally unsupported by the gateway. The proxy must reject
+    requests carrying SSE-C headers with 400 InvalidRequest *before*
+    the bytes flow to a worker — otherwise the worker would silently
+    store plaintext while the client believes it sent an encrypted
+    body. boto3 surfaces this as `client.exceptions.InvalidRequest`
+    (modeled), so user code can catch it typed."""
+    # 256-bit / 32-byte key, raw bytes (boto3 base64-encodes for us and
+    # also adds the matching MD5 header).
+    sse_c_key = b"01234567890123456789012345678901"
+    with pytest.raises(ClientError) as exc:
+        boto3_raw.put_object(
+            Bucket=bucket,
+            Key="sse-c-rejected",
+            Body=b"would-be-encrypted",
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=sse_c_key,
+        )
+    err = exc.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Error"]["Code"] == "InvalidRequest", err
+    # Pin the message substring so we catch a regression that flips the
+    # message to something less actionable (e.g. just "NotImplemented").
+    assert "SSE-C" in err["Error"].get("Message", ""), err
+
+
+def test_get_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
+    """Same gate applies to GET — clients setting SSECustomerKey on a
+    download expect to decrypt with that key. The proxy must reject
+    rather than serve plaintext that the client tries to decrypt."""
+    # Seed an object via plain PUT (no SSE-C) so it actually exists.
+    boto3_raw.put_object(Bucket=bucket, Key="sse-c-getme", Body=b"hi")
+
+    sse_c_key = b"01234567890123456789012345678901"
+    with pytest.raises(ClientError) as exc:
+        boto3_raw.get_object(
+            Bucket=bucket,
+            Key="sse-c-getme",
+            SSECustomerAlgorithm="AES256",
+            SSECustomerKey=sse_c_key,
+        )
+    err = exc.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Error"]["Code"] == "InvalidRequest", err
+    assert "SSE-C" in err["Error"].get("Message", ""), err
