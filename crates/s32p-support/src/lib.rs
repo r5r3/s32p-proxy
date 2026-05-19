@@ -71,6 +71,13 @@ pub struct PresignedSigV4Auth {
 /// constant and `verify_sigv4_request_any` always passes it.
 pub const HEADER_SIGV4_MAX_SKEW: Duration = Duration::from_secs(15 * 60);
 
+/// Upper bound on `X-Amz-Expires` accepted on presigned URLs. Matches the
+/// AWS S3 hard cap of 7 days (604800 seconds). Without this cap a client
+/// can sign a URL with an arbitrary `u64` and have it remain valid for
+/// centuries, which would survive any credential revocation that doesn't
+/// also recycle the long-term secret.
+pub const PRESIGN_MAX_EXPIRES: u64 = 7 * 24 * 60 * 60;
+
 /// Verify either:
 /// - standard SigV4 header Authorization, or
 /// - SigV4 presigned URL (query params)
@@ -301,14 +308,28 @@ pub fn verify_sigv4_presigned_url(
         return Err(anyhow!("date mismatch: scope={} x-amz-date={}", auth.scope_date, date_str));
     }
 
-    // 2) Basic expiry check (reject if already expired)
+    // 2) Bounds on X-Amz-Expires. AWS caps it at 7 days; we reject anything
+    // above that and zero/missing. Done before the "already expired" check
+    // so an oversized value can't satisfy the window via clock skew.
+    if auth.expires == 0 {
+        return Err(anyhow!("X-Amz-Expires must be > 0"));
+    }
+    if auth.expires > PRESIGN_MAX_EXPIRES {
+        return Err(anyhow!(
+            "X-Amz-Expires={} exceeds maximum {} seconds",
+            auth.expires,
+            PRESIGN_MAX_EXPIRES
+        ));
+    }
+
+    // 3) Basic expiry check (reject if already expired)
     let now = SystemTime::now();
     let exp_at = signing_time + Duration::from_secs(auth.expires);
     if now > exp_at {
         return Err(anyhow!("presigned URL expired"));
     }
 
-    // 3) Build base URI with SigV4-presign params removed, but keep original encoding/order
+    // 4) Build base URI with SigV4-presign params removed, but keep original encoding/order
     // (We remove x-amz-* params so the signer can regenerate them consistently.)
     let path = uri.path();
 
