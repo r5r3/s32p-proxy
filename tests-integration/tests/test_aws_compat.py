@@ -147,17 +147,28 @@ def test_aws_compat_unmapped_op_falls_back_to_501(boto3_raw, bucket):
     assert err["Error"]["Code"] == "NotImplemented", err
 
 
-# ---------------------------------------------------------------- SSE-C reject
+# ---------------------------------------------------------------- SSE reject
+
+# All server-side-encryption variants are structurally unsupported by
+# the gateway. The proxy must reject SSE-bearing requests with
+# 400 InvalidRequest *before* bytes flow to a worker — otherwise the
+# worker would silently store plaintext while the client believes it
+# sent an encrypted body. boto3 surfaces these as the modeled
+# `client.exceptions.InvalidRequest` so user code can `except` typed.
+
+
+def _assert_sse_rejected(exc_info: pytest.ExceptionInfo[ClientError], expected_substr: str) -> None:
+    err = exc_info.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Error"]["Code"] == "InvalidRequest", err
+    # Pin a per-variant substring so a regression that flips one variant
+    # to a generic message is caught individually.
+    assert expected_substr in err["Error"].get("Message", ""), err
 
 
 def test_put_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
-    """SSE-C (server-side encryption with customer-provided keys) is
-    structurally unsupported by the gateway. The proxy must reject
-    requests carrying SSE-C headers with 400 InvalidRequest *before*
-    the bytes flow to a worker — otherwise the worker would silently
-    store plaintext while the client believes it sent an encrypted
-    body. boto3 surfaces this as `client.exceptions.InvalidRequest`
-    (modeled), so user code can catch it typed."""
+    """SSE-C — customer-provided keys. Most dangerous to mis-attribute
+    because the caller's key material is in the request."""
     # 256-bit / 32-byte key, raw bytes (boto3 base64-encodes for us and
     # also adds the matching MD5 header).
     sse_c_key = b"01234567890123456789012345678901"
@@ -169,12 +180,7 @@ def test_put_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
             SSECustomerAlgorithm="AES256",
             SSECustomerKey=sse_c_key,
         )
-    err = exc.value.response
-    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
-    assert err["Error"]["Code"] == "InvalidRequest", err
-    # Pin the message substring so we catch a regression that flips the
-    # message to something less actionable (e.g. just "NotImplemented").
-    assert "SSE-C" in err["Error"].get("Message", ""), err
+    _assert_sse_rejected(exc, "SSE-C")
 
 
 def test_get_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
@@ -192,7 +198,47 @@ def test_get_with_sse_c_rejected_400_invalid_request(boto3_raw, bucket):
             SSECustomerAlgorithm="AES256",
             SSECustomerKey=sse_c_key,
         )
-    err = exc.value.response
-    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
-    assert err["Error"]["Code"] == "InvalidRequest", err
-    assert "SSE-C" in err["Error"].get("Message", ""), err
+    _assert_sse_rejected(exc, "SSE-C")
+
+
+def test_put_with_sse_s3_rejected_400_invalid_request(boto3_raw, bucket):
+    """SSE-S3 — `x-amz-server-side-encryption: AES256`. Server-managed
+    key, server-side-only encryption. Real AWS S3 implements this; we
+    don't, and we must not silently store plaintext."""
+    with pytest.raises(ClientError) as exc:
+        boto3_raw.put_object(
+            Bucket=bucket,
+            Key="sse-s3-rejected",
+            Body=b"would-be-encrypted",
+            ServerSideEncryption="AES256",
+        )
+    _assert_sse_rejected(exc, "SSE-S3")
+
+
+def test_put_with_sse_kms_rejected_400_invalid_request(boto3_raw, bucket):
+    """SSE-KMS — `x-amz-server-side-encryption: aws:kms`. We can't
+    delegate to KMS (no KMS integration in the gateway) and the body
+    would otherwise land as plaintext."""
+    with pytest.raises(ClientError) as exc:
+        boto3_raw.put_object(
+            Bucket=bucket,
+            Key="sse-kms-rejected",
+            Body=b"would-be-encrypted",
+            ServerSideEncryption="aws:kms",
+        )
+    _assert_sse_rejected(exc, "SSE-KMS")
+
+
+def test_put_with_sse_kms_key_id_rejected_400_invalid_request(boto3_raw, bucket):
+    """Same as SSE-KMS, but with a key ID specified — exercises the
+    additional `x-amz-server-side-encryption-aws-kms-key-id` header,
+    which is what production callers usually set."""
+    with pytest.raises(ClientError) as exc:
+        boto3_raw.put_object(
+            Bucket=bucket,
+            Key="sse-kms-with-key-id",
+            Body=b"would-be-encrypted",
+            ServerSideEncryption="aws:kms",
+            SSEKMSKeyId="alias/some-key",
+        )
+    _assert_sse_rejected(exc, "SSE-KMS")

@@ -255,12 +255,8 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
 /// with customer-provided keys). Six headers in total: three for the *target*
 /// object (PUT/GET/HEAD/UploadPart/CreateMultipartUpload), three for the
 /// *source* object on CopyObject / UploadPartCopy when the source itself was
-/// uploaded with SSE-C.
-///
-/// `detect_sse_c_headers` matches on these names case-insensitively (HTTP
-/// header names are case-insensitive and `http::HeaderMap` already normalizes
-/// to lowercase, but the constants are written in the canonical AWS casing
-/// for grep-ability against AWS docs).
+/// uploaded with SSE-C. Listed in the canonical AWS casing for grep-ability
+/// against AWS docs; `http::HeaderMap` lookups are case-insensitive.
 pub const SSE_C_HEADER_NAMES: &[&str] = &[
     "x-amz-server-side-encryption-customer-algorithm",
     "x-amz-server-side-encryption-customer-key",
@@ -270,14 +266,87 @@ pub const SSE_C_HEADER_NAMES: &[&str] = &[
     "x-amz-copy-source-server-side-encryption-customer-key-md5",
 ];
 
-/// True iff any SSE-C header is present in the request. We use this to
-/// short-circuit at the proxy: our gateway does not implement SSE-C, and
-/// silently dropping these headers would let the client believe its data
-/// is encrypted at rest when it isn't (the data path stores plaintext).
-/// Returning a clear 400 InvalidRequest at the proxy fails the request
-/// before any bytes hit the worker.
-pub fn detect_sse_c_headers(headers: &http::HeaderMap) -> bool {
-    SSE_C_HEADER_NAMES.iter().any(|name| headers.contains_key(*name))
+/// The primary header that selects server-managed SSE (SSE-S3 / SSE-KMS).
+/// Value is one of `AES256`, `aws:kms`, or `aws:kms:dsse`.
+pub const SSE_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption";
+
+/// Additional headers that imply SSE-KMS without the primary algorithm
+/// header. Some SDK paths set only these (the algorithm header gets added
+/// later by the SDK middleware); we still want to reject so the request
+/// can't slip through with the algorithm header materializing inside the
+/// worker.
+pub const SSE_KMS_AUX_HEADER_NAMES: &[&str] = &[
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+];
+
+/// Which SSE flavor we detected in an incoming request. Returned by
+/// [`detect_unsupported_sse`] so the response helper can craft a
+/// per-variant message — all four are equally unsupported by the
+/// gateway, but distinguishing them in the error makes the failure
+/// easier to debug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedSse {
+    /// SSE-C — customer-provided AES256 key, supplied in the request
+    /// headers. Most dangerous to silently drop because the client
+    /// believes it controls the key.
+    CustomerKey,
+    /// SSE-S3 — `x-amz-server-side-encryption: AES256`. Server-managed
+    /// key, server-side-only encryption.
+    ServerS3,
+    /// SSE-KMS — `x-amz-server-side-encryption: aws:kms` plus optional
+    /// `*-aws-kms-key-id` / `*-context` headers.
+    ServerKms,
+    /// SSE-KMS dual-layer — `x-amz-server-side-encryption: aws:kms:dsse`.
+    /// Same kind as ServerKms semantically; tracked separately so the
+    /// error message can name the right algorithm.
+    ServerKmsDsse,
+    /// Unknown `x-amz-server-side-encryption` value — client asked for
+    /// some flavor of SSE we don't recognize. Treat as unsupported.
+    Unknown,
+}
+
+/// Detect any unsupported server-side-encryption request shape. Returns
+/// `None` if the request carries no SSE intent. Used to short-circuit at
+/// the proxy: forwarding an SSE-bearing request to the gateway would
+/// silently store *plaintext* while the client believes its body was
+/// encrypted at rest — a data-confidentiality footgun.
+///
+/// Detection precedence: SSE-C wins over SSE-S3/KMS (a request setting
+/// both is malformed, but SSE-C is the more dangerous case to mis-attribute
+/// since it involves the caller's key material). The
+/// `x-amz-server-side-encryption` algorithm value is matched
+/// case-sensitively in the canonical AWS casing — that's what every SDK
+/// produces; deviations are folded into [`DetectedSse::Unknown`].
+pub fn detect_unsupported_sse(headers: &http::HeaderMap) -> Option<DetectedSse> {
+    // SSE-C: any of the customer-key headers, target or copy-source.
+    if SSE_C_HEADER_NAMES.iter().any(|name| headers.contains_key(*name)) {
+        return Some(DetectedSse::CustomerKey);
+    }
+
+    // SSE-S3 / SSE-KMS / SSE-KMS-DSSE: the algorithm header.
+    if let Some(value) = headers.get(SSE_ALGORITHM_HEADER) {
+        if let Ok(v) = value.to_str() {
+            return Some(match v.trim() {
+                "AES256" => DetectedSse::ServerS3,
+                "aws:kms" => DetectedSse::ServerKms,
+                "aws:kms:dsse" => DetectedSse::ServerKmsDsse,
+                _ => DetectedSse::Unknown,
+            });
+        }
+        // Non-UTF8 header value — pathological, but still SSE intent.
+        return Some(DetectedSse::Unknown);
+    }
+
+    // KMS-only headers without the primary algorithm header. Some
+    // middleware paths set these first; the algorithm header would
+    // materialize downstream. Reject early.
+    if SSE_KMS_AUX_HEADER_NAMES.iter().any(|name| headers.contains_key(*name)) {
+        return Some(DetectedSse::ServerKms);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -355,54 +424,104 @@ mod tests {
     }
 
     #[test]
-    fn detect_sse_c_headers_empty_map() {
+    fn detect_sse_empty_map() {
         let h = http::HeaderMap::new();
-        assert!(!detect_sse_c_headers(&h));
+        assert_eq!(detect_unsupported_sse(&h), None);
     }
 
     #[test]
-    fn detect_sse_c_headers_unrelated_headers_only() {
+    fn detect_sse_unrelated_headers_only() {
         let mut h = http::HeaderMap::new();
         h.insert("host", "example.com".parse().unwrap());
         h.insert("x-amz-date", "20250101T000000Z".parse().unwrap());
-        // SSE-S3 (not SSE-C) — different header, must not trigger.
-        h.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
-        assert!(!detect_sse_c_headers(&h));
+        h.insert("content-type", "text/plain".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), None);
     }
 
     #[test]
-    fn detect_sse_c_headers_target_algorithm() {
+    fn detect_sse_c_target_algorithm() {
         let mut h = http::HeaderMap::new();
         h.insert("x-amz-server-side-encryption-customer-algorithm", "AES256".parse().unwrap());
-        assert!(detect_sse_c_headers(&h));
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::CustomerKey));
     }
 
     #[test]
-    fn detect_sse_c_headers_target_key_only() {
+    fn detect_sse_c_target_key_only() {
         // Some clients only set the key+md5 (the algorithm comes via the
         // SDK as a default header); the proxy must reject as long as *any*
         // SSE-C header is present.
         let mut h = http::HeaderMap::new();
         h.insert("x-amz-server-side-encryption-customer-key", "AAAA".parse().unwrap());
-        assert!(detect_sse_c_headers(&h));
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::CustomerKey));
     }
 
     #[test]
-    fn detect_sse_c_headers_copy_source_variant() {
+    fn detect_sse_c_copy_source_variant() {
         let mut h = http::HeaderMap::new();
         h.insert(
             "x-amz-copy-source-server-side-encryption-customer-algorithm",
             "AES256".parse().unwrap(),
         );
-        assert!(detect_sse_c_headers(&h));
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::CustomerKey));
     }
 
     #[test]
-    fn detect_sse_c_headers_case_insensitive_via_headermap() {
+    fn detect_sse_c_case_insensitive_via_headermap() {
         // http::HeaderMap normalizes names; insert with mixed case still
         // resolves to lowercase, so the lookup matches our constants.
         let mut h = http::HeaderMap::new();
         h.insert("X-Amz-Server-Side-Encryption-Customer-Key", "AAAA".parse().unwrap());
-        assert!(detect_sse_c_headers(&h));
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::CustomerKey));
+    }
+
+    #[test]
+    fn detect_sse_s3_aes256() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::ServerS3));
+    }
+
+    #[test]
+    fn detect_sse_kms() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption", "aws:kms".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::ServerKms));
+    }
+
+    #[test]
+    fn detect_sse_kms_dsse() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption", "aws:kms:dsse".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::ServerKmsDsse));
+    }
+
+    #[test]
+    fn detect_sse_unknown_algorithm() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption", "ROT13".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::Unknown));
+    }
+
+    #[test]
+    fn detect_sse_kms_key_id_only() {
+        // Aux header without the primary algorithm header still trips
+        // the gate — middleware paths sometimes set kms-key-id first and
+        // let the SDK add the algorithm header later.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "alias/some-key".parse().unwrap(),
+        );
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::ServerKms));
+    }
+
+    #[test]
+    fn detect_sse_c_wins_over_sse_kms_when_both_present() {
+        // Pathological request — but if both are set, SSE-C is the more
+        // dangerous to mis-attribute (caller's key material involved).
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-server-side-encryption", "aws:kms".parse().unwrap());
+        h.insert("x-amz-server-side-encryption-customer-key", "AAAA".parse().unwrap());
+        assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::CustomerKey));
     }
 }

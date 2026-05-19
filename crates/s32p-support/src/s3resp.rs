@@ -119,19 +119,39 @@ pub fn versioning_not_configured() -> HttpResponse {
     response_bytes(StatusCode::OK, "application/xml", body, [])
 }
 
-/// 400 InvalidRequest for requests that carry SSE-C (server-side
-/// encryption with customer-provided keys) headers. The gateway has no
-/// at-rest encryption path, so silently dropping these headers would
-/// store the body in plaintext while the client believes it sent an
-/// encrypted PUT — a data-confidentiality footgun. Reject at the
-/// proxy with an AWS-shaped 400 + InvalidRequest so the failure
-/// surfaces immediately, before any worker is spawned.
-pub fn sse_c_not_supported(resource: Option<&str>) -> HttpResponse {
-    invalid_request(
-        "Server-side encryption with customer-provided keys (SSE-C) \
-         is not supported by this proxy",
-        resource,
-    )
+/// 400 InvalidRequest for requests that carry any server-side encryption
+/// headers — SSE-C (customer-provided keys), SSE-S3 (server-managed
+/// AES256), SSE-KMS (server-managed via AWS KMS), or SSE-KMS-DSSE
+/// (dual-layer). The gateway has no encryption path at all, so silently
+/// dropping these headers would store the body in plaintext while the
+/// client believes it sent an encrypted PUT — a data-confidentiality
+/// footgun across every variant. Reject at the proxy with an AWS-shaped
+/// 400 + InvalidRequest so the failure surfaces immediately, before any
+/// worker is spawned.
+///
+/// The message names the specific variant so a user reading the response
+/// knows exactly which SDK option to remove.
+pub fn sse_not_supported(
+    kind: crate::utils::DetectedSse,
+    resource: Option<&str>,
+) -> HttpResponse {
+    use crate::utils::DetectedSse;
+    let message = match kind {
+        DetectedSse::CustomerKey =>
+            "Server-side encryption with customer-provided keys (SSE-C) \
+             is not supported by this proxy",
+        DetectedSse::ServerS3 =>
+            "Server-side encryption (SSE-S3, x-amz-server-side-encryption: AES256) \
+             is not supported by this proxy",
+        DetectedSse::ServerKms =>
+            "Server-side encryption with AWS KMS (SSE-KMS) is not supported by this proxy",
+        DetectedSse::ServerKmsDsse =>
+            "Server-side encryption with AWS KMS dual-layer (SSE-KMS-DSSE) is not \
+             supported by this proxy",
+        DetectedSse::Unknown =>
+            "The requested server-side encryption algorithm is not supported by this proxy",
+    };
+    invalid_request(message, resource)
 }
 
 /// Convenience: InvalidRequest (400).
