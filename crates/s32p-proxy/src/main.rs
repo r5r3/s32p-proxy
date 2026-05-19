@@ -717,6 +717,13 @@ impl ProxyHttp for S3ProxyApp {
             .client_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
+        let user_agent = session
+            .req_header()
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<missing>")
+            .to_string();
 
         if let Some(err) = e {
             tracing::warn!(
@@ -725,6 +732,7 @@ impl ProxyHttp for S3ProxyApp {
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
+                user_agent = %user_agent,
                 error = %err,
                 "{}",
                 session.request_summary()
@@ -736,6 +744,7 @@ impl ProxyHttp for S3ProxyApp {
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
+                user_agent = %user_agent,
                 "{}",
                 session.request_summary()
             );

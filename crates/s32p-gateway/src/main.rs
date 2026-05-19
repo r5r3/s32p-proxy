@@ -357,6 +357,12 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
+    let user_agent_log = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_string();
     // Pick the "client IP" to log:
     //   - direct peer is loopback (or UDS) → trust X-Forwarded-For from the
     //     fronting s32p-proxy, fall back to the peer label if it's missing
@@ -381,6 +387,7 @@ async fn handle(
         method = %method,
         uri = %uri_log,
         host = %host_log,
+        user_agent = %user_agent_log,
         op = ?class.op,
         bucket = ?class.bucket,
         key = ?class.key,
@@ -395,6 +402,7 @@ async fn handle(
             method = %method,
             uri = %uri_log,
             host = %host_log,
+            user_agent = %user_agent_log,
             status = rej.response.status().as_u16(),
             reason = %rej.reason,
             "sigv4 verification failed"
