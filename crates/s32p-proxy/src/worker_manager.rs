@@ -383,9 +383,13 @@ impl WorkerManager {
             }
             cmd.arg("--resolve-libs");
             cmd.arg("--allow-nss");
+            if self.cfg.launcher.landlock_strict {
+                cmd.arg("--landlock-strict");
+            }
             tracing::debug!(
                 buckets_ro = ro_count,
                 buckets_rw = rw_count,
+                landlock_strict = self.cfg.launcher.landlock_strict,
                 "landlock enabled: --rw staged_root + per-bucket --ro/--rw data_paths (+ uds parent), --resolve-libs, --allow-nss"
             );
         }

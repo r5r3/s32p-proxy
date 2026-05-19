@@ -274,6 +274,11 @@ pub struct LauncherConfig {
     pub pass_user_flag_if_root: bool,
     #[serde(default = "default_true")]
     pub landlock:               bool,
+    /// Pass `--landlock-strict` to the launcher: fail-closed when the kernel
+    /// reports `PartiallyEnforced`. Defaults on; deployments on kernels with
+    /// incomplete Landlock ABI support may need to disable this explicitly.
+    #[serde(default = "default_true")]
+    pub landlock_strict:        bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

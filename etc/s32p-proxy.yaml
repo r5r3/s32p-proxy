@@ -36,6 +36,10 @@ workers:
     path: "{{install_bin_dir}}/restricted-exec"
     pass_user_flag_if_root: true
     landlock: true
+    # Fail-closed if the kernel only partially enforces the Landlock ruleset.
+    # Set to false only on hosts whose kernel lacks the full Landlock ABI
+    # used by the launcher (defaults to true).
+    landlock_strict: true
 
   lifecycle:
     idle_timeout_secs: 600
