@@ -392,6 +392,23 @@ impl ProxyHttp for S3ProxyApp {
             return Ok(true);
         }
 
+        // 2a*) AwsCompat: return the AWS-shaped feature-disabled response
+        // for the specific op (200 + empty config for GetBucketVersioning,
+        // 404 + ObjectLockConfigurationNotFoundError for Get-Object-Lock,
+        // etc.), falling back to 501 for ops without an AWS equivalent.
+        // Same SigV4 pre-check as NotImplemented — we never want to expose
+        // the per-op response to unauthenticated probes.
+        if let config::RouteAction::AwsCompat = action {
+            if !session_validated
+                && validate_sigv4_header_only_or_reject(session, &req, &user).await?
+            {
+                return Ok(true);
+            }
+
+            responses::respond_aws_compat(session, &class.op, Some(req.uri.path())).await?;
+            return Ok(true);
+        }
+
         // 2a') CreateSession: mint an ephemeral session for the caller, return
         // the AWS-shaped XML credentials. Sessions can't beget sessions —
         // CreateSession must be driven with long-term IAM creds.
@@ -466,7 +483,9 @@ impl ProxyHttp for S3ProxyApp {
         // 2b) Routing says Proxy: select worker profile
         let profile = match action {
             config::RouteAction::Proxy { worker_profile } => worker_profile.as_str(),
-            config::RouteAction::NotImplemented { .. } | config::RouteAction::CreateSession => {
+            config::RouteAction::NotImplemented { .. }
+            | config::RouteAction::CreateSession
+            | config::RouteAction::AwsCompat => {
                 unreachable!()
             }
         };

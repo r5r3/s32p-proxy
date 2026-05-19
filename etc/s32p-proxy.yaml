@@ -74,12 +74,19 @@ workers:
 
 routing:
   class_map:
+    # versioning + object_lock use the aws_compat target: per-op the
+    # proxy returns the AWS feature-disabled shape (200 with empty
+    # <VersioningConfiguration/> for GetBucketVersioning; 404 with
+    # ObjectLockConfigurationNotFoundError for GetBucketObjectLockConfiguration;
+    # 400 InvalidRequest for Put-Retention / Put-LegalHold). Ops within
+    # the class that AWS always implements (e.g. PutBucketVersioning,
+    # ListObjectVersions) fall back to 501 NotImplemented. Switch back
+    # to `not_implemented` for a deployment that prefers a uniform "fail
+    # loud" response on every op in the class.
     versioning:
-      action: "not_implemented"
-      message: "versioning is not implemented"
+      action: "aws_compat"
     object_lock:
-      action: "not_implemented"
-      message: "object lock is not implemented"
+      action: "aws_compat"
     multipart:
       action: "proxy"
       worker_profile: "s32p-gateway"

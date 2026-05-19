@@ -137,7 +137,7 @@ Defined in `pytest.ini`:
 - Writes a fresh `s32p-proxy.yaml` to a per-session tempdir.
 - Picks a free TCP port for the listen address (`bind` to port 0, read assigned, close).
 - Uses UDS for the worker upstream (`<session>/uds/<uid>-<instance>/<profile>.sock`) — no port collisions.
-- Routes `read/write/multipart/other` to the gateway profile; `versioning/object_lock/bucket_admin` → `not_implemented` (matches production intent).
+- Routes `read/write/multipart/other` to the gateway profile, `versioning/object_lock` to `aws_compat` (AWS-shaped feature-disabled responses per op, falling back to 501 where AWS has no equivalent), and `bucket_admin` to `not_implemented` (matches production intent — bucket admin is `s32p-ctl`-only).
 - Disables landlock and `pass_user_flag_if_root` for single-uid mode.
 - Pre-declares 8 buckets at session start; the `bucket` fixture leases one per test.
 - Captures stdout+stderr to `<session>/proxy.log` and dumps the tail in any startup-failure exception.

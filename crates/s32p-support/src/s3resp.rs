@@ -108,6 +108,17 @@ pub fn not_implemented(message: &str, resource: Option<&str>) -> HttpResponse {
     )
 }
 
+/// 200 OK with an empty `<VersioningConfiguration xmlns="…"/>` body.
+/// Matches what AWS S3 returns for `GetBucketVersioning` on a bucket
+/// that was never versioned — absence of the `<Status>` element is the
+/// "Unversioned" signal. Used by the `aws_compat` routing target.
+pub fn versioning_not_configured() -> HttpResponse {
+    let body = s3xml::versioning_configuration_empty_body().unwrap_or_else(|_| {
+        format!("<VersioningConfiguration xmlns=\"{}\"/>", s3xml::S3_XMLNS).into_bytes()
+    });
+    response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+
 /// Convenience: InvalidRequest (400).
 pub fn invalid_request(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(StatusCode::BAD_REQUEST, s3xml::error_code::INVALID_REQUEST, message, resource, None)

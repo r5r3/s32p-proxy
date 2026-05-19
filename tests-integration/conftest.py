@@ -540,6 +540,34 @@ def client_factory(_client_cls, _client_addressing, endpoint, request):
 
 
 @pytest.fixture
+def boto3_raw(endpoint):
+    """Raw boto3 S3 client for ops the `S3Client` matrix abstraction
+    doesn't expose (versioning/object-lock/bucket-admin). Shared with
+    `test_not_implemented.py` and `test_aws_compat.py`. Both files test
+    *proxy routing* rather than client behavior, so a single SDK is
+    enough — the request URL/verb is identical across SDKs.
+
+    Configured for path-style addressing with one-shot retries so a
+    routing-time NotImplemented surfaces immediately as a `ClientError`
+    instead of looping.
+    """
+    import boto3
+    from botocore.client import Config
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint.base_url,
+        region_name=endpoint.region,
+        aws_access_key_id=endpoint.access_key,
+        aws_secret_access_key=endpoint.secret_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 1, "mode": "standard"},
+        ),
+    )
+
+
+@pytest.fixture
 def acl_bucket(proxy_harness):
     """Factory for the pre-declared ACL test buckets.
 

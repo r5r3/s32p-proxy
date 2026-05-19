@@ -49,6 +49,17 @@ pub mod error_code {
     /// `x-amz-write-offset-bytes` did not equal the current object size.
     /// AWS S3 Express directory-bucket append surface.
     pub const INVALID_WRITE_OFFSET: &str = "InvalidWriteOffset";
+
+    /// AWS S3 returns this on `GetBucketObjectLockConfiguration` when the
+    /// bucket was not created with Object Lock enabled. Used by the
+    /// `aws_compat` routing target to emulate that response shape.
+    pub const OBJECT_LOCK_CONFIGURATION_NOT_FOUND_ERROR: &str =
+        "ObjectLockConfigurationNotFoundError";
+
+    /// AWS S3 returns this on `GetObjectRetention` / `GetObjectLegalHold`
+    /// when the object has no retention or legal-hold metadata. Used by the
+    /// `aws_compat` routing target for the same reason.
+    pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION: &str = "NoSuchObjectLockConfiguration";
 }
 
 /// Minimal bucket info used by ListBuckets.
@@ -136,6 +147,16 @@ pub fn get_bucket_location_body(region: &str) -> Result<Vec<u8>> {
     let value = if region == "us-east-1" { None } else { Some(region.to_string()) };
     let doc = LocationConstraintDoc { xmlns: S3_XMLNS, value };
     let xml = to_xml_string(&doc)?;
+    Ok(xml.into_bytes())
+}
+
+/// Build XML body for GetBucketVersioning when the bucket has no
+/// versioning configuration. Mirrors what real AWS S3 returns: a 200 OK
+/// with `<VersioningConfiguration xmlns="…"/>` — no `<Status>` child,
+/// meaning "Unversioned". Used by the `aws_compat` routing target.
+pub fn versioning_configuration_empty_body() -> Result<Vec<u8>> {
+    let doc = VersioningConfigurationDoc { xmlns: S3_XMLNS };
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
 
@@ -664,6 +685,16 @@ struct LocationConstraintDoc {
     // quick-xml/serde text node
     #[serde(rename = "$text", skip_serializing_if = "Option::is_none")]
     value: Option<String>,
+}
+
+// Empty <VersioningConfiguration xmlns="…"/> — what AWS returns for
+// GetBucketVersioning on an unversioned bucket. No child elements:
+// absence of <Status> is itself the "Unversioned" signal.
+#[derive(Debug, Serialize)]
+#[serde(rename = "VersioningConfiguration")]
+struct VersioningConfigurationDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
 }
 
 // --- internal DTOs for GetObjectAcl / GetBucketAcl ---

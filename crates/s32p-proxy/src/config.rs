@@ -318,6 +318,16 @@ pub enum RouteAction {
     /// credentials in the proxy's session store and returns the
     /// `<CreateSessionResult>` XML body.
     CreateSession,
+
+    /// Reply locally with the closest AWS-shaped response per the
+    /// specific `S3Op` (e.g. 200 + empty `<VersioningConfiguration/>`
+    /// for `GetBucketVersioning`, 404 + `ObjectLockConfigurationNotFoundError`
+    /// for `GetBucketObjectLockConfiguration`, 400 + `InvalidRequest` for
+    /// Put-Retention / Put-LegalHold). Ops within the routed class that
+    /// have no AWS feature-disabled equivalent fall back to 501
+    /// NotImplemented with a generic message. See
+    /// `responses::respond_aws_compat` for the per-op dispatch table.
+    AwsCompat,
 }
 
 impl Config {
@@ -509,6 +519,15 @@ impl Config {
                              valid for the 'session' class (got '{class}')"
                         ));
                     }
+                }
+                RouteAction::AwsCompat => {
+                    // No-op: the per-op AWS-shape dispatch lives in
+                    // `responses::respond_aws_compat`, and any op without an
+                    // explicit AWS feature-disabled response falls back to
+                    // a 501 NotImplemented. Allowed on any class — operators
+                    // can choose this for `versioning` / `object_lock` (the
+                    // intended use) without us second-guessing them on
+                    // other classes.
                 }
             }
         }
