@@ -416,6 +416,7 @@ impl WorkerManager {
             region:                  &self.server_cfg.region,
             virtual_hosted_suffixes: &virtual_hosted_suffixes_str,
             log_level:               &self.server_cfg.log_level.as_deref().unwrap_or("info"),
+            log_format:              &self.server_cfg.log_format.as_deref().unwrap_or("text"),
         };
 
         let rendered_args = render_args(&profile.args, &vars)
@@ -595,6 +596,7 @@ struct TemplateVars<'a> {
     region:                  &'a str,
     virtual_hosted_suffixes: &'a str,
     log_level:               &'a str,
+    log_format:              &'a str,
 }
 
 fn render_args(args: &[String], vars: &TemplateVars<'_>) -> Result<Vec<String>> {
@@ -614,7 +616,7 @@ fn render_env(
 
 /// Strict, safe placeholder replacement.
 /// Supports tokens like: {{username}}, {{uid}}, {{gid}}, {{access_key}}, {{secret_key}},
-/// {{posix_root}}, {{bind_addr}}, {{bind_uds}}, {{region}}, {{log_level}}.
+/// {{posix_root}}, {{bind_addr}}, {{bind_uds}}, {{region}}, {{log_level}}, {{log_format}}.
 /// Unknown tokens cause an error.
 fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
     let mut out = String::with_capacity(input.len());
@@ -643,6 +645,7 @@ fn render_template(input: &str, vars: &TemplateVars<'_>) -> Result<String> {
             "region" => vars.region.to_string(),
             "virtual_hosted_suffixes" => vars.virtual_hosted_suffixes.to_string(),
             "log_level" => vars.log_level.to_string(),
+            "log_format" => vars.log_format.to_string(),
             other => return Err(anyhow!("unknown template token '{{{{{other}}}}}' in '{input}'")),
         };
 

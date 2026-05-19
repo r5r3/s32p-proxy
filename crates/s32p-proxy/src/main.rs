@@ -732,7 +732,7 @@ impl ProxyHttp for S3ProxyApp {
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
-                user_agent = %user_agent,
+                user_agent = user_agent.as_str(),
                 error = %err,
                 "{}",
                 session.request_summary()
@@ -744,7 +744,7 @@ impl ProxyHttp for S3ProxyApp {
                 username = ctx.username.as_deref().unwrap_or("<unknown>"),
                 profile = ctx.worker_profile.as_deref().unwrap_or("<none>"),
                 status = status,
-                user_agent = %user_agent,
+                user_agent = user_agent.as_str(),
                 "{}",
                 session.request_summary()
             );
@@ -868,7 +868,13 @@ fn main() -> Result<()> {
         s32p_support::utils::local_utc_offset(),
         time::format_description::well_known::Rfc3339,
     );
-    tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter).init();
+    let log_format = cfg.server.log_format.as_deref().unwrap_or("text");
+    let builder = tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter);
+    match log_format {
+        "json" => builder.json().init(),
+        "text" => builder.init(),
+        other => anyhow::bail!("server.log_format must be \"text\" or \"json\", got {other:?}"),
+    }
 
     // Build directory backend
     let inner_directory: Arc<dyn Directory> = match cfg.auth.backend {

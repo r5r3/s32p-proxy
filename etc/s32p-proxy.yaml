@@ -7,6 +7,9 @@ server:
   tls_key_path: "etc/privkey.pem"
   region: "us-east-1"
   log_level: "s32p_proxy=debug,s32p_gateway=debug,pingora=info,pingora_proxy=info"
+  # "text" (default, human-readable) or "json" (one JSON object per line,
+  # for ingestion by Wazuh / Elastic / Loki / etc.).
+  log_format: "text"
   virtual_hosted_suffixes:
     - 127.0.0.1.nip.io
     - localhost
@@ -71,6 +74,7 @@ workers:
         S32P_POOL_SIZE: "128"
         S32P_DIRECT_IO: "true"
         S32P_LOG_LEVEL: "{{log_level}}"
+        S32P_LOG_FORMAT: "{{log_format}}"
 
 routing:
   class_map:

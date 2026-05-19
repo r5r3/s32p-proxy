@@ -62,6 +62,10 @@ pub struct ServerConfig {
     pub region:                     String,
     /// e.g. "info", "debug", or "s32p_proxy=debug"
     pub log_level:                  Option<String>,
+    /// Log format: "text" (default, human-readable) or "json" (one JSON
+    /// object per line, suitable for ingestion by Wazuh/Elastic/etc.).
+    /// Forwarded to workers via the `{{log_format}}` template placeholder.
+    pub log_format:                 Option<String>,
     /// Pingora's grace period on SIGTERM, in seconds. The proxy stops
     /// accepting new connections, broadcasts shutdown, then sleeps this
     /// long (uninterruptible) to let in-flight requests drain. Defaults

@@ -387,7 +387,7 @@ async fn handle(
         method = %method,
         uri = %uri_log,
         host = %host_log,
-        user_agent = %user_agent_log,
+        user_agent = user_agent_log.as_str(),
         op = ?class.op,
         bucket = ?class.bucket,
         key = ?class.key,
@@ -402,7 +402,7 @@ async fn handle(
             method = %method,
             uri = %uri_log,
             host = %host_log,
-            user_agent = %user_agent_log,
+            user_agent = user_agent_log.as_str(),
             status = rej.response.status().as_u16(),
             reason = %rej.reason,
             "sigv4 verification failed"
@@ -4068,7 +4068,13 @@ fn main() -> Result<()> {
         offset,
         time::format_description::well_known::Rfc3339,
     );
-    tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter).init();
+    let log_format = std::env::var("S32P_LOG_FORMAT").unwrap_or_else(|_| "text".into());
+    let builder = tracing_subscriber::fmt().with_timer(timer).with_env_filter(log_filter);
+    match log_format.as_str() {
+        "json" => builder.json().init(),
+        "text" => builder.init(),
+        other => anyhow::bail!("S32P_LOG_FORMAT must be \"text\" or \"json\", got {other:?}"),
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async_main())
