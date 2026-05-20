@@ -19,6 +19,7 @@ Classifier: crates/s32p-support/src/classifier.rs → WriteOp::RenameObject
 
 from __future__ import annotations
 
+import time
 from urllib.parse import quote
 
 import botocore.auth
@@ -448,6 +449,14 @@ def test_rename_client_token_replay_returns_cached_response(endpoint, bucket, bu
     assert not bucket_fs.exists("src.bin")
     assert bucket_fs.read("dst.bin") == b"contents\n"
 
+    # Force a fresh `x-amz-date` on the second call. SigV4 timestamps are
+    # second-resolution; without this sleep, both calls in the same second
+    # produce byte-identical signed requests and the SigV4 replay cache
+    # rejects the second before the idempotency cache (the thing under
+    # test) gets a chance to short-circuit. Real SDK retries pause
+    # longer than this for unrelated reasons (TCP backoff).
+    time.sleep(1.05)
+
     # Second call with same token, src now missing. Without idempotency
     # this would be NoSuchKey 404; with it, we get the cached 200.
     second = _rename_raw(
@@ -495,6 +504,11 @@ def test_rename_client_token_omitted_does_not_block_retry(endpoint, bucket, buck
     first = _rename_raw(endpoint, bucket=bucket, dst_key="dst.bin", src_key="src.bin")
     assert first.status_code == 200, first.text
 
+    # See comment in test_rename_client_token_replay_returns_cached_response:
+    # second-resolution x-amz-date means same-second calls produce identical
+    # signatures and trip the SigV4 replay cache.
+    time.sleep(1.05)
+
     second = _rename_raw(endpoint, bucket=bucket, dst_key="dst.bin", src_key="src.bin")
     assert second.status_code == 404, second.text
     assert "<Code>NoSuchKey</Code>" in second.text, second.text
@@ -515,6 +529,11 @@ def test_rename_client_token_failed_request_is_not_cached(endpoint, bucket, buck
     assert first.status_code == 404, first.text
 
     bucket_fs.write("late.bin", b"now exists\n")
+
+    # See comment in test_rename_client_token_replay_returns_cached_response:
+    # second-resolution x-amz-date means same-second calls produce identical
+    # signatures and trip the SigV4 replay cache.
+    time.sleep(1.05)
 
     second = _rename_raw(
         endpoint, bucket=bucket,

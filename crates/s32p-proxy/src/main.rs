@@ -6,7 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -48,6 +48,14 @@ struct S3ProxyApp {
     session_ttl:             Duration,
     routing:                 config::RoutingConfig,
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
+    /// In-memory cache of recently-verified SigV4 signatures. Each
+    /// successful verify is recorded; subsequent requests carrying the
+    /// same signature within the TTL window are rejected as replays.
+    replay_cache:            Arc<s32p_support::replay_cache::ReplayCache>,
+    /// One-shot guard for spawning the replay-cache sweeper task
+    /// lazily on the first request (we are not inside the tokio runtime
+    /// at startup, same constraint as the other sweepers).
+    replay_sweeper_started:  AtomicBool,
 }
 
 /// Pingora background service that terminates worker processes on graceful
@@ -98,6 +106,43 @@ impl ProxyCtx {
     }
 }
 
+impl S3ProxyApp {
+    /// Lazy-start a background task that periodically evicts expired
+    /// replay-cache entries. Same pattern as `WorkerManager::start_sweeper`:
+    /// can't spawn at construction time because the tokio runtime is not
+    /// yet up when pingora's `Server::bootstrap()` runs.
+    fn ensure_replay_sweeper(&self) {
+        if self
+            .replay_sweeper_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let cache = Arc::clone(&self.replay_cache);
+        // Sweep at half the TTL so any entry sees at most one sweep cycle
+        // of "stale memory" beyond its expiry. With the default TTL of
+        // ~15 min this fires every ~7.5 min.
+        let interval = cache.ttl() / 2;
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(interval);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                let stats = cache.sweep();
+                tracing::debug!(
+                    before = stats.before,
+                    after = stats.after,
+                    removed = stats.removed,
+                    elapsed_us = stats.elapsed.as_micros() as u64,
+                    "replay-cache sweep"
+                );
+            }
+        });
+        tracing::info!(interval_secs = interval.as_secs(), "replay-cache sweeper started");
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for S3ProxyApp {
     type CTX = ProxyCtx;
@@ -110,6 +155,7 @@ impl ProxyHttp for S3ProxyApp {
         // Start background sweepers lazily (we are now inside tokio).
         self.workers.start_sweeper();
         self.sessions.start_cleanup();
+        self.ensure_replay_sweeper();
 
         let start = Instant::now();
 
@@ -338,6 +384,7 @@ impl ProxyHttp for S3ProxyApp {
                 None,
                 &entry.secret_key,
                 Some(req.uri.path()),
+                Some(&self.replay_cache),
             ) {
                 Ok(()) => {}
                 Err(rej) => {
@@ -403,7 +450,7 @@ impl ProxyHttp for S3ProxyApp {
         // the routing table.
         if let config::RouteAction::NotImplemented { message } = action {
             if !session_validated
-                && validate_sigv4_header_only_or_reject(session, &req, &user).await?
+                && validate_sigv4_header_only_or_reject(session, &req, &user, &self.replay_cache).await?
             {
                 return Ok(true); // already responded with auth/signature error
             }
@@ -421,7 +468,7 @@ impl ProxyHttp for S3ProxyApp {
         // the per-op response to unauthenticated probes.
         if let config::RouteAction::AwsCompat = action {
             if !session_validated
-                && validate_sigv4_header_only_or_reject(session, &req, &user).await?
+                && validate_sigv4_header_only_or_reject(session, &req, &user, &self.replay_cache).await?
             {
                 return Ok(true);
             }
@@ -446,7 +493,7 @@ impl ProxyHttp for S3ProxyApp {
                 .await?;
                 return Ok(true);
             }
-            if validate_sigv4_header_only_or_reject(session, &req, &user).await? {
+            if validate_sigv4_header_only_or_reject(session, &req, &user, &self.replay_cache).await? {
                 return Ok(true);
             }
 
@@ -537,7 +584,7 @@ impl ProxyHttp for S3ProxyApp {
         // Skip if we already validated via session credentials above; sessions
         // sign with `s3express` and a different secret, which the long-term
         // path would reject.
-        if !session_validated && validate_sigv4_header_only_or_reject(session, &req, &user).await? {
+        if !session_validated && validate_sigv4_header_only_or_reject(session, &req, &user, &self.replay_cache).await? {
             return Ok(true); // already responded with auth/signature error, no spawn
         }
 
@@ -776,6 +823,7 @@ async fn validate_sigv4_header_only_or_reject(
     session: &mut Session,
     req: &RequestHeader,
     user: &UserDoc,
+    replay_cache: &s32p_support::replay_cache::ReplayCache,
 ) -> PResult<bool> {
     match s32p_support::verify_sigv4_request_any(
         req.method.as_str(),
@@ -784,6 +832,7 @@ async fn validate_sigv4_header_only_or_reject(
         None, // proxy already selected `user` based on extracted access key
         &user.secret_key,
         Some(req.uri.path()),
+        Some(replay_cache),
     ) {
         Ok(()) => Ok(false),
         Err(rej) => {
@@ -959,6 +1008,34 @@ fn main() -> Result<()> {
         "session store initialized"
     );
 
+    let replay_cache = Arc::new(s32p_support::replay_cache::ReplayCache::new());
+    tracing::info!(
+        ttl_secs = replay_cache.ttl().as_secs(),
+        "sigv4 replay cache initialized"
+    );
+
+    // Worker idle timeout must exceed the replay cache's worst-case
+    // entry lifetime. Header-signed entries are anchored on the client's
+    // `x-amz-date` and can survive up to `2 × HEADER_SIGV4_MAX_SKEW + 1`
+    // when the server clock lags the client (see
+    // `s32p_support::replay_cache` module docs). If a worker were
+    // recycled inside this window, its in-memory cache would be lost and
+    // an attacker could replay a previously-captured fast-path request
+    // (which the proxy does not re-validate) against the freshly-spawned
+    // worker. Fail closed at startup instead of relying on documentation.
+    {
+        let idle = cfg.workers.lifecycle.idle_timeout_secs;
+        let floor = replay_cache.max_entry_lifetime().as_secs();
+        if idle < floor {
+            anyhow::bail!(
+                "workers.lifecycle.idle_timeout_secs ({idle}) must be >= replay-cache \
+                 max entry lifetime ({floor}); a shorter idle timeout would let captured \
+                 fast-path signatures be replayed against a freshly-spawned worker \
+                 (its in-memory replay cache resets)"
+            );
+        }
+    }
+
     let app = S3ProxyApp {
         directory,
         workers: workers.clone(),
@@ -966,6 +1043,8 @@ fn main() -> Result<()> {
         session_ttl: Duration::from_secs(cfg.session.ttl_secs),
         routing: cfg.routing.clone(),
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
+        replay_cache,
+        replay_sweeper_started: AtomicBool::new(false),
     };
 
     let pingora_conf = ServerConf {
