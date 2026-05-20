@@ -40,6 +40,11 @@ pub struct WorkerManager {
     server_cfg:      ServerConfig,
     slots:           DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
     sweeper_started: AtomicBool,
+    /// `S32P_NSS_PROXY_SOCK` value to inject into every worker's env. Empty
+    /// string disables the lookup proxy (workers fall back to direct
+    /// `getpwuid_r` — only sensible without Landlock). Set at construction
+    /// from the proxy's pre-bound abstract socket name.
+    nss_sock_env:    String,
 }
 
 struct WorkerSlot {
@@ -143,12 +148,13 @@ impl WorkerHandle {
 }
 
 impl WorkerManager {
-    pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig) -> Arc<Self> {
+    pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig, nss_sock_env: String) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             server_cfg,
             slots: DashMap::new(),
             sweeper_started: AtomicBool::new(false),
+            nss_sock_env,
         })
     }
 
@@ -382,7 +388,12 @@ impl WorkerManager {
                 }
             }
             cmd.arg("--resolve-libs");
-            cmd.arg("--allow-nss");
+            // `--allow-nss` is intentionally NOT passed: the worker resolves
+            // uid → username over the proxy's abstract nss socket (see
+            // `nss_listener` and the gateway's `nss_client`) instead of
+            // reading `/etc/passwd` itself. Removing the allow rule closes
+            // C5 (a tenant symlink `<bucket>/leak -> /etc/passwd` no longer
+            // returns its content).
             if self.cfg.launcher.landlock_strict {
                 cmd.arg("--landlock-strict");
             }
@@ -390,7 +401,7 @@ impl WorkerManager {
                 buckets_ro = ro_count,
                 buckets_rw = rw_count,
                 landlock_strict = self.cfg.launcher.landlock_strict,
-                "landlock enabled: --rw staged_root + per-bucket --ro/--rw data_paths (+ uds parent), --resolve-libs, --allow-nss"
+                "landlock enabled: --rw staged_root + per-bucket --ro/--rw data_paths (+ uds parent), --resolve-libs"
             );
         }
 
@@ -471,6 +482,11 @@ impl WorkerManager {
         // operator's stray value (e.g. accidentally added) can't take
         // precedence over the proxy's generated one.
         cmd.env("S32P_WORKER_TOKEN", &worker_token);
+
+        // Abstract NSS lookup socket (e.g. `@s32p-nss-12345`). The gateway's
+        // `NssClient` connects here for uid → username resolution since the
+        // worker has no `/etc/passwd` in its Landlock allow list.
+        cmd.env("S32P_NSS_PROXY_SOCK", &self.nss_sock_env);
 
         // log command and env for debuuging
         tracing::debug!(command = ?cmd, "spawning worker");

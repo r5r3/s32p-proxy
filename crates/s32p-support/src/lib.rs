@@ -41,6 +41,13 @@ pub mod preconditions;
 /// In-memory cache that rejects replayed SigV4 signatures.
 pub mod replay_cache;
 
+/// Wire protocol for the proxy → worker NSS lookup service.
+pub mod nss_proto;
+
+/// Blocking `getpwuid_r` wrapper, shared by the proxy listener and the
+/// gateway's standalone fallback.
+pub mod nss_lookup;
+
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {
     pub access_key:     String,

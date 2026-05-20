@@ -81,6 +81,13 @@ class ProxyHarness:
     # CreateSession TTL. Kept short by default so expiry tests don't
     # bottleneck the suite; tests that need longer can override.
     session_ttl_secs: int = 60
+    # Landlock matches the production deployment policy. The proxy's
+    # `--allow-nss` flag is dropped (workers resolve uid → username via
+    # the proxy's abstract NSS socket); allow-list is `--rw staged_root`,
+    # per-bucket `--ro/--rw data_path`, `--rw uds-parent`, `--resolve-libs`.
+    # `S32P_LOG_UTC_OFFSET_SECS` injection bypasses the
+    # `/etc/localtime` read that would otherwise fail.
+    landlock_enabled: bool = True
 
     # Derived in __post_init__
     posix_root: Path = field(init=False)
@@ -149,7 +156,7 @@ class ProxyHarness:
                 "launcher": {
                     "path": str(restricted_exec_binary()),
                     "pass_user_flag_if_root": False,
-                    "landlock": False,  # disabled for the test harness; flip per-suite later
+                    "landlock": self.landlock_enabled,
                 },
                 "lifecycle": {
                     "idle_timeout_secs": self.idle_timeout_secs,

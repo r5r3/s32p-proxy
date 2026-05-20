@@ -6,7 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -25,6 +25,7 @@ use pingora::{
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 
 mod config;
+mod nss_listener;
 mod responses;
 mod session;
 mod worker_manager;
@@ -56,6 +57,19 @@ struct S3ProxyApp {
     /// lazily on the first request (we are not inside the tokio runtime
     /// at startup, same constraint as the other sweepers).
     replay_sweeper_started:  AtomicBool,
+    /// Pre-bound abstract NSS lookup listener. The kernel reserves the
+    /// abstract name at startup so workers can include the value in their
+    /// env at spawn time; the accept loop is started lazily from the first
+    /// `request_filter` invocation (same constraint as the replay-cache
+    /// sweeper). `Mutex<Option<_>>` lets us hand the listener over exactly
+    /// once when the loop starts.
+    nss_listener_pending:    Mutex<Option<std::os::unix::net::UnixListener>>,
+    /// Live handle to the running accept loop. Held so the listener stays
+    /// alive for the proxy's lifetime; dropping it would abort the accept
+    /// task and cause every worker's lookup connections to fail.
+    nss_listener_handle:     Mutex<Option<nss_listener::NssListenerHandle>>,
+    /// One-shot guard for starting the nss-proxy accept loop.
+    nss_listener_started:    AtomicBool,
 }
 
 /// Pingora background service that terminates worker processes on graceful
@@ -107,6 +121,35 @@ impl ProxyCtx {
 }
 
 impl S3ProxyApp {
+    /// Lazy-start the nss-proxy accept loop. The abstract socket has
+    /// already been bound at startup (in `run_async_main` before Pingora's
+    /// `Server::bootstrap`), so workers spawned by the WorkerManager can
+    /// already see the abstract name in the kernel; this just moves the
+    /// pre-bound listener into the tokio reactor so connections get
+    /// accepted. Same one-shot pattern as `ensure_replay_sweeper`.
+    fn ensure_nss_listener(&self) {
+        if self
+            .nss_listener_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(std_listener) = self.nss_listener_pending.lock().unwrap().take() else {
+            tracing::warn!("nss-proxy listener missing at lazy-start; lookups will fail");
+            return;
+        };
+        match nss_listener::start_accept_loop(std_listener) {
+            Ok(handle) => {
+                *self.nss_listener_handle.lock().unwrap() = Some(handle);
+                tracing::info!("nss-proxy accept loop started");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "nss-proxy accept loop failed to start");
+            }
+        }
+    }
+
     /// Lazy-start a background task that periodically evicts expired
     /// replay-cache entries. Same pattern as `WorkerManager::start_sweeper`:
     /// can't spawn at construction time because the tokio runtime is not
@@ -156,6 +199,7 @@ impl ProxyHttp for S3ProxyApp {
         self.workers.start_sweeper();
         self.sessions.start_cleanup();
         self.ensure_replay_sweeper();
+        self.ensure_nss_listener();
 
         let start = Instant::now();
 
@@ -992,7 +1036,14 @@ fn main() -> Result<()> {
 
     let listen = cfg.server.listen.clone();
 
-    let workers = WorkerManager::new(cfg.workers.clone(), cfg.server.clone());
+    // Bind the abstract NSS lookup socket up-front so the name is reserved
+    // before any worker spawns. The accept loop is started lazily on the
+    // first request, once Pingora's tokio runtime is up.
+    let (nss_std_listener, nss_sock_env_value) =
+        nss_listener::bind().context("failed to bind nss-proxy listener")?;
+
+    let workers =
+        WorkerManager::new(cfg.workers.clone(), cfg.server.clone(), nss_sock_env_value.clone());
 
     let sessions = Arc::new(SessionStore::new(
         cfg.session.max_active,
@@ -1045,6 +1096,9 @@ fn main() -> Result<()> {
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
         replay_cache,
         replay_sweeper_started: AtomicBool::new(false),
+        nss_listener_pending: Mutex::new(Some(nss_std_listener)),
+        nss_listener_handle: Mutex::new(None),
+        nss_listener_started: AtomicBool::new(false),
     };
 
     let pingora_conf = ServerConf {

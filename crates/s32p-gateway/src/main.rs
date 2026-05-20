@@ -7,6 +7,7 @@ pub mod buffer;
 mod fs_helpers;
 mod idempotency;
 mod multipart;
+mod nss_client;
 pub mod streaming;
 mod uring_io;
 
@@ -308,6 +309,12 @@ struct App {
     /// Per-worker idempotency cache for `x-amz-client-token` on
     /// RenameObject. See `idempotency.rs`.
     idempotency:             Arc<idempotency::IdempotencyCache>,
+    /// Resolves uid → username for listing/ACL `DisplayName` fields.
+    /// Connects to the proxy's abstract NSS lookup socket when the
+    /// `S32P_NSS_PROXY_SOCK` env is set; otherwise falls back to a direct
+    /// `getpwuid_r` call (only useful when running standalone without
+    /// Landlock). See `nss_client.rs`.
+    nss_client:              Arc<nss_client::NssClient>,
 }
 
 pub(crate) fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
@@ -947,7 +954,7 @@ async fn handle_get_object_acl(
     };
     let uid = std::os::unix::fs::MetadataExt::uid(&m);
     let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
-    let owner = owner_info(uid);
+    let owner = owner_info(&app.nss_client, uid).await;
 
     s32p_support::s3resp::get_acl(&owner.id, &owner.display_name, (mode & 0o004) != 0)
 }
@@ -991,7 +998,7 @@ async fn handle_get_bucket_acl(
     };
     let uid = std::os::unix::fs::MetadataExt::uid(&m);
     let mode = std::os::unix::fs::PermissionsExt::mode(&m.permissions());
-    let owner = owner_info(uid);
+    let owner = owner_info(&app.nss_client, uid).await;
 
     s32p_support::s3resp::get_acl(&owner.id, &owner.display_name, (mode & 0o004) != 0)
 }
@@ -1793,37 +1800,12 @@ fn ensure_frame_loaded(
     Ok(())
 }
 
-fn lookup_username(uid: u32) -> Option<String> {
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-
-        let mut buf_len = 16 * 1024;
-        for _ in 0..3 {
-            let mut buf = vec![0u8; buf_len];
-            let rc = libc::getpwuid_r(
-                uid as libc::uid_t,
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            );
-            if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
-                return Some(std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().to_string());
-            }
-            if rc == libc::ERANGE {
-                buf_len *= 2;
-                continue;
-            }
-            return None;
-        }
-        None
-    }
-}
-
-fn owner_info(uid: u32) -> s32p_support::s3xml::ListOwnerInfo {
+async fn owner_info(
+    client: &nss_client::NssClient,
+    uid: u32,
+) -> s32p_support::s3xml::ListOwnerInfo {
     let id = uid.to_string();
-    let display_name = lookup_username(uid).unwrap_or_else(|| id.clone());
+    let display_name = client.lookup(uid).await.unwrap_or_else(|| id.clone());
     s32p_support::s3xml::ListOwnerInfo { id, display_name }
 }
 
@@ -2097,12 +2079,17 @@ async fn handle_list_objects_v2(
                 if let Some(stx) = statx_info(&it.path) {
                     let key = format!("{}{}{}", top.dir_key, it.name, "/");
                     if key.starts_with(&prefix) {
+                        let owner = if fetch_owner {
+                            Some(owner_info(&app.nss_client, stx.uid).await)
+                        } else {
+                            None
+                        };
                         contents.push(s32p_support::s3xml::ListObjectInfo {
                             key,
                             last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
                             etag: format_inode_etag(stx.ino),
                             size: 0,
-                            owner: if fetch_owner { Some(owner_info(stx.uid)) } else { None },
+                            owner,
                         });
                     }
                 }
@@ -2136,7 +2123,11 @@ async fn handle_list_objects_v2(
         let etag = format_inode_etag(stx.ino);
         let size = stx.size;
 
-        let owner = if fetch_owner { Some(owner_info(stx.uid)) } else { None };
+        let owner = if fetch_owner {
+            Some(owner_info(&app.nss_client, stx.uid).await)
+        } else {
+            None
+        };
 
         contents.push(s32p_support::s3xml::ListObjectInfo {
             key,
@@ -2395,12 +2386,13 @@ async fn handle_list_objects_v1(
                     let key = format!("{}{}{}", top.dir_key, it.name, "/");
                     if key.starts_with(&prefix) {
                         last_emitted = Some(key.clone());
+                        let owner = Some(owner_info(&app.nss_client, stx.uid).await);
                         contents.push(s32p_support::s3xml::ListObjectInfo {
                             key,
                             last_modified: s32p_support::s3xml::format_s3_time_system(stx.mtime),
                             etag: format_inode_etag(stx.ino),
                             size: 0,
-                            owner: Some(owner_info(stx.uid)),
+                            owner,
                         });
                     }
                 }
@@ -2432,7 +2424,7 @@ async fn handle_list_objects_v1(
         let size = stx.size;
 
         // v1 always carries Owner in Contents.
-        let owner = Some(owner_info(stx.uid));
+        let owner = Some(owner_info(&app.nss_client, stx.uid).await);
 
         last_emitted = Some(key.clone());
         contents.push(s32p_support::s3xml::ListObjectInfo {
@@ -4161,12 +4153,46 @@ async fn async_main() -> Result<()> {
         tracing::info!(interval_secs = interval.as_secs(), "replay-cache sweeper started");
     }
 
+    // NSS lookup client. Connects to the proxy's abstract socket when
+    // `S32P_NSS_PROXY_SOCK` is set; otherwise falls back to local
+    // `getpwuid_r`. The proxy injects the env var at worker spawn time.
+    let nss_sock_env = std::env::var("S32P_NSS_PROXY_SOCK").ok();
+    let nss_client = Arc::new(nss_client::NssClient::from_env(nss_sock_env.as_deref()));
+    tracing::info!(
+        backend = if nss_client.is_direct() { "direct" } else { "proxy-socket" },
+        ttl_secs = nss_client.ttl().as_secs(),
+        "nss lookup client initialized"
+    );
+    // Sweep at half the TTL so expired entries survive at most one
+    // half-window of stale memory. Same shape as the replay-cache sweeper.
+    {
+        let cache = Arc::clone(&nss_client);
+        let interval = cache.ttl() / 2;
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(interval);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                t.tick().await;
+                let stats = cache.sweep();
+                tracing::debug!(
+                    before = stats.before,
+                    after = stats.after,
+                    removed = stats.removed,
+                    elapsed_us = stats.elapsed.as_micros() as u64,
+                    "nss-cache sweep"
+                );
+            }
+        });
+        tracing::info!(interval_secs = interval.as_secs(), "nss-cache sweeper started");
+    }
+
     let app = Arc::new(App {
         cfg: cfg.clone(),
         pool,
         uring,
         virtual_hosted_suffixes: cfg.virtual_hosted_suffixes.clone(),
         idempotency,
+        nss_client,
     });
 
     if let Some(sock_path) = cfg.bind_uds.clone() {
