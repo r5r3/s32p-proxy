@@ -25,6 +25,7 @@ use pingora::{
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 
 mod config;
+mod conn_limit;
 mod nss_listener;
 mod responses;
 mod session;
@@ -49,6 +50,10 @@ struct S3ProxyApp {
     session_ttl:             Duration,
     routing:                 config::RoutingConfig,
     virtual_hosted_suffixes: Vec<String>, // from config.server.virtual_hosted_suffixes
+    /// Per-IP concurrent-request cap + keep-alive idle override. The
+    /// keep-alive setting is load-bearing — Pingora's default is to never
+    /// time out an idle keep-alive connection.
+    conn_limiter:            Arc<conn_limit::ConnectionLimiter>,
     /// Pre-bound abstract NSS lookup listener. The kernel reserves the
     /// abstract name at startup so workers can include the value in their
     /// env at spawn time; the accept loop is started lazily from the first
@@ -102,6 +107,11 @@ struct ProxyCtx {
     // inject `X-S32P-Validated: <worker_token>` so the gateway short-circuits
     // its own SigV4 re-check.
     session_validated: bool,
+    // Source IP this request reserved a per-IP limiter slot for. `Some(ip)`
+    // means `logging()` must `release(ip)` on completion; `None` means the
+    // request bypassed the cap (loopback, UDS peer, or cap disabled). Set
+    // in `request_filter` once admission has been granted.
+    limiter_slot:      Option<std::net::IpAddr>,
 }
 
 impl ProxyCtx {
@@ -150,7 +160,52 @@ impl ProxyHttp for S3ProxyApp {
         ProxyCtx::default()
     }
 
+    /// Fires before `request_filter`, after the first request's headers
+    /// have been read on this connection. Used to override Pingora's
+    /// `KeepaliveStatus::Infinite` default with a finite idle timeout,
+    /// closing the "open one connection, sit on the FD forever after a
+    /// completed request" path. The same timeout is reapplied each
+    /// request — calling it every time is cheap and keeps the contract
+    /// in one place.
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> PResult<()> {
+        let secs = self.conn_limiter.keepalive_idle_secs;
+        if secs > 0 {
+            session.set_keepalive(Some(secs));
+        }
+        Ok(())
+    }
+
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> PResult<bool> {
+        // Per-IP admission control. Runs before any other work so a
+        // throttled IP doesn't get to drive SigV4 verification, directory
+        // lookups, or worker spawn. Loopback peers (and UDS — non-Inet
+        // `client_addr`) bypass the cap; see `conn_limit.rs` for the
+        // rationale. The slot is released in `logging()`.
+        let peer_ip = session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip());
+        match self.conn_limiter.acquire(peer_ip) {
+            conn_limit::AcquireOutcome::Acquired(ip) => {
+                ctx.limiter_slot = Some(ip);
+            }
+            conn_limit::AcquireOutcome::Bypassed => {}
+            conn_limit::AcquireOutcome::Throttled(ip) => {
+                tracing::debug!(
+                    client_ip = %ip,
+                    "per-IP concurrency cap exceeded; returning 429 SlowDown"
+                );
+                let path = session.req_header().uri.path().to_string();
+                responses::respond_slow_down(session, "request rate too high", Some(&path), 1)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
         // Start background sweepers lazily (we are now inside tokio).
         self.workers.start_sweeper();
         self.sessions.start_cleanup();
@@ -759,6 +814,14 @@ impl ProxyHttp for S3ProxyApp {
         e: Option<&pingora::Error>,
         ctx: &mut Self::CTX,
     ) {
+        // Release the per-IP limiter slot reserved in `request_filter`.
+        // Must run regardless of how the request terminated (success,
+        // upstream error, body filter failure) so we don't leak counters
+        // and eventually 429 a legitimate client.
+        if let Some(ip) = ctx.limiter_slot.take() {
+            self.conn_limiter.release(ip);
+        }
+
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
         let client = session
             .client_addr()
@@ -1029,6 +1092,16 @@ fn main() -> Result<()> {
         "session store initialized"
     );
 
+    let conn_limiter = Arc::new(conn_limit::ConnectionLimiter::new(
+        &cfg.server.connection_limits,
+    ));
+    tracing::info!(
+        per_ip = cfg.server.connection_limits.max_concurrent_requests_per_ip,
+        keepalive_idle_secs = cfg.server.connection_limits.keepalive_idle_secs,
+        loopback_bypass = cfg.server.connection_limits.trusted_loopback_bypass,
+        "connection limiter initialized"
+    );
+
     let app = S3ProxyApp {
         directory,
         workers: workers.clone(),
@@ -1036,6 +1109,7 @@ fn main() -> Result<()> {
         session_ttl: Duration::from_secs(cfg.session.ttl_secs),
         routing: cfg.routing.clone(),
         virtual_hosted_suffixes: cfg.server.virtual_hosted_suffixes.clone(),
+        conn_limiter,
         nss_listener_pending: Mutex::new(Some(nss_std_listener)),
         nss_listener_handle: Mutex::new(None),
         nss_listener_started: AtomicBool::new(false),

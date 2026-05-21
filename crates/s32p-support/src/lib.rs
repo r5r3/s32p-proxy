@@ -88,6 +88,48 @@ pub const HEADER_SIGV4_MAX_SKEW: Duration = Duration::from_secs(15 * 60);
 /// also recycle the long-term secret.
 pub const PRESIGN_MAX_EXPIRES: u64 = 7 * 24 * 60 * 60;
 
+/// Cheap pre-HMAC structural check on the parsed Authorization / presign
+/// fields. Catches the bulk of unauthenticated CPU-amplification probes
+/// before they pay the 6-attempt HMAC loop in
+/// [`verify_sigv4_header_only`] / [`verify_sigv4_presigned_url`].
+///
+/// A SigV4 signature is always exactly 64 ASCII hex chars (HMAC-SHA256
+/// hex output); a credential scope date is always exactly 8 ASCII digits
+/// (`YYYYMMDD`). Anything else can be rejected without computing a
+/// signature. A motivated attacker who supplies well-formed hex still
+/// reaches the HMAC path — this is purely to deny the easy garbage-byte
+/// amplification, not to change the security contract.
+///
+/// **Deliberately not checked: the service name.** The proxy serves both
+/// `s3` (standard S3 API) and `s3express` (S3 Express One Zone), and
+/// future AWS variants would be similarly valid. The HMAC step already
+/// binds the signature to the specific service string in the credential
+/// scope, so accepting any string here is safe.
+fn validate_sigv4_format(signature: &str, scope_date: &str) -> Result<()> {
+    const SIGNATURE_HEX_LEN: usize = 64;
+    const SCOPE_DATE_LEN: usize = 8;
+
+    if signature.len() != SIGNATURE_HEX_LEN {
+        return Err(anyhow!(
+            "signature wrong length: got {} expected {SIGNATURE_HEX_LEN}",
+            signature.len()
+        ));
+    }
+    if !signature.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("signature contains non-hex character"));
+    }
+    if scope_date.len() != SCOPE_DATE_LEN {
+        return Err(anyhow!(
+            "scope date wrong length: got {} expected {SCOPE_DATE_LEN}",
+            scope_date.len()
+        ));
+    }
+    if !scope_date.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("scope date contains non-digit character"));
+    }
+    Ok(())
+}
+
 /// Verify either:
 /// - standard SigV4 header Authorization, or
 /// - SigV4 presigned URL (query params)
@@ -132,6 +174,17 @@ pub fn verify_sigv4_request_any(
                 });
             }
         };
+
+        // Pre-HMAC fast-fail: reject obvious garbage (wrong-length signature,
+        // non-hex characters, malformed scope date) before running the
+        // 6-attempt HMAC loop. Returns SignatureDoesNotMatch — same
+        // client-visible behavior as if we'd let the HMAC run.
+        if let Err(e) = validate_sigv4_format(&auth.signature, &auth.scope_date) {
+            return Err(SigV4Rejection {
+                response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
+                reason:   format!("malformed sigv4 (pre-HMAC): {e}"),
+            });
+        }
 
         if let Some(exp) = expected_access_key {
             if auth.access_key != exp {
@@ -182,6 +235,15 @@ pub fn verify_sigv4_request_any(
             });
         }
     };
+
+    // Pre-HMAC fast-fail on the presigned path: same rationale as the
+    // header path above. Returns SignatureDoesNotMatch.
+    if let Err(e) = validate_sigv4_format(&auth.signature, &auth.scope_date) {
+        return Err(SigV4Rejection {
+            response: crate::s3resp::signature_does_not_match(CLIENT_MSG_BAD_SIG, resource),
+            reason:   format!("malformed sigv4 presign (pre-HMAC): {e}"),
+        });
+    }
 
     if let Some(exp) = expected_access_key {
         if auth.access_key != exp {
@@ -966,5 +1028,91 @@ fn offset_to_system_time(dt: OffsetDateTime) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(ts as u64)
     } else {
         UNIX_EPOCH - Duration::from_secs((-ts) as u64)
+    }
+}
+
+#[cfg(test)]
+mod fastfail_tests {
+    use super::validate_sigv4_format;
+
+    /// Canonical-shape valid signature: 64 lowercase hex chars + 8-digit date.
+    /// The HMAC step alone validates the actual bytes; we only check structure.
+    const GOOD_SIG: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const GOOD_DATE: &str = "20260521";
+
+    #[test]
+    fn well_formed_passes() {
+        assert!(validate_sigv4_format(GOOD_SIG, GOOD_DATE).is_ok());
+    }
+
+    #[test]
+    fn uppercase_hex_passes() {
+        // Some clients emit uppercase hex. The AWS canonical form is lowercase
+        // but `is_ascii_hexdigit` accepts both; the HMAC step does the actual
+        // byte comparison, so we don't gate case here.
+        let upper = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        assert!(validate_sigv4_format(upper, GOOD_DATE).is_ok());
+    }
+
+    #[test]
+    fn s3express_scope_still_passes_format_check() {
+        // Regression guard: the service name lives elsewhere in the credential
+        // scope and is deliberately NOT inspected here. As long as signature
+        // and scope_date are well-formed, the validator must pass — otherwise
+        // we'd kill all `s3express` traffic.
+        assert!(validate_sigv4_format(GOOD_SIG, GOOD_DATE).is_ok());
+    }
+
+    #[test]
+    fn empty_signature_rejected() {
+        assert!(validate_sigv4_format("", GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn short_signature_rejected() {
+        let short = "abc";
+        assert!(validate_sigv4_format(short, GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn signature_63_chars_rejected() {
+        let one_short = &GOOD_SIG[..63];
+        assert!(validate_sigv4_format(one_short, GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn signature_65_chars_rejected() {
+        let one_over = format!("{GOOD_SIG}0");
+        assert!(validate_sigv4_format(&one_over, GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn signature_non_hex_rejected() {
+        // Right length, wrong alphabet — a `g` is not a hex digit.
+        let mut bad = String::from(&GOOD_SIG[..63]);
+        bad.push('g');
+        assert_eq!(bad.len(), 64);
+        assert!(validate_sigv4_format(&bad, GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn signature_with_spaces_rejected() {
+        // 64-char string but the chars are spaces — used to model dribble
+        // attacks that try to bypass the length gate with non-hex bytes.
+        let spaces = " ".repeat(64);
+        assert!(validate_sigv4_format(&spaces, GOOD_DATE).is_err());
+    }
+
+    #[test]
+    fn scope_date_wrong_length_rejected() {
+        assert!(validate_sigv4_format(GOOD_SIG, "2026052").is_err());
+        assert!(validate_sigv4_format(GOOD_SIG, "202605211").is_err());
+        assert!(validate_sigv4_format(GOOD_SIG, "").is_err());
+    }
+
+    #[test]
+    fn scope_date_non_digit_rejected() {
+        assert!(validate_sigv4_format(GOOD_SIG, "2026May2").is_err());
     }
 }

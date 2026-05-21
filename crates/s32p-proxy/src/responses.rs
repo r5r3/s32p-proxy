@@ -83,6 +83,19 @@ pub async fn respond_not_implemented(
     respond_hyper(session, resp, /* close = */ true).await
 }
 
+/// Convenience: SlowDown (429) with `Retry-After`. Closes the connection
+/// (`close = true`) so a throttled client doesn't keep an FD pinned in
+/// keep-alive after being told to back off.
+pub async fn respond_slow_down(
+    session: &mut Session,
+    message: &str,
+    resource: Option<&str>,
+    retry_after_secs: u64,
+) -> pingora::Result<()> {
+    let resp = s3resp::slow_down(message, resource, retry_after_secs);
+    respond_hyper(session, resp, /* close = */ true).await
+}
+
 /* -------------------------
  * aws_compat dispatch
  * ------------------------- */

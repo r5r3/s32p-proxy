@@ -80,6 +80,60 @@ pub struct ServerConfig {
     /// Example: ["s3.example.com", "s3.internal.example.com"]
     #[serde(default)]
     pub virtual_hosted_suffixes:    Vec<String>,
+    /// Per-source-IP concurrency cap + keep-alive idle override. The
+    /// keep-alive setting overrides Pingora's default (`Infinite`) — leaving
+    /// it unset would let an attacker hold an FD forever after a single
+    /// completed request.
+    #[serde(default)]
+    pub connection_limits:          ConnectionLimitsConfig,
+}
+
+/// Per-IP concurrency and keep-alive tuning for the public listener.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionLimitsConfig {
+    /// Maximum concurrent in-flight requests from a single source IP.
+    /// 429 SlowDown is returned when exceeded. Default 256 — typical S3
+    /// clients peak at 10–30 concurrent; 256 accommodates a single power
+    /// user, several clients behind one NAT, or an HPC burst client.
+    #[serde(default = "default_max_concurrent_requests_per_ip")]
+    pub max_concurrent_requests_per_ip: u64,
+    /// Keep-alive idle timeout in seconds — connection closes if the next
+    /// request doesn't arrive within this window. Pingora ships with
+    /// `KeepaliveStatus::Infinite` by default
+    /// (`pingora-core/.../protocols/http/v1/server.rs:647`), which lets an
+    /// attacker camp on an FD forever after one completed request. 60s
+    /// matches HAProxy/ALB; nginx ships 75s. Long-running uploads and
+    /// downloads are unaffected — the idle clock only runs between
+    /// requests, not during active body transfer.
+    #[serde(default = "default_keepalive_idle_secs")]
+    pub keepalive_idle_secs:            u64,
+    /// When true (default), source IPs in `127.0.0.0/8` or `::1` skip the
+    /// per-IP cap. Needed so operator health checks (`curl localhost…`)
+    /// and the integration test harness don't false-trip the limit.
+    /// An attacker who can reach the proxy from loopback has already
+    /// breached the host, so the bypass is not a security loss.
+    #[serde(default = "default_trusted_loopback_bypass")]
+    pub trusted_loopback_bypass:        bool,
+}
+
+impl Default for ConnectionLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests_per_ip: default_max_concurrent_requests_per_ip(),
+            keepalive_idle_secs:            default_keepalive_idle_secs(),
+            trusted_loopback_bypass:        default_trusted_loopback_bypass(),
+        }
+    }
+}
+
+fn default_max_concurrent_requests_per_ip() -> u64 {
+    256
+}
+fn default_keepalive_idle_secs() -> u64 {
+    60
+}
+fn default_trusted_loopback_bypass() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

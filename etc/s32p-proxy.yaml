@@ -14,6 +14,23 @@ server:
     - 127.0.0.1.nip.io
     - localhost
 
+  # Per-IP concurrency limit + keep-alive idle override for the public
+  # listener. The keep-alive setting must be set explicitly — Pingora's
+  # default is `Infinite` (no idle timeout at all), which lets an attacker
+  # camp on an FD forever after a single completed request.
+  connection_limits:
+    # Reject with 429 SlowDown when one source IP has this many in-flight
+    # requests. Typical S3 clients peak at 10-30 concurrent.
+    max_concurrent_requests_per_ip: 256
+    # Close keep-alive connections idle for longer than this. Matches
+    # HAProxy / AWS ALB defaults (nginx ships 75s). Long-running uploads
+    # and downloads are unaffected; the clock only runs between requests.
+    keepalive_idle_secs: 60
+    # Skip the per-IP cap for loopback peers (127.0.0.0/8, ::1) so operator
+    # health checks and the integration test harness don't false-trip it.
+    # Disable only if local users on the host are part of your threat model.
+    trusted_loopback_bypass: true
+
 auth:
   backend: "yaml"
   yaml:

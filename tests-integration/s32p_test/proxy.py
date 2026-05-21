@@ -82,6 +82,16 @@ class ProxyHarness:
     # `S32P_LOG_UTC_OFFSET_SECS` injection bypasses the
     # `/etc/localtime` read that would otherwise fail.
     landlock_enabled: bool = True
+    # `server.connection_limits` knobs. Defaults match the production
+    # ones in `etc/s32p-proxy.yaml`. The loopback bypass is on by
+    # default because the test runner is `127.0.0.1` — without it,
+    # bursty positive tests would intermittently false-trip the cap.
+    # Tests that *do* want to exercise the cap (test_dos.py) spin up
+    # their own harness with `trusted_loopback_bypass=False` and a low
+    # `max_concurrent_requests_per_ip`.
+    max_concurrent_requests_per_ip: int = 256
+    keepalive_idle_secs: int = 60
+    trusted_loopback_bypass: bool = True
 
     # Derived in __post_init__
     posix_root: Path = field(init=False)
@@ -140,6 +150,11 @@ class ProxyHarness:
                 "log_level": self.log_level,
                 "shutdown_grace_period_secs": 5,
                 "virtual_hosted_suffixes": list(self.virtual_hosted_suffixes),
+                "connection_limits": {
+                    "max_concurrent_requests_per_ip": self.max_concurrent_requests_per_ip,
+                    "keepalive_idle_secs": self.keepalive_idle_secs,
+                    "trusted_loopback_bypass": self.trusted_loopback_bypass,
+                },
             },
             "auth": {
                 "backend": "yaml",

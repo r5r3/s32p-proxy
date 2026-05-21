@@ -20,6 +20,9 @@ pub mod error_code {
     pub const INTERNAL_ERROR: &str = "InternalError";
     pub const SERVICE_UNAVAILABLE: &str = "ServiceUnavailable";
     pub const ENTITY_TOO_LARGE: &str = "EntityTooLarge";
+    /// AWS S3's canonical "back off and retry" response. The proxy emits this
+    /// (HTTP 429) when a single source IP exceeds its concurrent-request cap.
+    pub const SLOW_DOWN: &str = "SlowDown";
 
     // Used by gateway for object retrieval errors.
     pub const NO_SUCH_KEY: &str = "NoSuchKey";

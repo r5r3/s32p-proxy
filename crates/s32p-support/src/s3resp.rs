@@ -190,6 +190,29 @@ pub fn request_time_too_skewed(message: &str, resource: Option<&str>) -> HttpRes
     )
 }
 
+/// Convenience: SlowDown (429). Emitted by the proxy when one source IP
+/// exceeds its concurrent-request cap. AWS's documented response for
+/// "retry, with backoff" — clients that respect the AWS SDK retry conventions
+/// already know to back off on this code. `retry_after_secs` is sent as the
+/// HTTP `Retry-After` header.
+pub fn slow_down(message: &str, resource: Option<&str>, retry_after_secs: u64) -> HttpResponse {
+    let body = s3xml::s3_error_body(s3xml::error_code::SLOW_DOWN, message, resource, None, None)
+        .unwrap_or_else(|_| {
+            format!(
+                "<Error><Code>{}</Code><Message>{}</Message></Error>",
+                s3xml::error_code::SLOW_DOWN,
+                message
+            )
+            .into_bytes()
+        });
+    response_bytes(
+        StatusCode::TOO_MANY_REQUESTS,
+        "application/xml",
+        body,
+        [("Retry-After", retry_after_secs.to_string())],
+    )
+}
+
 /// Convenience: InvalidAccessKeyId (403).
 pub fn invalid_access_key_id(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(
