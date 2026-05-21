@@ -191,6 +191,7 @@ class ProxyHarness:
                     "other":        {"action": "proxy", "worker_profile": self.profile_name},
                     "versioning":   {"action": "aws_compat"},
                     "object_lock":  {"action": "aws_compat"},
+                    "service":      {"action": "aws_compat"},
                     "bucket_admin": {"action": "not_implemented", "message": "bucket admin via s32p-ctl only"},
                     "session":      {"action": "create_session"},
                 },

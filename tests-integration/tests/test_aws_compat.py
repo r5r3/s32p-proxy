@@ -25,7 +25,15 @@ through the real proxy + SigV4.
 
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
+from urllib.parse import urlparse
+
+import botocore.auth
+import botocore.awsrequest
+import botocore.credentials
 import pytest
+import requests
 from botocore.exceptions import ClientError
 
 
@@ -124,6 +132,42 @@ def test_put_object_legal_hold_returns_400_invalid_request(boto3_raw, bucket):
     err = exc.value.response
     assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert err["Error"]["Code"] == "InvalidRequest", err
+
+
+# ---------------------------------------------------------------- service-level HEAD
+
+
+def test_head_service_returns_405_method_not_allowed(endpoint):
+    """`HEAD /` is not a documented S3 op; AWS returns 405. The proxy
+    classifies it as `HeadService`, the `service` class is routed to
+    `aws_compat`, and the dispatcher emits 405 with `Allow: GET`.
+
+    Clients like Cyberduck / MountainDuck issue this as a connectivity
+    probe before doing real work. The classifier change closes the
+    "spawn versitygw worker just to bounce a 405 back" path that the
+    `Other`-routed-via-proxy behavior produced before.
+    """
+    url = f"{endpoint.base_url}/"
+    parsed = urlparse(url)
+    amz_date = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    pre_headers = {
+        "host":                 parsed.netloc,
+        "x-amz-content-sha256": hashlib.sha256(b"").hexdigest(),
+        "x-amz-date":           amz_date,
+    }
+    creds = botocore.credentials.Credentials(endpoint.access_key, endpoint.secret_key)
+    req = botocore.awsrequest.AWSRequest(
+        method="HEAD", url=url, data=b"", headers=dict(pre_headers)
+    )
+    botocore.auth.SigV4Auth(creds, "s3", endpoint.region).add_auth(req)
+    signed = dict(req.headers.items())
+
+    resp = requests.head(url, headers=signed, timeout=10)
+    assert resp.status_code == 405, resp.text
+    # AWS's MethodNotAllowed response carries `Allow:` listing the methods
+    # the resource does accept — `GET` only for the service endpoint
+    # (ListBuckets).
+    assert resp.headers.get("Allow") == "GET", dict(resp.headers)
 
 
 # ---------------------------------------------------------------- fallback

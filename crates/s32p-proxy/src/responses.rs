@@ -148,6 +148,18 @@ pub fn aws_compat_response(op: &S3Op, resource: Option<&str>) -> s3resp::HttpRes
             )
         }
 
+        // HeadService: `HEAD /` is not a documented S3 op (only `GET /` for
+        // ListBuckets is). AWS returns 405 Method Not Allowed; clients like
+        // Cyberduck / MountainDuck issue HEAD / as a connectivity probe and
+        // treat 405 as "server is alive, can't HEAD that resource" — they
+        // proceed with real S3 work afterwards. The `Allow: GET` header
+        // points polite clients at the right verb.
+        S3Op::HeadService => s3resp::method_not_allowed(
+            "The specified method is not allowed against this resource.",
+            resource,
+            "GET",
+        ),
+
         // Anything else within an aws_compat-routed class — AWS either
         // doesn't have a feature-disabled response (it implements the
         // op unconditionally, e.g. PutBucketVersioning) or the wire
@@ -258,5 +270,22 @@ mod tests {
         let op = S3Op::BucketAdmin(BucketAdminOp::CreateBucket);
         let (status, _) = body_bytes(aws_compat_response(&op, None)).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn head_service_returns_405_with_allow_get() {
+        // `HEAD /` on AWS S3 returns 405; the proxy mirrors that under
+        // the `aws_compat` action so clients like Cyberduck / MountainDuck
+        // see the spec-accurate response without a SigV4 round-trip or
+        // worker involvement.
+        let resp = aws_compat_response(&S3Op::HeadService, None);
+        let allow = resp
+            .headers()
+            .get("Allow")
+            .map(|v| v.to_str().unwrap().to_string());
+        let (status, body) = body_bytes(resp).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(allow.as_deref(), Some("GET"));
+        assert_xml_contains(&body, "<Code>MethodNotAllowed</Code>");
     }
 }

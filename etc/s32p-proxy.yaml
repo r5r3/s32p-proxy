@@ -126,6 +126,13 @@ routing:
       message: "bucket administration is not implemented"
     session:
       action: "create_session"
+    # Service-level probes (HEAD /): clients like Cyberduck / MountainDuck,
+    # mc, and similar issue these before doing real work. AWS returns
+    # 405 Method Not Allowed (only GET / is documented at the service
+    # endpoint); aws_compat mirrors that directly without touching a
+    # worker or requiring SigV4 beyond the routing decision.
+    service:
+      action: "aws_compat"
     other:
       action: "proxy"
       worker_profile: "versitygw-default"

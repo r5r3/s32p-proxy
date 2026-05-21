@@ -34,6 +34,12 @@ pub enum S3Op {
     BucketAdmin(BucketAdminOp),
     /// Session / authorization operations (S3 Express directory-bucket flow).
     Session(SessionOp),
+    /// Service-level (no bucket, no key) probe. The only documented S3
+    /// op at the service endpoint is `GET /` (ListBuckets) — `HEAD /` is
+    /// the connectivity probe that clients like Cyberduck / MountainDuck,
+    /// mc, and similar issue before doing real work. AWS returns 405
+    /// Method Not Allowed; we mirror that under the `aws_compat` action.
+    HeadService,
     /// Anything else (for now).
     Other,
 }
@@ -312,6 +318,8 @@ impl S3Op {
             },
             S3Op::BucketAdmin(_) => true,
             S3Op::Session(_) => false,
+            // HeadService is a pure liveness probe — no state involved.
+            S3Op::HeadService => false,
             S3Op::Other => true,
         }
     }
@@ -328,6 +336,7 @@ pub fn class_key(class: &S3RequestClass) -> &'static str {
         S3Op::Write(_) => "write",
         S3Op::BucketAdmin(_) => "bucket_admin",
         S3Op::Session(_) => "session",
+        S3Op::HeadService => "service",
         S3Op::Other => "other",
     }
 }
@@ -352,6 +361,17 @@ pub fn classify_with_headers(
     // ListBuckets: GET / (may include pagination/filter query params, allow x-id)
     if method == "GET" && bucket.is_none() && key.is_none() && query.validate_xid("ListBuckets") {
         return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::ListBuckets) };
+    }
+
+    // HeadService: HEAD / with no bucket/key/query. Service-level HEAD is
+    // not a documented S3 operation; AWS returns 405 Method Not Allowed.
+    // Clients like Cyberduck / MountainDuck and `mc` issue this as a
+    // connectivity probe before doing real work — recognising it here
+    // (instead of falling through to `Other` → operator-configured proxy
+    // worker) lets the proxy answer 405 directly via `aws_compat`,
+    // skipping SigV4 / worker spawn for what should be a liveness check.
+    if method == "HEAD" && bucket.is_none() && key.is_none() && query.is_empty_effective() {
+        return S3RequestClass { bucket, key, query, op: S3Op::HeadService };
     }
 
     // Detect multipart first (uploadId can coexist with versionId in theory,
@@ -563,6 +583,10 @@ pub fn not_implemented_reason(class: &S3RequestClass) -> Option<&'static str> {
         S3Op::Write(_) => None,
         S3Op::BucketAdmin(_) => Some("bucket administration is not implemented"),
         S3Op::Session(_) => None, // handled locally at the proxy
+        // HeadService is handled by the `aws_compat` arm (405 Method Not Allowed).
+        // Returning None here lets routing decide; under the default routing
+        // ("service": aws_compat) the proxy emits 405 without touching a worker.
+        S3Op::HeadService => None,
         S3Op::Other => None,
     }
 }

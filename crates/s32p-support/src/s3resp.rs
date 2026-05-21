@@ -190,6 +190,32 @@ pub fn request_time_too_skewed(message: &str, resource: Option<&str>) -> HttpRes
     )
 }
 
+/// Convenience: MethodNotAllowed (405) with an `Allow:` header.
+///
+/// Used for HTTP methods that aren't defined on the requested resource —
+/// the canonical case is `HEAD /` (service-level HEAD; AWS only documents
+/// `GET /` for ListBuckets). The `Allow:` value is the comma-separated
+/// list of methods the caller could have used on the same resource (for
+/// service-level `/`, that's just `GET`).
+pub fn method_not_allowed(message: &str, resource: Option<&str>, allow: &str) -> HttpResponse {
+    let body =
+        s3xml::s3_error_body(s3xml::error_code::METHOD_NOT_ALLOWED, message, resource, None, None)
+            .unwrap_or_else(|_| {
+                format!(
+                    "<Error><Code>{}</Code><Message>{}</Message></Error>",
+                    s3xml::error_code::METHOD_NOT_ALLOWED,
+                    message
+                )
+                .into_bytes()
+            });
+    response_bytes(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "application/xml",
+        body,
+        [("Allow", allow.to_string())],
+    )
+}
+
 /// Convenience: SlowDown (429). Emitted by the proxy when one source IP
 /// exceeds its concurrent-request cap. AWS's documented response for
 /// "retry, with backoff" — clients that respect the AWS SDK retry conventions

@@ -23,6 +23,10 @@ pub mod error_code {
     /// AWS S3's canonical "back off and retry" response. The proxy emits this
     /// (HTTP 429) when a single source IP exceeds its concurrent-request cap.
     pub const SLOW_DOWN: &str = "SlowDown";
+    /// AWS S3's response for HTTP methods not defined on the requested
+    /// resource — e.g., `HEAD /` (service-level HEAD is undefined; only
+    /// GET / for ListBuckets is documented).
+    pub const METHOD_NOT_ALLOWED: &str = "MethodNotAllowed";
 
     // Used by gateway for object retrieval errors.
     pub const NO_SUCH_KEY: &str = "NoSuchKey";
