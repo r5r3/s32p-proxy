@@ -357,7 +357,10 @@ async fn handle(
     app.idempotency.start_cleanup();
 
     let method = req.method().clone();
-    let uri_log = req.uri().to_string();
+    // SigV4 signature and STS token are truncated to an 8-char prefix
+    // (cryptographically useless, still useful for correlating log
+    // lines). Other `X-Amz-*` params pass through verbatim.
+    let uri_log = s32p_support::log_redact::redact_uri_for_log(req.uri());
     let host_log = req
         .headers()
         .get("host")

@@ -38,6 +38,9 @@ pub mod utils;
 /// Precondition evaluation functions for S3 operations
 pub mod preconditions;
 
+/// Log-safe redaction of SigV4 credentials in URIs.
+pub mod log_redact;
+
 /// Wire protocol for the proxy → worker NSS lookup service.
 pub mod nss_proto;
 

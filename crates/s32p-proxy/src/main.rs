@@ -223,7 +223,9 @@ impl ProxyHttp for S3ProxyApp {
 
         let method = req.method.as_str();
         let path = req.uri.path();
-        let query = req.uri.query().unwrap_or("");
+        // SigV4 signature / STS token redacted to an 8-char prefix for
+        // log output; everything else in the query passes through.
+        let query_log = s32p_support::log_redact::redact_query_for_log(req.uri.query().unwrap_or(""));
 
         let host = req.headers.get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
@@ -232,7 +234,7 @@ impl ProxyHttp for S3ProxyApp {
         tracing::debug!(
             method = method,
             path = path,
-            query = query,
+            query = %query_log,
             host = host.as_deref().unwrap_or("<missing-host>"),
             "incoming request"
         );
@@ -770,6 +772,20 @@ impl ProxyHttp for S3ProxyApp {
             .unwrap_or("<missing>")
             .to_string();
 
+        // Replicate Pingora's `Session::request_summary()` shape with the
+        // SigV4 signature / STS token redacted to an 8-char prefix.
+        // `request_summary()` formats as `"METHOD URI, Host: HOST"` and
+        // would otherwise emit a presigned URL's full signature into
+        // info-level access logs.
+        let req_header = session.req_header();
+        let host = req_header
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<missing>");
+        let uri_log = s32p_support::log_redact::redact_uri_for_log(&req_header.uri);
+        let summary = format!("{} {}, Host: {}", req_header.method, uri_log, host);
+
         if let Some(err) = e {
             tracing::warn!(
                 client = %client,
@@ -780,7 +796,7 @@ impl ProxyHttp for S3ProxyApp {
                 user_agent = user_agent.as_str(),
                 error = %err,
                 "{}",
-                session.request_summary()
+                summary
             );
         } else {
             tracing::info!(
@@ -791,7 +807,7 @@ impl ProxyHttp for S3ProxyApp {
                 status = status,
                 user_agent = user_agent.as_str(),
                 "{}",
-                session.request_summary()
+                summary
             );
         }
     }
@@ -836,11 +852,13 @@ async fn validate_sigv4_header_only_or_reject(
                 .client_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            let query_log =
+                s32p_support::log_redact::redact_query_for_log(req.uri.query().unwrap_or(""));
             tracing::debug!(
                 client = %client,
                 method = req.method.as_str(),
                 path = req.uri.path(),
-                query = req.uri.query().unwrap_or(""),
+                query = %query_log,
                 username = user.username.as_str(),
                 status = rej.response.status().as_u16(),
                 reason = %rej.reason,
