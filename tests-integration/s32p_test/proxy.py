@@ -69,13 +69,7 @@ class ProxyHarness:
         "s32p_proxy=info,s32p_gateway=info,pingora=warn,pingora_proxy=warn"
     )
     virtual_hosted_suffixes: tuple[str, ...] = ()
-    # Must satisfy the proxy's startup invariant
-    # `idle_timeout_secs >= replay_cache.max_entry_lifetime` (currently
-    # 1801 = 2 × HEADER_SIGV4_MAX_SKEW + 1, see
-    # s32p-support/src/replay_cache.rs). The test suite never actually
-    # waits for worker idle-out, so the absolute value is irrelevant
-    # beyond clearing the check.
-    idle_timeout_secs: int = 2400
+    idle_timeout_secs: int = 600
     sweep_interval_secs: int = 5
     profile_name: str = "gateway"
     # CreateSession TTL. Kept short by default so expiry tests don't

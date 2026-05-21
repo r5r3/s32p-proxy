@@ -38,9 +38,6 @@ pub mod utils;
 /// Precondition evaluation functions for S3 operations
 pub mod preconditions;
 
-/// In-memory cache that rejects replayed SigV4 signatures.
-pub mod replay_cache;
-
 /// Wire protocol for the proxy → worker NSS lookup service.
 pub mod nss_proto;
 
@@ -95,14 +92,6 @@ pub const PRESIGN_MAX_EXPIRES: u64 = 7 * 24 * 60 * 60;
 /// `expected_access_key`:
 /// - If `Some`, the signer access key must match it.
 /// - If `None`, no access-key match is enforced (useful if caller already selected credentials by key).
-///
-/// `replay_cache`:
-/// - If `Some`, the verified signature is recorded; subsequent requests
-///   carrying the same signature within the cache TTL are rejected as
-///   replays. The cache is consulted *after* signature verification so
-///   only valid signatures consume memory.
-/// - If `None`, no replay protection is applied (used by tests and
-///   callers that opt out explicitly).
 pub fn verify_sigv4_request_any(
     method: &str,
     uri: &Uri,
@@ -110,7 +99,6 @@ pub fn verify_sigv4_request_any(
     expected_access_key: Option<&str>,
     secret_key: &str,
     resource: Option<&str>,
-    replay_cache: Option<&replay_cache::ReplayCache>,
 ) -> std::result::Result<(), SigV4Rejection> {
     // Generic, client-safe messages. Detailed `reason` strings stay server-side
     // (in SigV4Rejection.reason) for operator debugging; never put canonical
@@ -172,15 +160,6 @@ pub fn verify_sigv4_request_any(
             return Err(SigV4Rejection { response, reason });
         }
 
-        if let Some(cache) = replay_cache {
-            // Anchor cache expiry on the client's `x-amz-date` rather
-            // than on receipt time, so the entry survives until the
-            // signature stops being verifiable regardless of clock skew.
-            // See `replay_cache` module docs for the gap this closes.
-            let expires_at = header_signed_replay_expiry(headers, cache);
-            check_replay(cache, &auth.signature, expires_at, resource)?;
-        }
-
         return Ok(());
     }
 
@@ -223,89 +202,7 @@ pub fn verify_sigv4_request_any(
         return Err(SigV4Rejection { response, reason });
     }
 
-    if let Some(cache) = replay_cache {
-        // Presigned URLs use the cache's default TTL (not their full
-        // X-Amz-Expires window). Replay protection beyond `cache.ttl()`
-        // seconds after receipt is a documented trade-off; see the
-        // `replay_cache` module docs.
-        let expires_at = std::time::Instant::now() + cache.ttl();
-        check_replay(cache, &auth.signature, expires_at, resource)?;
-    }
-
     Ok(())
-}
-
-/// Look the signature up in the replay cache. A hit is mapped to
-/// `SignatureDoesNotMatch` — the same client message a genuine bad
-/// signature would produce, so the cache cannot be used as an oracle to
-/// distinguish "first attempt with wrong sig" from "replay attempt".
-fn check_replay(
-    cache: &replay_cache::ReplayCache,
-    signature_hex: &str,
-    expires_at: std::time::Instant,
-    resource: Option<&str>,
-) -> std::result::Result<(), SigV4Rejection> {
-    let Some(sig_bytes) = replay_cache::decode_signature_hex(signature_hex) else {
-        // Verification already accepted this signature, so it should be 64
-        // hex chars. Treat any deviation as a server-side bug rather than
-        // accepting silently — fail closed.
-        return Err(SigV4Rejection {
-            response: crate::s3resp::signature_does_not_match(
-                "the request signature we calculated does not match the signature you provided",
-                resource,
-            ),
-            reason:   format!(
-                "internal: verified signature is not 64-char hex (len={})",
-                signature_hex.len()
-            ),
-        });
-    };
-    if cache.check_and_record_until(sig_bytes, expires_at).is_err() {
-        return Err(SigV4Rejection {
-            response: crate::s3resp::signature_does_not_match(
-                "the request signature we calculated does not match the signature you provided",
-                resource,
-            ),
-            reason:   "replay: signature already seen within window".to_string(),
-        });
-    }
-    Ok(())
-}
-
-/// Compute the cache expiry for a header-signed request. The signature
-/// stays verifiable until `x-amz-date + HEADER_SIGV4_MAX_SKEW`, so we
-/// keep the cache entry alive until +1s past that — the entry expires
-/// exactly when (or just after) the signature does, regardless of which
-/// side has clock drift.
-///
-/// Falls back to `now + cache.ttl()` if `x-amz-date` is missing or
-/// unparseable. This should not happen on a path that already passed
-/// `verify_sigv4_header_only` (which parses the same header) but is
-/// defensive.
-fn header_signed_replay_expiry(
-    headers: &HeaderMap,
-    cache: &replay_cache::ReplayCache,
-) -> std::time::Instant {
-    let now_instant = std::time::Instant::now();
-    let fallback = now_instant + cache.ttl();
-
-    let amz_date = headers.get("x-amz-date").and_then(|v| v.to_str().ok());
-    let Some(amz_date) = amz_date else { return fallback };
-    let Ok((_, _, signing_time)) = parse_amz_date(amz_date.trim()) else {
-        return fallback;
-    };
-
-    // Target wall-clock instant: signing_time + HEADER_SIGV4_MAX_SKEW + 1s.
-    let target_systime = signing_time + HEADER_SIGV4_MAX_SKEW + Duration::from_secs(1);
-    let now_systime = SystemTime::now();
-
-    // Convert wall-clock target to a monotonic `Instant`. `duration_since`
-    // returns Err if `target < now_systime` (the cache entry should
-    // already have expired); fall back to ttl in that pathological case.
-    match target_systime.duration_since(now_systime) {
-        Ok(delta) => now_instant + delta,
-        Err(_) => fallback,
-    }
 }
 
 /// Why a SigV4 verification was rejected, paired with the S3-XML response to send back.

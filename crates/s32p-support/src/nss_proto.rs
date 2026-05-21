@@ -16,9 +16,8 @@
 //! 1-byte length field is sufficient. Each connection is a stream of
 //! independent request/response pairs.
 //!
-//! This module is intentionally sync / tokio-free (same convention as
-//! `replay_cache`). Async wire I/O lives in the proxy and gateway crates,
-//! which already depend on tokio.
+//! This module is intentionally sync / tokio-free. Async wire I/O lives in
+//! the proxy and gateway crates, which already depend on tokio.
 
 /// Prefix that distinguishes a Linux abstract-namespace socket name from a
 /// filesystem path in the `S32P_NSS_PROXY_SOCK` env var.

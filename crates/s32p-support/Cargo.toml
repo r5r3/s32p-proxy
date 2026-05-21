@@ -16,9 +16,6 @@ aws-smithy-runtime-api = "1.9"
 constant_time_eq = "0.5"
 time = { workspace = true }
 
-# in-memory replay cache for SigV4 signatures
-dashmap = "6"
-
 # shared classifier parses query params
 url = { workspace = true }
 percent-encoding = "2"

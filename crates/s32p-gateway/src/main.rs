@@ -114,14 +114,6 @@ struct Cfg {
     #[cfg(feature = "lustre")]
     lustre_max_stripe_count: u32,
     virtual_hosted_suffixes: Vec<String>,
-    /// In-memory cache of recently-verified SigV4 signatures. Each
-    /// successful verify is recorded; requests carrying the same
-    /// signature within the TTL window are rejected as replays. The
-    /// proxy has its own cache for paths it validates locally; the two
-    /// cover disjoint traffic (proxy: CreateSession, NotImplemented,
-    /// AwsCompat, session-credential, spawn-gating; gateway: every
-    /// forwarded request once the worker is warm).
-    replay_cache:            Arc<s32p_support::replay_cache::ReplayCache>,
     /// Per-spawn secret shared with the proxy. The proxy attaches it as
     /// `X-S32P-Validated: <worker_token>` when forwarding a session-validated
     /// request; the worker uses the comparison to short-circuit SigV4
@@ -270,12 +262,6 @@ fn load_cfg() -> Result<Cfg> {
     // work end-to-end, but normal long-term-credential traffic does.
     let worker_token = std::env::var("S32P_WORKER_TOKEN").unwrap_or_default();
 
-    let replay_cache = Arc::new(s32p_support::replay_cache::ReplayCache::new());
-    tracing::info!(
-        ttl_secs = replay_cache.ttl().as_secs(),
-        "sigv4 replay cache initialized"
-    );
-
     Ok(Cfg {
         bind_addr,
         bind_uds,
@@ -295,7 +281,6 @@ fn load_cfg() -> Result<Cfg> {
         virtual_hosted_suffixes,
         bucket_acl,
         worker_token,
-        replay_cache,
     })
 }
 
@@ -601,7 +586,6 @@ fn require_sigv4(
         Some(&cfg.access_key),
         &cfg.secret_key,
         Some(req.uri().path()),
-        Some(&cfg.replay_cache),
     )
 }
 
@@ -4128,30 +4112,6 @@ async fn async_main() -> Result<()> {
     );
     // Sweeper is started lazily from the first request handler — the
     // tokio runtime is up by then. Mirrors `SessionStore::start_cleanup`.
-
-    // Replay-cache sweeper: we are inside the tokio runtime now, so spawn
-    // directly. Sweeps at half the TTL so any expired entry survives at
-    // most one half-window of stale memory.
-    {
-        let cache = Arc::clone(&cfg.replay_cache);
-        let interval = cache.ttl() / 2;
-        tokio::spawn(async move {
-            let mut t = tokio::time::interval(interval);
-            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                t.tick().await;
-                let stats = cache.sweep();
-                tracing::debug!(
-                    before = stats.before,
-                    after = stats.after,
-                    removed = stats.removed,
-                    elapsed_us = stats.elapsed.as_micros() as u64,
-                    "replay-cache sweep"
-                );
-            }
-        });
-        tracing::info!(interval_secs = interval.as_secs(), "replay-cache sweeper started");
-    }
 
     // NSS lookup client. Connects to the proxy's abstract socket when
     // `S32P_NSS_PROXY_SOCK` is set; otherwise falls back to local

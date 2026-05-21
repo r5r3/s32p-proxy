@@ -42,15 +42,7 @@ workers:
     landlock_strict: true
 
   lifecycle:
-    # Must exceed the replay cache's worst-case entry lifetime
-    # (2 × HEADER_SIGV4_MAX_SKEW + 1s = 1801s). Header-signed entries
-    # are anchored on the client's x-amz-date, so when the server
-    # clock lags the client by the full skew, an entry can live
-    # almost twice the skew. A worker torn down inside that window
-    # would leave the next-spawned worker with an empty cache, letting
-    # an attacker replay a captured fast-path request. The proxy
-    # refuses to start if this is set below 1801.
-    idle_timeout_secs: 2400
+    idle_timeout_secs: 600
     sweep_interval_secs: 10
 
   profiles:
