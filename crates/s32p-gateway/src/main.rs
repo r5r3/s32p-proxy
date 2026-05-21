@@ -31,7 +31,7 @@ use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use httpdate::fmt_http_date;
 use hyper::{HeaderMap, body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use s32p_support::{
     self,
     preconditions::{
@@ -1045,17 +1045,22 @@ fn acl_request_world_readable_intent(
 /// without leaving room for memory-pressure abuse.
 pub(crate) const XML_BODY_MAX_BYTES: usize = 1 * 1024 * 1024;
 
-/// Max wall-clock time the client has to deliver the full request-line +
-/// headers after a connection is established. Closes the slow-loris path
-/// (open a socket, dribble headers one byte at a time, tie up an FD + a
-/// Hyper task forever). 15 s is generous for a well-behaved client over a
-/// poor link and far below what an attacker needs to be useful.
-const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Cap on header count per request. Hyper's default is no cap, so a
 /// hostile client can advertise tens of thousands of headers to inflate
 /// per-connection memory. 64 headers comfortably fits any S3 client we
 /// know of (boto3, aws-cli, rclone, mountpoint-s3, s5cmd all send <30).
+///
+/// Note: there is intentionally no `header_read_timeout` on the gateway
+/// listener. Hyper's `header_read_timeout` is consulted at the start of
+/// every header read — including the post-keepalive "waiting for next
+/// request" read — so it doubles as a keep-alive idle timeout, which
+/// would close idle proxy↔gateway connections and force pingora to
+/// reconnect on the next request. The gateway is always behind the
+/// proxy (UDS by default, local TCP otherwise), and the proxy already
+/// reads the full request headers before forwarding, so slowloris from
+/// the proxy isn't a credible threat. The public-internet slowloris
+/// gate lives at the proxy listener (Pingora `set_keepalive(60s)` from
+/// `early_request_filter`).
 const MAX_REQUEST_HEADERS: usize = 64;
 
 /// Outcome of [`collect_body_capped`].
@@ -4310,8 +4315,6 @@ async fn async_main() -> Result<()> {
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(HEADER_READ_TIMEOUT)
                     .max_headers(MAX_REQUEST_HEADERS)
                     .serve_connection(io, svc)
                     .await
@@ -4345,8 +4348,6 @@ async fn async_main() -> Result<()> {
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
-                    .timer(TokioTimer::new())
-                    .header_read_timeout(HEADER_READ_TIMEOUT)
                     .max_headers(MAX_REQUEST_HEADERS)
                     .serve_connection(io, svc)
                     .await
