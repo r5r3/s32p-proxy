@@ -251,10 +251,14 @@ impl ProxyHttp for S3ProxyApp {
             Some(a) => (key, a),
             None => match self.routing.class_map.get("other") {
                 Some(a) => {
-                    tracing::debug!(
+                    // Surface routing-config gaps so operators don't silently
+                    // route a new class (e.g. `service`) through the
+                    // catch-all `other` arm. Repeated noise here is a
+                    // hint to add an explicit entry to `routing.class_map`.
+                    tracing::warn!(
                         requested_class = key,
                         fallback_class = "other",
-                        "no routing configured for class; falling back to 'other'"
+                        "no routing configured for class; falling back to 'other' — add an explicit class_map entry"
                     );
                     ("other", a)
                 }
@@ -293,6 +297,30 @@ impl ProxyHttp for S3ProxyApp {
             host = host.as_deref().unwrap_or("<missing-host>"),
             "incoming request"
         );
+
+        // Surface request shapes the classifier doesn't recognise.
+        // `S3Op::Other` is the fallback bucket for verbs/paths/queries we
+        // haven't explicitly classified — finding them in production logs
+        // lets us decide whether to add an explicit branch (with its own
+        // class key) or accept routing them via `class_map.other`. Includes
+        // `user_agent` to identify the source client and `action` to show
+        // where the request is being routed today.
+        if matches!(class.op, s32p_support::classifier::S3Op::Other) {
+            let user_agent = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<missing>");
+            tracing::warn!(
+                method = method,
+                path = path,
+                query = %query_log,
+                host = host.as_deref().unwrap_or("<missing-host>"),
+                user_agent = user_agent,
+                action = ?action,
+                "request classified as Other (unrecognised S3 op shape); consider adding an explicit classifier branch"
+            );
+        }
 
         // 1) Extract access key cheaply (no SigV4 check yet)
         let access_key = match s32p_support::extract_access_key_from_request(&req.uri, &req.headers)
