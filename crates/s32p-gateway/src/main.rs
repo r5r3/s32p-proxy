@@ -31,7 +31,7 @@ use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use httpdate::fmt_http_date;
 use hyper::{HeaderMap, body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use s32p_support::{
     self,
     preconditions::{
@@ -1038,6 +1038,82 @@ fn acl_request_world_readable_intent(
     s32p_support::s3xml::parse_put_acl_request_world_readable(body).map_err(|e| e.to_string())
 }
 
+/// Hard cap on XML-shaped S3 control-plane bodies (PutObjectAcl,
+/// PutBucketAcl, DeleteObjects, CompleteMultipartUpload). The largest
+/// realistic body is DeleteObjects at 1000 keys, which is ~256 KiB at
+/// 256 B/key; 1 MiB gives generous headroom for unusual key lengths
+/// without leaving room for memory-pressure abuse.
+pub(crate) const XML_BODY_MAX_BYTES: usize = 1 * 1024 * 1024;
+
+/// Max wall-clock time the client has to deliver the full request-line +
+/// headers after a connection is established. Closes the slow-loris path
+/// (open a socket, dribble headers one byte at a time, tie up an FD + a
+/// Hyper task forever). 15 s is generous for a well-behaved client over a
+/// poor link and far below what an attacker needs to be useful.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap on header count per request. Hyper's default is no cap, so a
+/// hostile client can advertise tens of thousands of headers to inflate
+/// per-connection memory. 64 headers comfortably fits any S3 client we
+/// know of (boto3, aws-cli, rclone, mountpoint-s3, s5cmd all send <30).
+const MAX_REQUEST_HEADERS: usize = 64;
+
+/// Outcome of [`collect_body_capped`].
+pub(crate) enum BodyCapErr {
+    /// Body advertised or streamed more than the cap. `advertised` carries
+    /// the `Content-Length` value if that was the trigger (for log detail),
+    /// `None` if it was a streaming overrun.
+    TooLarge { advertised: Option<u64> },
+    /// Underlying body read error (network, decoder, etc.).
+    Read(String),
+}
+
+/// Collect an Incoming body into [`Bytes`], refusing bodies above `cap`.
+///
+/// Two-stage rejection:
+/// - **Pre-read**: if `Content-Length` is present and exceeds `cap`, reject
+///   without touching the body. Closes the "advertise 1 GiB, dribble" path.
+/// - **Streaming**: wrap in [`http_body_util::Limited`] so a body without
+///   `Content-Length` (or one that lies about it) is cut off as soon as the
+///   running total crosses `cap`.
+///
+/// On success returns the collected bytes (at most `cap`).
+/// Check `Content-Length` against `cap`. Returns the advertised value if it
+/// would exceed the cap (caller should reject before reading the body), or
+/// `None` if the header is absent / non-numeric / within budget. Factored out
+/// so it's unit-testable without constructing a [`hyper::body::Incoming`].
+fn content_length_over_cap(headers: &HeaderMap, cap: usize) -> Option<u64> {
+    let advertised = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())?;
+    (advertised > cap as u64).then_some(advertised)
+}
+
+pub(crate) async fn collect_body_capped(
+    headers: &HeaderMap,
+    body: Incoming,
+    cap: usize,
+) -> Result<Bytes, BodyCapErr> {
+    if let Some(advertised) = content_length_over_cap(headers, cap) {
+        return Err(BodyCapErr::TooLarge {
+            advertised: Some(advertised),
+        });
+    }
+
+    let limited = http_body_util::Limited::new(body, cap);
+    match limited.collect().await {
+        Ok(c) => Ok(c.to_bytes()),
+        Err(e) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                Err(BodyCapErr::TooLarge { advertised: None })
+            } else {
+                Err(BodyCapErr::Read(e.to_string()))
+            }
+        }
+    }
+}
+
 async fn handle_put_object_acl(
     req: Request<Incoming>,
     app: Arc<App>,
@@ -1090,9 +1166,24 @@ async fn handle_put_object_acl(
     let current = (std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o004) != 0;
 
     let (parts, body) = req.into_parts();
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
+    let collected = match collect_body_capped(&parts.headers, body, XML_BODY_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyCapErr::TooLarge { advertised }) => {
+            tracing::debug!(
+                op = "PutObjectAcl",
+                advertised = ?advertised,
+                cap = XML_BODY_MAX_BYTES,
+                "request body exceeds XML body cap"
+            );
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "request body too large",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+        Err(BodyCapErr::Read(e)) => {
             return s32p_support::s3resp::invalid_request(
                 &format!("failed to read body: {e}"),
                 Some(parts.uri.path()),
@@ -1172,9 +1263,24 @@ async fn handle_put_bucket_acl(
     let current = (std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o004) != 0;
 
     let (parts, body) = req.into_parts();
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
+    let collected = match collect_body_capped(&parts.headers, body, XML_BODY_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyCapErr::TooLarge { advertised }) => {
+            tracing::debug!(
+                op = "PutBucketAcl",
+                advertised = ?advertised,
+                cap = XML_BODY_MAX_BYTES,
+                "request body exceeds XML body cap"
+            );
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "request body too large",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+        Err(BodyCapErr::Read(e)) => {
             return s32p_support::s3resp::invalid_request(
                 &format!("failed to read body: {e}"),
                 Some(parts.uri.path()),
@@ -3931,10 +4037,26 @@ async fn handle_delete_objects(
 
     let (parts, body) = req.into_parts();
 
-    // Read entire XML body (DeleteObjects bodies are small; S3 limits to 1000 keys)
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
+    // Read entire XML body. S3 limits DeleteObjects to 1000 keys; XML_BODY_MAX_BYTES
+    // (1 MiB) caps the worst-case allocation before the body is touched.
+    let collected = match collect_body_capped(&parts.headers, body, XML_BODY_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyCapErr::TooLarge { advertised }) => {
+            tracing::debug!(
+                op = "DeleteObjects",
+                advertised = ?advertised,
+                cap = XML_BODY_MAX_BYTES,
+                "request body exceeds XML body cap"
+            );
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "request body too large",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+        Err(BodyCapErr::Read(e)) => {
             return s32p_support::s3resp::s3_error(
                 StatusCode::BAD_REQUEST,
                 s32p_support::s3xml::error_code::INVALID_REQUEST,
@@ -4188,6 +4310,9 @@ async fn async_main() -> Result<()> {
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_READ_TIMEOUT)
+                    .max_headers(MAX_REQUEST_HEADERS)
                     .serve_connection(io, svc)
                     .await
                 {
@@ -4220,6 +4345,9 @@ async fn async_main() -> Result<()> {
                 if let Err(e) = http1::Builder::new()
                     .max_buf_size(8 * 1024 * 1024)
                     .writev(true)
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_READ_TIMEOUT)
+                    .max_headers(MAX_REQUEST_HEADERS)
                     .serve_connection(io, svc)
                     .await
                 {
@@ -4333,5 +4461,64 @@ mod tests {
         let (is_streaming, logical) = compute_logical_len(&h).unwrap();
         assert!(!is_streaming);
         assert_eq!(logical, 5678);
+    }
+
+    fn cl_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(http::header::CONTENT_LENGTH, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn content_length_under_cap_returns_none() {
+        let h = cl_headers("1024");
+        assert_eq!(content_length_over_cap(&h, XML_BODY_MAX_BYTES), None);
+    }
+
+    #[test]
+    fn content_length_equal_to_cap_returns_none() {
+        // The cap is inclusive — a body of exactly XML_BODY_MAX_BYTES is
+        // accepted. Documenting the boundary so a future "≤ vs <" change is
+        // a deliberate, test-visible decision.
+        let h = cl_headers(&XML_BODY_MAX_BYTES.to_string());
+        assert_eq!(content_length_over_cap(&h, XML_BODY_MAX_BYTES), None);
+    }
+
+    #[test]
+    fn content_length_one_over_cap_rejected() {
+        let v = (XML_BODY_MAX_BYTES + 1).to_string();
+        let h = cl_headers(&v);
+        assert_eq!(
+            content_length_over_cap(&h, XML_BODY_MAX_BYTES),
+            Some(XML_BODY_MAX_BYTES as u64 + 1)
+        );
+    }
+
+    #[test]
+    fn content_length_huge_value_rejected() {
+        // The realistic DoS path: client claims a gigabyte body.
+        let h = cl_headers("1073741824");
+        assert_eq!(
+            content_length_over_cap(&h, XML_BODY_MAX_BYTES),
+            Some(1_073_741_824)
+        );
+    }
+
+    #[test]
+    fn content_length_absent_treated_as_unknown() {
+        // No Content-Length is legal (chunked, etc.). Pre-check passes;
+        // the streaming wrap in collect_body_capped catches over-cap bodies
+        // during read.
+        let h = HeaderMap::new();
+        assert_eq!(content_length_over_cap(&h, XML_BODY_MAX_BYTES), None);
+    }
+
+    #[test]
+    fn content_length_garbage_treated_as_absent() {
+        // A non-numeric or negative Content-Length is malformed but we
+        // don't reject on it here — hyper will reject the request earlier
+        // in the parse path. The cap check just falls through to streaming.
+        let h = cl_headers("not-a-number");
+        assert_eq!(content_length_over_cap(&h, XML_BODY_MAX_BYTES), None);
     }
 }

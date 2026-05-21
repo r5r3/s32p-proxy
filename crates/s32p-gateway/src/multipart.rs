@@ -13,7 +13,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{Request, StatusCode, request::Parts};
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use s32p_support::{
     preconditions::{PreconditionOutcome, evaluate_write_preconditions, parse_conditional_headers},
@@ -1542,11 +1541,34 @@ async fn handle_complete(
     // Extract headers before moving req
     let headers = req.headers().clone();
 
-    // Read and parse complete body
+    // Read and parse complete body. XML_BODY_MAX_BYTES (1 MiB) caps the
+    // CompleteMultipartUpload XML body before allocation — even at the
+    // 10,000-part S3 cap, the part list comfortably fits.
     let (parts, body) = req.into_parts();
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
+    let collected = match crate::collect_body_capped(
+        &parts.headers,
+        body,
+        crate::XML_BODY_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(crate::BodyCapErr::TooLarge { advertised }) => {
+            tracing::debug!(
+                op = "CompleteMultipartUpload",
+                advertised = ?advertised,
+                cap = crate::XML_BODY_MAX_BYTES,
+                "request body exceeds XML body cap"
+            );
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "request body too large",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+        Err(crate::BodyCapErr::Read(e)) => {
             return s32p_support::s3resp::s3_error(
                 StatusCode::BAD_REQUEST,
                 s32p_support::s3xml::error_code::INVALID_REQUEST,
