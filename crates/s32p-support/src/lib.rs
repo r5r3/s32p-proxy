@@ -332,6 +332,8 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
     let signed_headers = signed_headers.ok_or_else(|| anyhow!("missing X-Amz-SignedHeaders"))?;
     let signature = signature.ok_or_else(|| anyhow!("missing X-Amz-Signature"))?;
 
+    require_host_signed(&signed_headers)?;
+
     // Credential = access_key/YYYYMMDD/region/service/aws4_request
     let mut it = credential.split('/');
     let access_key = it.next().ok_or_else(|| anyhow!("bad X-Amz-Credential"))?.to_string();
@@ -571,6 +573,26 @@ pub fn verify_sigv4_presigned_url(
     ))
 }
 
+/// Audit finding M7: AWS SigV4 mandates that `host` appear in the
+/// `SignedHeaders` list. Without this check a client can omit `host`
+/// from the signature, sign a request, then mutate the Host header in
+/// the wire request to swap routing — and the signature still verifies
+/// because the canonical request never included Host.
+///
+/// Called from both [`parse_authorization`] and [`parse_presigned_query`]
+/// so the requirement holds for header-signed and presigned-URL paths.
+fn require_host_signed(signed_headers: &str) -> Result<()> {
+    let has_host = signed_headers
+        .split(';')
+        .any(|h| h.trim().eq_ignore_ascii_case("host"));
+    if !has_host {
+        return Err(anyhow!(
+            "SignedHeaders must include 'host' (AWS SigV4 requirement)"
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
     let auth = headers
         .get("authorization")
@@ -603,6 +625,8 @@ pub fn parse_authorization(headers: &HeaderMap) -> Result<SigV4Auth> {
     let credential = credential.ok_or_else(|| anyhow!("missing Credential"))?;
     let signed_headers = signed_headers.ok_or_else(|| anyhow!("missing SignedHeaders"))?;
     let signature = signature.ok_or_else(|| anyhow!("missing Signature"))?;
+
+    require_host_signed(&signed_headers)?;
 
     // Credential = access_key/YYYYMMDD/region/service/aws4_request
     let mut it = credential.split('/');
@@ -1117,5 +1141,85 @@ mod fastfail_tests {
     #[test]
     fn scope_date_non_digit_rejected() {
         assert!(validate_sigv4_format(GOOD_SIG, "2026May2").is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_signed_tests {
+    //! Audit finding M7: AWS SigV4 requires `host` in the `SignedHeaders`
+    //! list. The check sits in `parse_authorization` / `parse_presigned_query`
+    //! so both header-signed and presigned-URL paths reject before
+    //! reaching the HMAC step.
+    use http::{HeaderMap, HeaderValue, Uri};
+
+    use super::{parse_authorization, parse_presigned_query};
+
+    const CRED: &str =
+        "AKIAIOSFODNN7EXAMPLE/20260521/us-east-1/s3/aws4_request";
+    const SIG: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn auth_header(signed_headers: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let v = format!(
+            "AWS4-HMAC-SHA256 Credential={CRED}, SignedHeaders={signed_headers}, Signature={SIG}"
+        );
+        h.insert("authorization", HeaderValue::from_str(&v).unwrap());
+        h
+    }
+
+    fn presign_uri(signed_headers: &str) -> Uri {
+        let q = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential={CRED}\
+             &X-Amz-Date=20260521T120000Z\
+             &X-Amz-Expires=3600\
+             &X-Amz-SignedHeaders={signed_headers}\
+             &X-Amz-Signature={SIG}",
+        );
+        format!("/bucket/key?{q}").parse().unwrap()
+    }
+
+    #[test]
+    fn header_auth_with_host_accepted() {
+        parse_authorization(&auth_header("host;x-amz-content-sha256;x-amz-date"))
+            .expect("host present → ok");
+    }
+
+    #[test]
+    fn header_auth_without_host_rejected() {
+        let err = parse_authorization(&auth_header("x-amz-content-sha256;x-amz-date"))
+            .expect_err("no host → reject");
+        assert!(
+            err.to_string().to_lowercase().contains("host"),
+            "error should name host: {err}"
+        );
+    }
+
+    #[test]
+    fn header_auth_uppercase_host_accepted() {
+        // Some clients emit `Host` with a capital H in SignedHeaders.
+        // AWS canonical form is lowercase; the check is case-insensitive
+        // to avoid spurious rejections at the parse layer (the HMAC step
+        // is what actually compares bytes).
+        parse_authorization(&auth_header("Host;x-amz-date"))
+            .expect("uppercase Host → ok");
+    }
+
+    #[test]
+    fn presign_with_host_accepted() {
+        parse_presigned_query(&presign_uri("host%3Bx-amz-date"))
+            .expect("parse should not error")
+            .expect("presigned auth should be present");
+    }
+
+    #[test]
+    fn presign_without_host_rejected() {
+        let err = parse_presigned_query(&presign_uri("x-amz-date"))
+            .expect_err("no host → reject");
+        assert!(
+            err.to_string().to_lowercase().contains("host"),
+            "error should name host: {err}"
+        );
     }
 }
