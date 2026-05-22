@@ -40,6 +40,16 @@ type Resp = s32p_support::s3resp::HttpResponse;
 
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// AWS S3 spec parity: a single multipart upload may have at most 10,000
+/// parts. The gateway has no inherent reason to cap part *size* or final
+/// object size — POSIX quotas on the backing filesystem already bound
+/// total bytes written — but a part-number cap is still load-bearing:
+/// it (a) keeps SDKs that internally allocate `Vec<Part>` of size 10_000
+/// from misbehaving when ListParts returns a higher number, and (b)
+/// implicitly bounds `UploadMeta::parts` (BTreeMap by distinct part
+/// number) to ~10_000 entries — a few MB of meta.json at worst.
+pub(crate) const MAX_PARTS_PER_UPLOAD: u32 = 10_000;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 enum UploadState {
@@ -650,10 +660,10 @@ async fn handle_upload_part(
             None,
         );
     }
-    if part_number == 0 {
+    if part_number == 0 || part_number > MAX_PARTS_PER_UPLOAD {
         return s32p_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
             "invalid partNumber",
             Some(req.uri().path()),
             None,
@@ -1043,10 +1053,10 @@ async fn handle_upload_part_copy(
             None,
         );
     }
-    if part_number == 0 {
+    if part_number == 0 || part_number > MAX_PARTS_PER_UPLOAD {
         return s32p_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
             "invalid partNumber",
             Some(req.uri().path()),
             None,
@@ -1629,6 +1639,15 @@ async fn handle_complete(
 
     // Validate parts exist
     let last_pn = *requested_parts.last().unwrap();
+    if last_pn > MAX_PARTS_PER_UPLOAD {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+            "invalid partNumber",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
     // Require contiguous 1..last_pn (typical S3 expectation; simplifies direct layout).
     if requested_parts.len() != last_pn as usize || requested_parts[0] != 1 {
         return s32p_support::s3resp::s3_error(
@@ -2327,4 +2346,24 @@ async fn handle_complete(
     let etag = crate::format_inode_etag(m.ino());
 
     s32p_support::s3resp::complete_multipart_upload_ok(&location, bucket, key, &etag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_parts_per_upload_matches_aws_spec() {
+        assert_eq!(MAX_PARTS_PER_UPLOAD, 10_000);
+    }
+
+    #[test]
+    fn part_number_bounds() {
+        let in_range = |pn: u32| pn != 0 && pn <= MAX_PARTS_PER_UPLOAD;
+        assert!(!in_range(0));
+        assert!(in_range(1));
+        assert!(in_range(MAX_PARTS_PER_UPLOAD));
+        assert!(!in_range(MAX_PARTS_PER_UPLOAD + 1));
+        assert!(!in_range(u32::MAX));
+    }
 }

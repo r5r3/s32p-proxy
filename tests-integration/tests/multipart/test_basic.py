@@ -145,3 +145,34 @@ def test_complete_with_part_gap_fails(client, bucket):
         except S3Error as cleanup_err:
             if cleanup_err.status != 404:
                 raise
+
+
+def test_upload_part_above_max_parts_rejected(client, bucket):
+    """AWS spec parity: a single multipart upload has at most 10,000 parts.
+    Part number 10001 must be rejected with 400 InvalidArgument and not
+    leave a part entry in the upload state."""
+    key = "mpu/part-cap.bin"
+    upload_id = client.create_multipart(bucket, key)
+    try:
+        with pytest.raises(S3Error) as exc:
+            client.upload_part(bucket, key, upload_id, 10_001, _make_part(1))
+        assert exc.value.status == 400, (
+            f"expected 400 InvalidArgument, got {exc.value!r}"
+        )
+    finally:
+        client.abort_multipart(bucket, key, upload_id)
+
+
+def test_upload_part_at_max_parts_accepted(client, bucket):
+    """Boundary: part number 10000 is the largest valid value and must
+    be accepted. The upload doesn't have to complete — we're pinning the
+    boundary, not the rest of the multipart contract."""
+    key = "mpu/part-cap-boundary.bin"
+    upload_id = client.create_multipart(bucket, key)
+    try:
+        etag = client.upload_part(
+            bucket, key, upload_id, 10_000, _make_part(1)
+        )
+        assert etag
+    finally:
+        client.abort_multipart(bucket, key, upload_id)
