@@ -31,6 +31,9 @@ StandardError=append:/var/log/s32p/s32p.log
 LimitNOFILE=1048576
 LimitMEMLOCK=infinity
 
+# Disable coredumps.
+LimitCORE=0
+
 Restart=on-failure
 RestartSec=5s
 
