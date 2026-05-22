@@ -1,4 +1,8 @@
-use std::fs;
+use std::{
+    fs::{self, OpenOptions, Permissions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -43,7 +47,25 @@ pub fn load_directory_yaml_file(path: &str) -> Result<DirectoryFileV1> {
     parse_directory_yaml_str(&s)
 }
 
+/// Write the directory file at mode 0600. New files are created with the
+/// strict mode from the outset (no transient world-readable window);
+/// existing files have their mode tightened after write.
+///
+/// The proxy rejects directory files with group/other bits at startup
+/// (audit finding H6; see `s32p_support::secret_file::stat_or_reject`),
+/// so any operator path that creates or updates the file must land here.
 pub fn save_directory_yaml_file(path: &str, doc: &DirectoryFileV1) -> Result<()> {
     let s = render_directory_yaml_string(doc)?;
-    fs::write(path, s).with_context(|| format!("write directory yaml file: {path}"))
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open directory yaml file: {path}"))?;
+    f.write_all(s.as_bytes())
+        .with_context(|| format!("write directory yaml file: {path}"))?;
+    fs::set_permissions(path, Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 directory yaml file: {path}"))?;
+    Ok(())
 }

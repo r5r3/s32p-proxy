@@ -48,6 +48,9 @@ pub mod nss_proto;
 /// gateway's standalone fallback.
 pub mod nss_lookup;
 
+/// Startup-time permission check for secret-bearing config files.
+pub mod secret_file;
+
 #[derive(Debug, Clone)]
 pub struct SigV4Auth {
     pub access_key:     String,

@@ -4,6 +4,8 @@ server:
   listen: "0.0.0.0:9000"
   public_scheme: "http"
   tls_cert_path: "etc/fullchain.pem"
+  # TLS private key. Mode 0600, owned by the proxy uid (no group/other bits).
+  # The proxy refuses to start if the check fails.
   tls_key_path: "etc/privkey.pem"
   region: "us-east-1"
   log_level: "s32p_proxy=debug,s32p_gateway=debug,pingora=info,pingora_proxy=info"
@@ -34,11 +36,16 @@ server:
 auth:
   backend: "yaml"
   yaml:
+    # Per-tenant secret-key store. Mode 0600, owned by the proxy uid (no
+    # group/other bits). `s32p-ctl` writes it at that mode by default; the
+    # proxy refuses to start if the check fails.
     path: "etc/directory.yaml"
   openbao:
     address: "http://127.0.0.1:5901"
     approle_mount: "approle"
+    # AppRole RoleID. Mode 0600, owned by the proxy uid.
     role_id_file: "etc/proxy-role-id-file"
+    # AppRole SecretID. Mode 0600, owned by the proxy uid.
     secret_id_file: "etc/proxy-secret-id-file"
     # Admin AppRole — used by `s32p-ctl --config <this-file>` only; ignored by the proxy.
     admin_role_id_file: "etc/admin-role-id-file"

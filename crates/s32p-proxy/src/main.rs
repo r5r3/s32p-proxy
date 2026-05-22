@@ -1034,16 +1034,22 @@ fn main() -> Result<()> {
     let inner_directory: Arc<dyn Directory> = match cfg.auth.backend {
         config::AuthBackend::Yaml => {
             let y = cfg.auth.yaml.as_ref().context("auth.yaml missing")?;
+            s32p_support::secret_file::stat_or_reject(std::path::Path::new(&y.path))
+                .context("auth.yaml.path")?;
             Arc::new(YamlDirectory::from_path(&y.path)?)
         }
         config::AuthBackend::OpenBao => {
             let o = cfg.auth.openbao.as_ref().context("auth.openbao missing")?;
 
+            s32p_support::secret_file::stat_or_reject(std::path::Path::new(&o.role_id_file))
+                .context("auth.openbao.role_id_file")?;
             let role_id = fs::read_to_string(&o.role_id_file)
                 .with_context(|| format!("failed to read role_id_file {}", o.role_id_file))?
                 .trim()
                 .to_string();
 
+            s32p_support::secret_file::stat_or_reject(std::path::Path::new(&o.secret_id_file))
+                .context("auth.openbao.secret_id_file")?;
             let secret_id = fs::read_to_string(&o.secret_id_file)
                 .with_context(|| format!("failed to read secret_id_file {}", o.secret_id_file))?
                 .trim()
@@ -1153,9 +1159,12 @@ fn main() -> Result<()> {
     let mut proxy = http_proxy_service(&server.configuration, app);
 
     if cfg.server.public_scheme == "https" {
+        let key_path = cfg.server.tls_key_path.as_ref().unwrap();
+        s32p_support::secret_file::stat_or_reject(std::path::Path::new(key_path))
+            .context("server.tls_key_path")?;
         let mut tls_settings = TlsSettings::intermediate(
             cfg.server.tls_cert_path.as_ref().unwrap(),
-            cfg.server.tls_key_path.as_ref().unwrap(),
+            key_path,
         )
         .context("failed to load TLS settings (check certificate/key paths and format)")?;
         tls_settings.enable_h2();

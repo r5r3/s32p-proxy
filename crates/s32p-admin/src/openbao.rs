@@ -444,8 +444,23 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     }
 
     pub async fn export_yaml_file(&self, path: &str) -> Result<()> {
+        use std::{
+            fs::{self, OpenOptions, Permissions},
+            io::Write,
+            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
         let s = self.export_yaml_string().await?;
-        std::fs::write(path, s).with_context(|| format!("write yaml file {path}"))?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open yaml file {path}"))?;
+        f.write_all(s.as_bytes())
+            .with_context(|| format!("write yaml file {path}"))?;
+        fs::set_permissions(path, Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 yaml file {path}"))?;
         Ok(())
     }
 

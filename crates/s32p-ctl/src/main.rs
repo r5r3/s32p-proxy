@@ -865,8 +865,7 @@ async fn async_main() -> Result<()> {
                 let src = require_yaml_path(&yaml_path)?;
                 let doc = load_yaml_or_default(&src)?;
                 let text = render_directory_yaml_string(&doc)?;
-                std::fs::write(&args.yaml, text)
-                    .with_context(|| format!("write {}", args.yaml.display()))?;
+                write_secret_file(&args.yaml, &text)?;
                 println!("ok");
             }
         },
