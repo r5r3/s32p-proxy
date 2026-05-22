@@ -237,7 +237,7 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
 
     // Token auth takes precedence
     if let Some(t) = &conn.auth.token {
-        return Ok(OpenBaoAdmin::new_token(address, t.clone(), kv_mount, prefix));
+        return OpenBaoAdmin::new_token(address, t.clone(), kv_mount, prefix);
     }
 
     // Otherwise AppRole auth
@@ -253,7 +253,7 @@ async fn openbao_admin(conn: &OpenBaoConnArgs) -> Result<OpenBaoAdmin> {
         _ => return Err(anyhow!("missing auth: provide --token or --secret-id/--secret-id-file")),
     };
 
-    Ok(OpenBaoAdmin::new_approle(address, approle_mount, role_id, secret_id, kv_mount, prefix))
+    OpenBaoAdmin::new_approle(address, approle_mount, role_id, secret_id, kv_mount, prefix)
 }
 
 /* ------------------- setup ------------------- */

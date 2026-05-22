@@ -10,7 +10,7 @@ use crate::{
         layout::{DirectoryLayout, IndexDoc},
         posix_groups::groups_for_user,
     },
-    openbao_client::OpenBaoClient,
+    openbao_client::{OpenBaoClient, build_openbao_http_client},
 };
 
 #[derive(Clone)]
@@ -28,12 +28,19 @@ impl OpenBaoDirectory {
         secret_id: String,
         kv_mount: String,
         prefix: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let http = build_openbao_http_client()?;
+        Ok(Self {
             kv_mount: trim_slashes(&kv_mount),
             layout:   DirectoryLayout::new(prefix),
-            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
-        }
+            client:   OpenBaoClient::new_approle(
+                address,
+                approle_mount,
+                role_id,
+                secret_id,
+                http,
+            ),
+        })
     }
 
     fn effective_access(

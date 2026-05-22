@@ -5,7 +5,7 @@ pub use s32p_directory::openbao_client::OpenBaoAuth;
 use s32p_directory::{
     DirectoryFileV1,
     directory::layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key},
-    openbao_client::OpenBaoClient,
+    openbao_client::{OpenBaoClient, build_openbao_http_client},
     parse_directory_yaml_str, render_directory_yaml_string,
     types::{AclEntry, BucketDoc, Principal, UserDoc},
 };
@@ -39,12 +39,13 @@ impl OpenBaoAdmin {
         token: impl Into<String>,
         kv_mount: impl Into<String>,
         prefix: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let http = build_openbao_http_client()?;
+        Ok(Self {
             kv_mount: trim_slashes(&kv_mount.into()),
             layout:   DirectoryLayout::new(prefix.into()),
-            client:   OpenBaoClient::new_token(address, token),
-        }
+            client:   OpenBaoClient::new_token(address, token, http),
+        })
     }
 
     pub fn new_approle(
@@ -54,12 +55,19 @@ impl OpenBaoAdmin {
         secret_id: impl Into<String>,
         kv_mount: impl Into<String>,
         prefix: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let http = build_openbao_http_client()?;
+        Ok(Self {
             kv_mount: trim_slashes(&kv_mount.into()),
             layout:   DirectoryLayout::new(prefix.into()),
-            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id),
-        }
+            client:   OpenBaoClient::new_approle(
+                address,
+                approle_mount,
+                role_id,
+                secret_id,
+                http,
+            ),
+        })
     }
 
     pub fn kv_mount(&self) -> &str {
@@ -79,7 +87,8 @@ impl OpenBaoAdmin {
         kv_mount: String,
         prefix: String,
     ) -> Result<SetupResult> {
-        let client = OpenBaoClient::new_token(address, root_token);
+        let http = build_openbao_http_client()?;
+        let client = OpenBaoClient::new_token(address, root_token, http);
 
         let kv_mount = trim_slashes(&kv_mount);
         let prefix = trim_slashes(&prefix);

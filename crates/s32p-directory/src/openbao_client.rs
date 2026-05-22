@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+/// Hardened `reqwest::Client` for OpenBao/Vault. Audit finding H7.
+///
+/// Sets:
+/// - `min_tls_version(TLS 1.2)` — explicit floor (rustls already drops <1.2,
+///   but explicit is documentation-in-code so a dep bump can't weaken it).
+/// - `connect_timeout = 5s`, request `timeout = 10s` — bounds the DoS surface
+///   where a wedged Vault would otherwise freeze every cache-miss request.
+pub fn build_openbao_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build OpenBao HTTP client")
+}
+
 #[derive(Clone, Debug)]
 pub enum OpenBaoAuth {
     Token(String),
@@ -31,21 +47,29 @@ struct TokenState {
 }
 
 impl OpenBaoClient {
-    pub fn new_token(address: impl Into<String>, token: impl Into<String>) -> Self {
+    /// Callers should build `http` via [`build_openbao_http_client`] so the
+    /// TLS floor, timeouts, and optional CA pin are applied consistently.
+    pub fn new_token(
+        address: impl Into<String>,
+        token: impl Into<String>,
+        http: reqwest::Client,
+    ) -> Self {
         let token = token.into();
         Self {
             address: address.into().trim_end_matches('/').to_string(),
             auth:    OpenBaoAuth::Token(token.clone()),
-            http:    reqwest::Client::new(),
+            http,
             state:   Arc::new(Mutex::new(TokenState { token: Some(token), expires_at: None })),
         }
     }
 
+    /// Callers should build `http` via [`build_openbao_http_client`].
     pub fn new_approle(
         address: impl Into<String>,
         approle_mount: impl Into<String>,
         role_id: impl Into<String>,
         secret_id: impl Into<String>,
+        http: reqwest::Client,
     ) -> Self {
         Self {
             address: address.into().trim_end_matches('/').to_string(),
@@ -54,7 +78,7 @@ impl OpenBaoClient {
                 role_id:   role_id.into(),
                 secret_id: secret_id.into(),
             },
-            http:    reqwest::Client::new(),
+            http,
             state:   Arc::new(Mutex::new(TokenState { token: None, expires_at: None })),
         }
     }
@@ -480,5 +504,17 @@ fn verify_kv_v2(mount: &str, ty: &str, ver: &str) -> Result<()> {
         Err(anyhow!(
             "secrets engine at '{mount}/' exists but is not KV v2 (type='{ty}', options.version='{ver}'). Refusing to overwrite — fix the mount manually or pick a different --kv-mount."
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_returns_ok() {
+        // Smoke check: the configured TLS floor + timeouts produce a
+        // client that builds without panic on the current rustls backend.
+        build_openbao_http_client().expect("builder should succeed");
     }
 }

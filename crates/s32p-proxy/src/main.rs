@@ -1062,7 +1062,7 @@ fn main() -> Result<()> {
                 secret_id,
                 o.kv_mount.clone(),
                 o.prefix.clone(),
-            ))
+            )?)
         }
     };
 
