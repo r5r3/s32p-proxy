@@ -240,9 +240,6 @@ path "{kv_mount}/metadata/{prefix}/*" {{
     /* ----------------------------- Users ----------------------------- */
 
     pub async fn upsert_user(&self, mut user: UserDoc) -> Result<()> {
-        if user.access_key.trim().is_empty() {
-            return Err(anyhow!("user.access_key must not be empty"));
-        }
         if user.secret_key.trim().is_empty() {
             return Err(anyhow!("user.secret_key must not be empty"));
         }
@@ -253,6 +250,11 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         user.access_key = user.access_key.trim().to_string();
         user.secret_key = user.secret_key.trim().to_string();
         user.username = user.username.trim().to_string();
+
+        // Access key is stored as a KV path segment (`users/<access_key>`) and
+        // must agree with the ACL access-key principal allowlist, so a created
+        // user can always be named by a grant. Rejects empty too.
+        s32p_directory::validate_access_key(&user.access_key)?;
 
         self.kv_put(&self.layout.user(&user.access_key), &user).await?;
         Ok(())
@@ -341,6 +343,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         bucket.id = bucket.id.trim().to_string();
         bucket.name = bucket.name.trim().to_string();
         bucket.data_path = bucket.data_path.trim().to_string();
+        s32p_directory::validate_acl(&bucket.acl)
+            .with_context(|| format!("bucket {} ({})", bucket.id, bucket.name))?;
         bucket.acl = normalize_acl(bucket.acl);
 
         let existing = self.kv_get_opt::<BucketDoc>(&self.layout.bucket(&bucket.id)).await?;

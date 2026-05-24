@@ -26,6 +26,17 @@ impl DirectoryFileV1 {
                 self.version
             ));
         }
+        for u in &self.users {
+            // Access key doubles as a KV path segment and must match the ACL
+            // access-key principal allowlist so every user can be named by a
+            // grant. Rejects empty too.
+            crate::directory::layout::validate_access_key(&u.access_key)
+                .with_context(|| format!("user {}", u.username))?;
+        }
+        for b in &self.buckets {
+            crate::directory::layout::validate_acl(&b.acl)
+                .with_context(|| format!("bucket {} ({})", b.id, b.name))?;
+        }
         Ok(())
     }
 }

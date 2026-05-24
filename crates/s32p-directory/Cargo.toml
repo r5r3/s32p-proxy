@@ -14,6 +14,8 @@ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macr
 libc = { workspace = true }
 s32p-support = { path = "../s32p-support" }
 
+regex = { workspace = true }
+
 # OpenBao/Vault HTTP API
 reqwest = { workspace = true }
 serde_json = { workspace = true }

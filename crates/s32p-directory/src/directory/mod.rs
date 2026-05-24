@@ -13,7 +13,10 @@ pub use file::{
     DirectoryFileV1, load_directory_yaml_file, parse_directory_yaml_str,
     render_directory_yaml_string, save_directory_yaml_file,
 };
-pub use layout::{DirectoryLayout, IndexDoc, normalize_acl, principal_key};
+pub use layout::{
+    DirectoryLayout, IndexDoc, normalize_acl, principal_key, validate_access_key, validate_acl,
+    validate_principal,
+};
 pub use types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc};
 
 #[async_trait]

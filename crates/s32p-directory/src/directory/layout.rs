@@ -1,8 +1,67 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
+use anyhow::{Result, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::directory::types::{AccessLevel, AclEntry, Principal};
+
+/// Allowed access-key principal: 1–128 chars of `[A-Za-z0-9_-]`. Excludes
+/// empty/whitespace/`/`/`.`/`*` so the value is safe as an OpenBao KV path
+/// segment (`users/<access_key>`, `index/access_key/<access_key>`) and can
+/// never be a path-traversal token or a "matches nothing" stray.
+static ACCESS_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,128}$").expect("valid access_key regex"));
+
+/// Allowed group-name principal: must start with `[A-Za-z0-9_]`, then up to 63
+/// more of `[A-Za-z0-9_.-]`. Permits typical POSIX group names (e.g.
+/// `s3-team`, `domain.users`) while excluding empty, leading separators, `/`,
+/// whitespace, and `*`. Leading-char rule means the value can never be `.` or
+/// `..`, keeping `index/group/<name>` traversal-safe.
+static GROUP_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$").expect("valid group regex"));
+
+/// Validate an access-key identifier against [`ACCESS_KEY_RE`]. Shared by user
+/// creation (`UserDoc.access_key`) and the ACL access-key principal so the two
+/// can never disagree — an access key you can create must also be one you can
+/// grant. Both store the value as an OpenBao KV path segment, so the
+/// character-set bound is also a path-traversal guard.
+pub fn validate_access_key(access_key: &str) -> Result<()> {
+    if !ACCESS_KEY_RE.is_match(access_key) {
+        bail!("invalid access_key {access_key:?}: must match {}", ACCESS_KEY_RE.as_str());
+    }
+    Ok(())
+}
+
+/// Reject ACL principals whose identifier is empty, a wildcard, or otherwise
+/// outside the allowed character set. Under the exact-equality ACL matcher an
+/// empty/`*` principal can never name a real caller, so it is always an
+/// operator mistake (a silently dead entry); the character-set bound also
+/// keeps both principal kinds safe as OpenBao KV path segments. Called at
+/// every ingestion point (YAML parse/render, `s32p-ctl` grant parsing, and
+/// the OpenBao admin write path) so neither backend can persist a bad entry.
+pub fn validate_principal(p: &Principal) -> Result<()> {
+    match p {
+        Principal::AccessKey { access_key } => validate_access_key(access_key)?,
+        Principal::GroupName { name } => {
+            if !GROUP_NAME_RE.is_match(name) {
+                bail!(
+                    "invalid ACL principal group_name {name:?}: must match {}",
+                    GROUP_NAME_RE.as_str()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every principal in an ACL. See [`validate_principal`].
+pub fn validate_acl(acl: &[AclEntry]) -> Result<()> {
+    for e in acl {
+        validate_principal(&e.principal)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct DirectoryLayout {
@@ -93,4 +152,72 @@ pub fn normalize_acl(acl: Vec<AclEntry>) -> Vec<AclEntry> {
 
     out.sort_by(|a, b| principal_key(&a.principal).cmp(&principal_key(&b.principal)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ak(s: &str) -> Principal {
+        Principal::AccessKey { access_key: s.to_string() }
+    }
+    fn grp(s: &str) -> Principal {
+        Principal::GroupName { name: s.to_string() }
+    }
+
+    #[test]
+    fn valid_access_keys_accepted() {
+        for s in ["TESTACCESSKEY123", "AKIA1234567890", "a", "user_1-2", &"k".repeat(128)] {
+            assert!(validate_principal(&ak(s)).is_ok(), "should accept access_key {s:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_access_keys_rejected() {
+        // empty, whitespace, wildcard, path separator, dot/traversal, control,
+        // and over-length all rejected.
+        for s in ["", " ", "ab cd", "*", "a/b", "..", "a.b", "key\n", &"k".repeat(129)] {
+            assert!(validate_principal(&ak(s)).is_err(), "should reject access_key {s:?}");
+        }
+    }
+
+    #[test]
+    fn valid_group_names_accepted() {
+        for s in ["s3-team", "domain.users", "_internal", "g1", &"g".repeat(64)] {
+            assert!(validate_principal(&grp(s)).is_ok(), "should accept group_name {s:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_group_names_rejected() {
+        // empty, wildcard, leading separator (can't become `.`/`..`), path
+        // separator, whitespace, and over-length all rejected.
+        for s in ["", "*", ".", "..", "-bad", ".hidden", "a/b", "team x", &"g".repeat(65)] {
+            assert!(validate_principal(&grp(s)).is_err(), "should reject group_name {s:?}");
+        }
+    }
+
+    #[test]
+    fn validate_access_key_matches_principal_rule() {
+        // User-creation validation must agree with the ACL access-key
+        // principal rule, so a created user can always be named by a grant.
+        for s in ["TESTACCESSKEY123", "user_1-2"] {
+            assert!(validate_access_key(s).is_ok());
+            assert!(validate_principal(&ak(s)).is_ok());
+        }
+        for s in ["", "*", "a/b", "..", "bad key"] {
+            assert!(validate_access_key(s).is_err());
+            assert!(validate_principal(&ak(s)).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_acl_reports_first_bad_entry() {
+        let acl = vec![
+            AclEntry { principal: ak("good"), access: AccessLevel::ReadOnly },
+            AclEntry { principal: ak(""), access: AccessLevel::ReadWrite },
+        ];
+        let err = validate_acl(&acl).unwrap_err().to_string();
+        assert!(err.contains("access_key"), "error should name the field: {err}");
+    }
 }

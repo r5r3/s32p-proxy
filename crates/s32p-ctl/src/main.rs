@@ -463,6 +463,8 @@ fn parse_grant(s: &str) -> Result<AclEntry> {
         other => return Err(anyhow!("invalid grant principal type '{other}' in '{s}'")),
     };
 
+    s32p_directory::validate_principal(&principal)?;
+
     let access = parse_access_level(parts[2])?;
     Ok(AclEntry { principal, access })
 }
