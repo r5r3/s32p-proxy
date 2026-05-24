@@ -46,11 +46,13 @@ tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
+[profile.release]
+panic = "abort"
+
 [profile.perf]
 rustflags = ["-C", "target-cpu=native"]
 inherits = "release"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
 
