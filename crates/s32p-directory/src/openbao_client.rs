@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-/// Hardened `reqwest::Client` for OpenBao/Vault. Audit finding H7.
+/// Hardened `reqwest::Client` for OpenBao/Vault.
 ///
 /// Sets:
 /// - `min_tls_version(TLS 1.2)` — explicit floor (rustls already drops <1.2,

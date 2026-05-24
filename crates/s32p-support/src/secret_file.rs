@@ -1,4 +1,4 @@
-//! Startup-time validation for secret-bearing files (audit finding H6).
+//! Startup-time validation for secret-bearing files.
 //!
 //! The proxy reads several files at startup whose contents are credentials:
 //! the YAML directory, OpenBao AppRole role-id/secret-id, the TLS private key.

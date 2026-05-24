@@ -65,7 +65,7 @@ pub fn load_directory_yaml_file(path: &str) -> Result<DirectoryFileV1> {
 /// existing files have their mode tightened after write.
 ///
 /// The proxy rejects directory files with group/other bits at startup
-/// (audit finding H6; see `s32p_support::secret_file::stat_or_reject`),
+/// (see `s32p_support::secret_file::stat_or_reject`),
 /// so any operator path that creates or updates the file must land here.
 pub fn save_directory_yaml_file(path: &str, doc: &DirectoryFileV1) -> Result<()> {
     let s = render_directory_yaml_string(doc)?;

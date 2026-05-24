@@ -1,6 +1,6 @@
 """DoS-class admission control on the proxy listener.
 
-Covers audit finding H3 (#1): per-IP concurrent-request cap returning
+Covers the per-IP concurrent-request cap returning
 `429 SlowDown` once a single source IP exceeds
 `server.connection_limits.max_concurrent_requests_per_ip`.
 

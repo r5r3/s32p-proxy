@@ -315,7 +315,7 @@ pub struct WorkersConfig {
     /// Shared POSIX root directory passed to the worker template ({{posix_root}})
     pub posix_root: String,
 
-    /// Allowed-root prefixes for bucket `data_path` values (audit finding M1).
+    /// Allowed-root prefixes for bucket `data_path` values.
     /// Each bucket's `data_path` — which is symlinked into the staged
     /// `posix_root` *and* passed to the launcher as a Landlock `--ro`/`--rw`
     /// allowed path — must live under one of these roots. Matching is
@@ -350,6 +350,27 @@ pub struct LauncherConfig {
 pub struct LifecycleConfig {
     pub idle_timeout_secs:   u64,
     pub sweep_interval_secs: u64,
+    /// How often the reconciler re-checks each live worker's directory
+    /// snapshot (user credentials + accessible bucket set) and recycles any
+    /// whose snapshot changed (revocation propagation and new-bucket
+    /// awareness). Bounds the worst-case staleness window. For the
+    /// OpenBao backend this is also bounded below by the directory cache TTL.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+    /// Drain window for a worker the reconciler decides to replace. The slot
+    /// flips to "stopped" immediately so new requests spawn a fresh worker
+    /// (current credentials + Landlock), while the retired process keeps
+    /// serving its in-flight requests for this long before being terminated.
+    #[serde(default = "default_reconcile_grace_secs")]
+    pub reconcile_grace_secs:    u64,
+}
+
+fn default_reconcile_interval_secs() -> u64 {
+    60
+}
+
+fn default_reconcile_grace_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

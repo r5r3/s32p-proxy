@@ -323,7 +323,7 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
 
     let credential = credential.ok_or_else(|| anyhow!("missing X-Amz-Credential"))?;
     let amz_date = amz_date.ok_or_else(|| anyhow!("missing X-Amz-Date"))?;
-    // Distinguish missing from present-but-malformed (audit finding L2): a
+    // Distinguish missing from present-but-malformed: a
     // non-numeric or negative value is rejected explicitly rather than being
     // silently coerced to "missing". Parsed only after the algo gate above, so
     // a non-presigned request carrying a junk X-Amz-Expires query param is
@@ -582,7 +582,7 @@ pub fn verify_sigv4_presigned_url(
     ))
 }
 
-/// Audit finding M7: AWS SigV4 mandates that `host` appear in the
+/// AWS SigV4 mandates that `host` appear in the
 /// `SignedHeaders` list. Without this check a client can omit `host`
 /// from the signature, sign a request, then mutate the Host header in
 /// the wire request to swap routing — and the signature still verifies
@@ -1155,7 +1155,7 @@ mod fastfail_tests {
 
 #[cfg(test)]
 mod host_signed_tests {
-    //! Audit finding M7: AWS SigV4 requires `host` in the `SignedHeaders`
+    //! AWS SigV4 requires `host` in the `SignedHeaders`
     //! list. The check sits in `parse_authorization` / `parse_presigned_query`
     //! so both header-signed and presigned-URL paths reject before
     //! reaching the HMAC step.
@@ -1235,7 +1235,7 @@ mod host_signed_tests {
 
 #[cfg(test)]
 mod expires_parse_tests {
-    //! Audit finding L2: a present-but-malformed `X-Amz-Expires` is rejected
+    //! A present-but-malformed `X-Amz-Expires` is rejected
     //! explicitly (distinct from "missing"), not silently coerced to "missing".
     use http::Uri;
 

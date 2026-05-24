@@ -208,6 +208,7 @@ impl ProxyHttp for S3ProxyApp {
 
         // Start background sweepers lazily (we are now inside tokio).
         self.workers.start_sweeper();
+        self.workers.start_reconciler();
         self.sessions.start_cleanup();
         self.ensure_nss_listener();
 
@@ -1113,8 +1114,12 @@ fn main() -> Result<()> {
     let (nss_std_listener, nss_sock_env_value) =
         nss_listener::bind().context("failed to bind nss-proxy listener")?;
 
-    let workers =
-        WorkerManager::new(cfg.workers.clone(), cfg.server.clone(), nss_sock_env_value.clone());
+    let workers = WorkerManager::new(
+        cfg.workers.clone(),
+        cfg.server.clone(),
+        nss_sock_env_value.clone(),
+        Arc::clone(&directory),
+    );
 
     let sessions = Arc::new(SessionStore::new(
         cfg.session.max_active,

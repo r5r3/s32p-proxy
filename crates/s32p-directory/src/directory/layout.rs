@@ -30,7 +30,7 @@ static BUCKET_NAME_RE: LazyLock<Regex> =
 
 /// Validate a bucket name against the S3 general-purpose naming rule, enforced
 /// at *creation* (not only when the name is later interpolated into a worker's
-/// staging path). Mirrors the M2 access-key/principal validators: rejecting bad
+/// staging path). Mirrors the access-key/principal validators: rejecting bad
 /// names where an operator creates them, rather than only catching them at the
 /// filesystem-path boundary.
 ///

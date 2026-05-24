@@ -1,5 +1,7 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     fmt, fs,
+    hash::{Hash, Hasher},
     net::{SocketAddr, TcpListener},
     os::unix::{ffi::OsStrExt, fs as unix_fs},
     path::{Component, Path, PathBuf},
@@ -13,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
-use s32p_directory::{AccessLevel, BucketView, UserDoc};
+use s32p_directory::{AccessLevel, BucketView, Directory, UserDoc};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
@@ -45,6 +47,20 @@ pub struct WorkerManager {
     /// `getpwuid_r` — only sensible without Landlock). Set at construction
     /// from the proxy's pre-bound abstract socket name.
     nss_sock_env:    String,
+    /// Directory handle (the same cached one the request path uses) so the
+    /// reconciler can refetch a worker's user + bucket snapshot and detect
+    /// revocations / new grants.
+    directory:          Arc<dyn Directory>,
+    reconciler_started: AtomicBool,
+    /// Workers the reconciler has replaced: kept alive to drain their
+    /// in-flight requests, then terminated once `terminate_after_unix` passes
+    /// (swept on the regular sweep cadence).
+    retiring:           Mutex<Vec<RetiringWorker>>,
+}
+
+struct RetiringWorker {
+    handle:               Arc<WorkerHandle>,
+    terminate_after_unix: u64,
 }
 
 struct WorkerSlot {
@@ -84,6 +100,10 @@ pub struct WorkerHandle {
     /// env-loaded `S32P_WORKER_TOKEN` to short-circuit SigV4 re-validation.
     /// Regenerated on every spawn; never persisted.
     pub worker_token: String,
+    /// SipHash of the directory snapshot (user credentials + accessible bucket
+    /// set) this worker was spawned from. The reconciler recomputes it from the
+    /// current directory and recycles the worker on a mismatch.
+    spawn_fingerprint: u64,
     tempdir:          Mutex<Option<TempDir>>,
     last_used_unix:   AtomicU64,
     child:            Mutex<Child>,
@@ -148,13 +168,21 @@ impl WorkerHandle {
 }
 
 impl WorkerManager {
-    pub fn new(cfg: WorkersConfig, server_cfg: ServerConfig, nss_sock_env: String) -> Arc<Self> {
+    pub fn new(
+        cfg: WorkersConfig,
+        server_cfg: ServerConfig,
+        nss_sock_env: String,
+        directory: Arc<dyn Directory>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             server_cfg,
             slots: DashMap::new(),
             sweeper_started: AtomicBool::new(false),
             nss_sock_env,
+            directory,
+            reconciler_started: AtomicBool::new(false),
+            retiring: Mutex::new(Vec::new()),
         })
     }
 
@@ -177,6 +205,140 @@ impl WorkerManager {
                 mgr.sweep_once().await;
             }
         });
+    }
+
+    /// Start the background directory reconciler exactly once.
+    /// Every `reconcile_interval_secs` it refetches each live worker's user +
+    /// bucket snapshot and recycles any worker whose snapshot changed (or whose
+    /// user was deleted), so credential/ACL revocations and new bucket grants
+    /// propagate to running workers without waiting for an idle timeout.
+    pub fn start_reconciler(self: &Arc<Self>) {
+        let interval_secs = self.cfg.lifecycle.reconcile_interval_secs;
+        if interval_secs == 0 {
+            return; // disabled
+        }
+        if self
+            .reconciler_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return; // already started
+        }
+
+        let mgr = Arc::clone(self);
+        let interval = Duration::from_secs(interval_secs);
+        tracing::info!(
+            reconcile_interval_secs = interval_secs,
+            reconcile_grace_secs = mgr.cfg.lifecycle.reconcile_grace_secs,
+            "worker directory reconciler started"
+        );
+        tokio::spawn(async move {
+            loop {
+                time::sleep(interval).await;
+                mgr.reconcile_once().await;
+            }
+        });
+    }
+
+    /// One reconciliation pass: for every running worker, recompute its
+    /// directory fingerprint and retire it on a mismatch (or if its user is
+    /// gone). Transient directory errors are skipped — a backend blip must
+    /// never trigger a self-inflicted recycle storm.
+    async fn reconcile_once(self: &Arc<Self>) {
+        let roots = &self.cfg.allowed_data_path_roots;
+        let grace = self.cfg.lifecycle.reconcile_grace_secs;
+
+        let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
+
+        for key in keys {
+            let Some(slot) = self.slots.get(&key) else { continue };
+            let handle = {
+                let state = slot.state.lock().await;
+                match &*state {
+                    SlotState::Running(h) => Some(Arc::clone(h)),
+                    _ => None,
+                }
+            };
+            drop(slot);
+            let Some(h) = handle else { continue };
+
+            // Refetch the user. A definitive `Ok(None)` means the access key
+            // was deleted → retire. A backend error is transient → skip.
+            let user = match self.directory.user_by_access_key(&key.access_key).await {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    tracing::info!(
+                        access_key = key.access_key.as_str(),
+                        profile = key.profile.as_str(),
+                        "access key no longer in directory; retiring worker"
+                    );
+                    self.retire_worker(&key, h, grace).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        access_key = key.access_key.as_str(),
+                        error = %e,
+                        "reconcile: directory user lookup failed; leaving worker in place"
+                    );
+                    continue;
+                }
+            };
+
+            let buckets = match self.directory.buckets_for_access_key(&key.access_key).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        access_key = key.access_key.as_str(),
+                        error = %e,
+                        "reconcile: directory bucket lookup failed; leaving worker in place"
+                    );
+                    continue;
+                }
+            };
+
+            // Apply the same data_path policy filter the spawn path uses, so
+            // the fingerprint reflects exactly what would be baked into a fresh
+            // worker.
+            let filtered: Vec<BucketView> = buckets
+                .into_iter()
+                .filter(|b| data_path_under_allowed_root(&b.data_path, roots))
+                .collect();
+
+            let current = directory_fingerprint(&user, &filtered);
+            if current != h.spawn_fingerprint {
+                tracing::info!(
+                    access_key = key.access_key.as_str(),
+                    profile = key.profile.as_str(),
+                    "directory snapshot changed; retiring worker for replacement"
+                );
+                self.retire_worker(&key, h, grace).await;
+            }
+        }
+    }
+
+    /// Retire a worker gracefully: flip its slot to `Stopped` so the next
+    /// request spawns a fresh worker (current credentials + Landlock), then
+    /// park the old process on the retiring list to drain its in-flight
+    /// requests until `grace_secs` elapses, at which point `sweep_once`
+    /// terminates it.
+    async fn retire_worker(self: &Arc<Self>, key: &WorkerKey, handle: Arc<WorkerHandle>, grace_secs: u64) {
+        if let Some(slot) = self.slots.get(key) {
+            let mut state = slot.state.lock().await;
+            // Only retire if this exact handle is still the running one — a
+            // concurrent respawn may already have replaced it.
+            if let SlotState::Running(h) = &*state {
+                if Arc::ptr_eq(h, &handle) {
+                    *state = SlotState::Stopped;
+                    slot.notify.notify_waiters();
+                }
+            }
+        }
+        let deadline = WorkerHandle::now_unix().saturating_add(grace_secs);
+        self.retiring
+            .lock()
+            .await
+            .push(RetiringWorker { handle, terminate_after_unix: deadline });
     }
 
     /// Returns Some(handle) if the worker is running and alive; otherwise None.
@@ -291,7 +453,7 @@ impl WorkerManager {
 
         let euid_is_root = unsafe { libc::geteuid() == 0 };
 
-        // M1: restrict bucket `data_path` to `workers.allowed_data_path_roots`.
+        // Restrict bucket `data_path` to `workers.allowed_data_path_roots`.
         // A bucket whose `data_path` is outside every configured root is
         // dropped from this worker's set entirely — no symlink, not in the
         // Landlock allow-list (`--ro`/`--rw` below), and not in
@@ -419,9 +581,9 @@ impl WorkerManager {
             // `--allow-nss` is intentionally NOT passed: the worker resolves
             // uid → username over the proxy's abstract nss socket (see
             // `nss_listener` and the gateway's `nss_client`) instead of
-            // reading `/etc/passwd` itself. Removing the allow rule closes
-            // C5 (a tenant symlink `<bucket>/leak -> /etc/passwd` no longer
-            // returns its content).
+            // reading `/etc/passwd` itself. Removing the allow rule means a
+            // tenant symlink `<bucket>/leak -> /etc/passwd` no longer
+            // returns its content.
             if self.cfg.launcher.landlock_strict {
                 cmd.arg("--landlock-strict");
             }
@@ -527,6 +689,10 @@ impl WorkerManager {
             endpoint: endpoint.clone(),
             posix_root: staged_root.clone(),
             worker_token,
+            // `buckets` here is the post-policy-filter set actually baked into
+            // the worker; the reconciler recomputes from the same filter so the
+            // two fingerprints are comparable.
+            spawn_fingerprint: directory_fingerprint(user, buckets),
             tempdir: Mutex::new(Some(tempdir)),
             last_used_unix: AtomicU64::new(WorkerHandle::now_unix()),
             child: Mutex::new(child),
@@ -539,6 +705,22 @@ impl WorkerManager {
     async fn sweep_once(self: &Arc<Self>) {
         let now = WorkerHandle::now_unix();
         let idle_secs = self.cfg.lifecycle.idle_timeout_secs;
+
+        // Terminate retired workers whose drain window has elapsed.
+        // They no longer receive new requests (their slot was flipped to
+        // Stopped at retirement); this just reaps them after the grace period.
+        {
+            let mut retiring = self.retiring.lock().await;
+            let mut still_draining = Vec::with_capacity(retiring.len());
+            for r in retiring.drain(..) {
+                if now >= r.terminate_after_unix || !r.handle.is_alive().await {
+                    r.handle.terminate().await;
+                } else {
+                    still_draining.push(r);
+                }
+            }
+            *retiring = still_draining;
+        }
 
         // Collect keys first to avoid holding iter borrows over awaits.
         let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
@@ -589,6 +771,11 @@ impl WorkerManager {
     /// broadcast — that path relies on `kill_on_drop(true)` on the spawn
     /// `Command` to clean up during runtime teardown.
     pub async fn shutdown(self: &Arc<Self>) {
+        // Reap any workers still draining on the retiring list.
+        for r in self.retiring.lock().await.drain(..) {
+            r.handle.terminate().await;
+        }
+
         let keys: Vec<WorkerKey> = self.slots.iter().map(|e| e.key().clone()).collect();
 
         let mut uds_run_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -766,6 +953,33 @@ fn format_bucket_acl(buckets: &[BucketView]) -> String {
         .join(",")
 }
 
+/// SipHash fingerprint of everything baked into a worker at spawn: the user's
+/// credential + identity, and the accessible bucket set (id, data_path, access
+/// level). The reconciler recomputes this from the current directory and
+/// recycles the worker on a mismatch. A 64-bit digest is ample for
+/// change detection — a collision only delays a recycle to the next change, it
+/// is not an authorization decision. Bucket order is normalized (sort by
+/// bucket_id) so an unrelated reordering from the backend doesn't churn
+/// workers.
+fn directory_fingerprint(user: &UserDoc, buckets: &[BucketView]) -> u64 {
+    let mut h = DefaultHasher::new();
+    user.access_key.hash(&mut h);
+    user.secret_key.hash(&mut h);
+    user.uid.hash(&mut h);
+    user.gid.hash(&mut h);
+    user.username.hash(&mut h);
+
+    let mut sorted: Vec<&BucketView> = buckets.iter().collect();
+    sorted.sort_by(|a, b| a.bucket_id.cmp(&b.bucket_id));
+    sorted.len().hash(&mut h);
+    for b in sorted {
+        b.bucket_id.hash(&mut h);
+        b.data_path.hash(&mut h);
+        (b.access as u8).hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Path-safety backstop run when a bucket name is interpolated into the
 /// worker's staging path (`<temp>/<bucket_name>` symlink). The S3-spec name
 /// rule is enforced upstream at creation (`s32p_directory::validate_bucket_name`),
@@ -819,8 +1033,8 @@ fn chown_if_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Whether `data_path` is contained within one of `allowed_roots` (audit
-/// finding M1). Matching is component-boundary aware via `Path::starts_with`,
+/// Whether `data_path` is contained within one of `allowed_roots`.
+/// Matching is component-boundary aware via `Path::starts_with`,
 /// so `/srv/s3` admits `/srv/s3` and `/srv/s3/foo` but rejects `/srv/s3-evil`.
 ///
 /// - An **empty** `allowed_roots` means "no restriction" → always `true`.
@@ -1000,6 +1214,45 @@ mod tests {
             bv("charlie", AccessLevel::ReadWrite),
         ];
         assert_eq!(format_bucket_acl(&buckets), "alpha:rw,bravo:ro,charlie:rw");
+    }
+
+    fn user(secret: &str) -> UserDoc {
+        UserDoc {
+            access_key: "AKIATEST".to_string(),
+            secret_key: secret.to_string(),
+            username:   "alice".to_string(),
+            uid:        1000,
+            gid:        1000,
+        }
+    }
+
+    #[test]
+    fn fingerprint_stable_and_order_independent() {
+        let u = user("s3cret");
+        let a = vec![bv("alpha", AccessLevel::ReadWrite), bv("bravo", AccessLevel::ReadOnly)];
+        let b = vec![bv("bravo", AccessLevel::ReadOnly), bv("alpha", AccessLevel::ReadWrite)];
+        // Same inputs → same fingerprint; bucket order must not matter.
+        assert_eq!(directory_fingerprint(&u, &a), directory_fingerprint(&u, &a));
+        assert_eq!(directory_fingerprint(&u, &a), directory_fingerprint(&u, &b));
+    }
+
+    #[test]
+    fn fingerprint_changes_on_secret_rotation() {
+        let buckets = vec![bv("alpha", AccessLevel::ReadWrite)];
+        assert_ne!(
+            directory_fingerprint(&user("old"), &buckets),
+            directory_fingerprint(&user("new"), &buckets),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_on_bucket_set_and_access_level() {
+        let u = user("s3cret");
+        let base = vec![bv("alpha", AccessLevel::ReadOnly)];
+        let added = vec![bv("alpha", AccessLevel::ReadOnly), bv("bravo", AccessLevel::ReadOnly)];
+        let promoted = vec![bv("alpha", AccessLevel::ReadWrite)];
+        assert_ne!(directory_fingerprint(&u, &base), directory_fingerprint(&u, &added)); // grant added
+        assert_ne!(directory_fingerprint(&u, &base), directory_fingerprint(&u, &promoted)); // ro→rw
     }
 
     #[test]

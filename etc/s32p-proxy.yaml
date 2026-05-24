@@ -79,6 +79,16 @@ workers:
   lifecycle:
     idle_timeout_secs: 600
     sweep_interval_secs: 10
+    # How often the reconciler re-checks each live worker's directory snapshot
+    # (user credentials + accessible buckets) and recycles any worker whose
+    # snapshot changed — this is how credential/ACL revocations and new bucket
+    # grants reach an already-running worker. For the OpenBao backend
+    # the effective floor is also the directory cache TTL. 0 disables it.
+    reconcile_interval_secs: 60
+    # Drain window for a worker being replaced: its slot is freed immediately so
+    # new requests spawn a fresh worker, while the old process keeps serving
+    # in-flight requests for this long before termination.
+    reconcile_grace_secs: 30
 
   profiles:
     versitygw-default:
