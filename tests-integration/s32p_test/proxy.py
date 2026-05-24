@@ -92,6 +92,12 @@ class ProxyHarness:
     max_concurrent_requests_per_ip: int = 256
     keepalive_idle_secs: int = 60
     trusted_loopback_bypass: bool = True
+    # Override for the generated `auth:` block. None → the default YAML
+    # backend (and a `self.directory` YamlDirectory is created). Set it to
+    # an `{"backend": "openbao", "openbao": {...}}` dict to point the proxy
+    # at an OpenBao instead; in that case the caller owns directory seeding
+    # (via OpenBaoDirectory) and `self.directory` is None.
+    auth_config: dict | None = None
 
     # Derived in __post_init__
     posix_root: Path = field(init=False)
@@ -99,7 +105,7 @@ class ProxyHarness:
     config_path: Path = field(init=False)
     directory_path: Path = field(init=False)
     log_path: Path = field(init=False)
-    directory: YamlDirectory = field(init=False)
+    directory: YamlDirectory | None = field(init=False)
 
     _proc: subprocess.Popen | None = field(default=None, init=False, repr=False)
     _log_fh: IO[bytes] | None = field(default=None, init=False, repr=False)
@@ -119,7 +125,11 @@ class ProxyHarness:
         if self.listen_port == 0:
             self.listen_port = _alloc_port(self.listen_host)
 
-        self.directory = YamlDirectory(self.directory_path)
+        # YAML backend owns a directory file the harness seeds directly;
+        # OpenBao callers seed via their own OpenBaoDirectory wrapper.
+        self.directory = (
+            YamlDirectory(self.directory_path) if self.auth_config is None else None
+        )
 
     @property
     def base_url(self) -> str:
@@ -156,7 +166,7 @@ class ProxyHarness:
                     "trusted_loopback_bypass": self.trusted_loopback_bypass,
                 },
             },
-            "auth": {
+            "auth": self.auth_config or {
                 "backend": "yaml",
                 "yaml": {"path": str(self.directory_path)},
             },

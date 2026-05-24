@@ -53,7 +53,8 @@ tests-integration/
 ├── s32p_test/                      # the harness package
 │   ├── paths.py                    # locate the four required binaries
 │   ├── proxy.py                    # ProxyHarness — config gen, spawn, teardown
-│   ├── directory.py                # YamlDirectory — wraps `s32p-ctl --backend yaml`
+│   ├── directory.py                # Yaml/OpenBaoDirectory — wrap `s32p-ctl --backend …`
+│   ├── openbao.py                  # OpenBaoServer — ephemeral `bao server -dev`
 │   ├── backend_fs.py               # BackendFs — direct POSIX ops on a bucket
 │   └── clients/
 │       ├── base.py                 # S3Client ABC + dataclasses + S3Error
@@ -63,6 +64,7 @@ tests-integration/
 │
 └── tests/
     ├── test_get_put_delete.py      # smoke round-trip + metadata xfail
+    ├── test_openbao.py             # OpenBao directory backend smoke (auto-spawned bao)
     ├── test_mountpoint.py          # FUSE mount tests (mount-s3 + rclone)
     └── interop/                    # POSIX <-> S3 contracts
         ├── test_basic.py           # write/read both ways, rename, listing
@@ -112,7 +114,7 @@ Defined in `pytest.ini`:
 |---|---|
 | `slow` | Takes >5s; excluded from `pixi run test-fast`. |
 | `requires_lustre` | Needs Lustre + gateway built with `--features lustre`. |
-| `requires_openbao` | Needs an OpenBao server (use `test-env/start-bao.py`). |
+| `requires_openbao` | Covers the OpenBao directory backend. Auto-spawns its own `bao server -dev`; needs the `bao` binary on PATH (`S32P_BAO_BIN` to override), else skips. |
 | `requires_root` | Needs to run as root (CAP_SETUID for `restricted-exec --user`). |
 | `multi_uid_only` | Skipped unless `--mode=multi-uid`. |
 | `single_uid_only` | Skipped unless `--mode=single-uid`. |
@@ -143,3 +145,17 @@ Defined in `pytest.ini`:
 - Captures stdout+stderr to `<session>/proxy.log` and dumps the tail in any startup-failure exception.
 
 Under xdist (`pytest -n N`), each worker is a separate Python process, so each gets its own `ProxyHarness`, session_dir, port, and bucket pool — the suite is parallel-safe by construction.
+
+### Directory backends
+
+Most of the suite drives the **YAML** backend (`YamlDirectory`, the default
+when `ProxyHarness.auth_config` is unset). `tests/test_openbao.py` covers the
+**OpenBao** backend instead: it spins up an ephemeral `bao server -dev`
+(`OpenBaoServer`), runs `s32p-ctl … setup` to bootstrap the proxy/admin
+AppRoles, seeds users/buckets through an `OpenBaoDirectory` authed as the
+admin AppRole, and points the proxy at the proxy AppRole via
+`ProxyHarness(auth_config={"backend": "openbao", …})`. This exercises both the
+`s32p-ctl` KV write path and the proxy's runtime KV read path; it skips when
+`bao` isn't installed. Both backends share the same `s32p-ctl` command surface
+(`_CtlDirectory`), so seeding is identical — only the backend-selection flags
+and bootstrap differ.
