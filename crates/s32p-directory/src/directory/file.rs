@@ -34,6 +34,8 @@ impl DirectoryFileV1 {
                 .with_context(|| format!("user {}", u.username))?;
         }
         for b in &self.buckets {
+            crate::directory::layout::validate_bucket_name(&b.name)
+                .with_context(|| format!("bucket id {}", b.id))?;
             crate::directory::layout::validate_acl(&b.acl)
                 .with_context(|| format!("bucket {} ({})", b.id, b.name))?;
         }

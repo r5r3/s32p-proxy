@@ -15,7 +15,7 @@ pub use file::{
 };
 pub use layout::{
     DirectoryLayout, IndexDoc, normalize_acl, principal_key, validate_access_key, validate_acl,
-    validate_principal,
+    validate_bucket_name, validate_principal,
 };
 pub use types::{AccessLevel, AclEntry, BucketDoc, BucketView, Principal, UserDoc};
 

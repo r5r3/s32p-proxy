@@ -21,6 +21,39 @@ static ACCESS_KEY_RE: LazyLock<Regex> =
 static GROUP_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$").expect("valid group regex"));
 
+/// S3 general-purpose bucket-name rule: 3–63 chars of `[a-z0-9.-]`, beginning
+/// and ending with a letter or digit. (`{1,61}` interior + the two anchored
+/// ends = length 3–63.) Adjacent dots are rejected by a separate check in
+/// [`validate_bucket_name`].
+static BUCKET_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$").expect("valid bucket regex"));
+
+/// Validate a bucket name against the S3 general-purpose naming rule, enforced
+/// at *creation* (not only when the name is later interpolated into a worker's
+/// staging path). Mirrors the M2 access-key/principal validators: rejecting bad
+/// names where an operator creates them, rather than only catching them at the
+/// filesystem-path boundary.
+///
+/// Enforces: length 3–63, charset `[a-z0-9.-]`, begins/ends alphanumeric, and
+/// no consecutive dots. Deliberately **not** enforced (out of scope, matching
+/// the gateway's pragmatic level): the IPv4-address-format prohibition and the
+/// reserved prefix/suffix rules (`xn--`, `-s3alias`, …). The proxy's
+/// `validate_bucket_link_name` remains as an independent path-safety backstop
+/// at the symlink-construction step, since the name's source (a hand-editable
+/// directory backend) is a separate trust boundary.
+pub fn validate_bucket_name(name: &str) -> Result<()> {
+    if !BUCKET_NAME_RE.is_match(name) {
+        bail!(
+            "invalid bucket name {name:?}: must be 3–63 chars of [a-z0-9.-], \
+             beginning and ending with a letter or digit"
+        );
+    }
+    if name.contains("..") {
+        bail!("invalid bucket name {name:?}: must not contain consecutive dots");
+    }
+    Ok(())
+}
+
 /// Validate an access-key identifier against [`ACCESS_KEY_RE`]. Shared by user
 /// creation (`UserDoc.access_key`) and the ACL access-key principal so the two
 /// can never disagree — an access key you can create must also be one you can
@@ -208,6 +241,42 @@ mod tests {
         for s in ["", "*", "a/b", "..", "bad key"] {
             assert!(validate_access_key(s).is_err());
             assert!(validate_principal(&ak(s)).is_err());
+        }
+    }
+
+    #[test]
+    fn valid_bucket_names_accepted() {
+        for s in [
+            "test",
+            "scratch",
+            "boto3-directory",
+            "test-bucket-000",
+            "test-dirbucket-000--use1-az4--x-s3", // double hyphens are fine
+            "a1b",
+            "my.bucket.name",
+            &"b".repeat(63),
+        ] {
+            assert!(validate_bucket_name(s).is_ok(), "should accept bucket name {s:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_bucket_names_rejected() {
+        for s in [
+            "",
+            "ab",                  // too short (<3)
+            &"b".repeat(64),       // too long (>63)
+            "UPPER",               // uppercase
+            "under_score",         // underscore not in charset
+            "-leading",            // must begin alphanumeric
+            "trailing-",           // must end alphanumeric
+            ".dot",                // must begin alphanumeric
+            "dot.",                // must end alphanumeric
+            "a..b",                // consecutive dots
+            "has space",           // whitespace
+            "bad/slash",           // path separator
+        ] {
+            assert!(validate_bucket_name(s).is_err(), "should reject bucket name {s:?}");
         }
     }
 

@@ -343,6 +343,8 @@ path "{kv_mount}/metadata/{prefix}/*" {{
         bucket.id = bucket.id.trim().to_string();
         bucket.name = bucket.name.trim().to_string();
         bucket.data_path = bucket.data_path.trim().to_string();
+        s32p_directory::validate_bucket_name(&bucket.name)
+            .with_context(|| format!("bucket id {}", bucket.id))?;
         s32p_directory::validate_acl(&bucket.acl)
             .with_context(|| format!("bucket {} ({})", bucket.id, bucket.name))?;
         bucket.acl = normalize_acl(bucket.acl);

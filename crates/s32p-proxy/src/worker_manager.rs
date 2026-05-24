@@ -766,12 +766,22 @@ fn format_bucket_acl(buckets: &[BucketView]) -> String {
         .join(",")
 }
 
+/// Path-safety backstop run when a bucket name is interpolated into the
+/// worker's staging path (`<temp>/<bucket_name>` symlink). The S3-spec name
+/// rule is enforced upstream at creation (`s32p_directory::validate_bucket_name`),
+/// but the name's source — a hand-editable directory backend — is a separate
+/// trust boundary, so this independent check guards the privileged symlink
+/// step regardless. It is intentionally a focused "safe as a path component"
+/// check, not a full S3 validator.
 fn validate_bucket_link_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("bucket name must not be empty"));
     }
     if name.contains('/') || name.contains('\0') {
         return Err(anyhow!("bucket name contains invalid characters: {name:?}"));
+    }
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(anyhow!("bucket name contains control or whitespace characters: {name:?}"));
     }
     if name == "." || name == ".." {
         return Err(anyhow!("bucket name is not allowed: {name:?}"));
