@@ -38,7 +38,7 @@ http = "1"
 http-body-util = "0.1"
 httpdate = "1"
 libc = "0.2"
-mimalloc = "*"
+mimalloc = "0.1.52"
 quick-xml = { version = "0.40", features = ["serialize"] }
 tokio = { version = "1" }
 tracing = "0.1"

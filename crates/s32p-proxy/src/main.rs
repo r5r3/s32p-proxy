@@ -327,12 +327,16 @@ impl ProxyHttp for S3ProxyApp {
         {
             Ok(k) => k,
             Err(e) => {
+                // Verbose reason stays in the log; the client gets a generic
+                // message. The error chain here only carries request-derived
+                // parse detail (echoed client input), but reflecting it would
+                // still violate the response/reason separation rule.
                 tracing::warn!(error = %e, "failed to extract access key");
                 responses::respond_s3_error(
                     session,
                     StatusCode::FORBIDDEN,
                     responses::error_code::ACCESS_DENIED,
-                    &e.to_string(),
+                    "invalid or missing credentials",
                     Some(req.uri.path()),
                     None,
                 )
