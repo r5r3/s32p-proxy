@@ -292,7 +292,7 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
     let mut algo: Option<String> = None;
     let mut credential: Option<String> = None;
     let mut amz_date: Option<String> = None;
-    let mut expires: Option<u64> = None;
+    let mut expires_raw: Option<String> = None;
     let mut signed_headers: Option<String> = None;
     let mut signature: Option<String> = None;
     let mut security_token: Option<String> = None;
@@ -303,12 +303,7 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
             "x-amz-algorithm" => algo = Some(v.into_owned()),
             "x-amz-credential" => credential = Some(v.into_owned()),
             "x-amz-date" => amz_date = Some(v.into_owned()),
-            "x-amz-expires" => {
-                let s = v.trim();
-                if !s.is_empty() {
-                    expires = s.parse::<u64>().ok();
-                }
-            }
+            "x-amz-expires" => expires_raw = Some(v.into_owned()),
             "x-amz-signedheaders" => signed_headers = Some(v.into_owned()),
             "x-amz-signature" => signature = Some(v.into_owned()),
             "x-amz-security-token" => security_token = Some(v.into_owned()),
@@ -328,7 +323,21 @@ pub fn parse_presigned_query(uri: &Uri) -> Result<Option<PresignedSigV4Auth>> {
 
     let credential = credential.ok_or_else(|| anyhow!("missing X-Amz-Credential"))?;
     let amz_date = amz_date.ok_or_else(|| anyhow!("missing X-Amz-Date"))?;
-    let expires = expires.ok_or_else(|| anyhow!("missing/invalid X-Amz-Expires"))?;
+    // Distinguish missing from present-but-malformed (audit finding L2): a
+    // non-numeric or negative value is rejected explicitly rather than being
+    // silently coerced to "missing". Parsed only after the algo gate above, so
+    // a non-presigned request carrying a junk X-Amz-Expires query param is
+    // unaffected. The numeric range (0 < expires <= 7 days) is enforced later
+    // in `verify_sigv4_presigned_url`.
+    let expires = match expires_raw {
+        Some(s) => s.trim().parse::<u64>().map_err(|_| {
+            anyhow!(
+                "invalid X-Amz-Expires {:?}: must be a non-negative integer number of seconds",
+                s.trim()
+            )
+        })?,
+        None => return Err(anyhow!("missing X-Amz-Expires")),
+    };
     let signed_headers = signed_headers.ok_or_else(|| anyhow!("missing X-Amz-SignedHeaders"))?;
     let signature = signature.ok_or_else(|| anyhow!("missing X-Amz-Signature"))?;
 
@@ -1221,5 +1230,76 @@ mod host_signed_tests {
             err.to_string().to_lowercase().contains("host"),
             "error should name host: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod expires_parse_tests {
+    //! Audit finding L2: a present-but-malformed `X-Amz-Expires` is rejected
+    //! explicitly (distinct from "missing"), not silently coerced to "missing".
+    use http::Uri;
+
+    use super::parse_presigned_query;
+
+    const CRED: &str = "AKIAIOSFODNN7EXAMPLE/20260521/us-east-1/s3/aws4_request";
+    const SIG: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Presign URI with `host` signed (so a valid value reaches a successful
+    /// parse) and the given raw `X-Amz-Expires` value spliced in verbatim.
+    fn uri_with_expires(expires: &str) -> Uri {
+        let q = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential={CRED}\
+             &X-Amz-Date=20260521T120000Z\
+             &X-Amz-Expires={expires}\
+             &X-Amz-SignedHeaders=host%3Bx-amz-date\
+             &X-Amz-Signature={SIG}",
+        );
+        format!("/bucket/key?{q}").parse().unwrap()
+    }
+
+    #[test]
+    fn valid_expires_parsed() {
+        let p = parse_presigned_query(&uri_with_expires("3600"))
+            .expect("parse ok")
+            .expect("presigned present");
+        assert_eq!(p.expires, 3600);
+    }
+
+    #[test]
+    fn malformed_expires_rejected_explicitly() {
+        // non-numeric, negative, fractional, empty, hex — all present, all bad.
+        for bad in ["abc", "-5", "3.5", "", "0x10"] {
+            let err = parse_presigned_query(&uri_with_expires(bad))
+                .expect_err("malformed expires must error");
+            let m = err.to_string();
+            assert!(
+                m.contains("invalid X-Amz-Expires"),
+                "expected explicit invalid error for {bad:?}, got: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_expires_has_distinct_error() {
+        let q = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential={CRED}\
+             &X-Amz-Date=20260521T120000Z\
+             &X-Amz-SignedHeaders=host%3Bx-amz-date\
+             &X-Amz-Signature={SIG}",
+        );
+        let uri: Uri = format!("/bucket/key?{q}").parse().unwrap();
+        let err = parse_presigned_query(&uri).expect_err("missing expires must error");
+        assert!(err.to_string().contains("missing X-Amz-Expires"), "got: {err}");
+    }
+
+    #[test]
+    fn not_presigned_with_junk_expires_is_passthrough() {
+        // No X-Amz-Algorithm marker → not a presigned URL. A junk
+        // X-Amz-Expires query param must NOT trigger the strict parse; the
+        // function returns Ok(None) so header-auth fallthrough is unaffected.
+        let uri: Uri = "/bucket/key?X-Amz-Expires=abc&foo=bar".parse().unwrap();
+        assert!(parse_presigned_query(&uri).expect("no error").is_none());
     }
 }
