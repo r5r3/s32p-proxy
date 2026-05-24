@@ -56,6 +56,17 @@ auth:
 workers:
   posix_root: "/tmp/s3"
 
+  # Allowed-root prefixes for bucket data_path values. Each bucket's data_path
+  # is symlinked into the staged posix_root AND passed to the launcher as a
+  # Landlock --ro/--rw allowed path, so this list bounds the worker's
+  # filesystem reach. Matching is component-boundary aware ("/srv/s3" admits
+  # "/srv/s3/foo" but not "/srv/s3-evil"); a data_path with a ".." component is
+  # always rejected. A bucket outside every root is dropped from the worker
+  # set (logged at warn), not fatal. Empty/omitted = no restriction.
+  # allowed_data_path_roots:
+  #   - /srv/s3
+  #   - /data/buckets
+
   launcher:
     path: "{{install_bin_dir}}/restricted-exec"
     pass_user_flag_if_root: true

@@ -315,6 +315,17 @@ pub struct WorkersConfig {
     /// Shared POSIX root directory passed to the worker template ({{posix_root}})
     pub posix_root: String,
 
+    /// Allowed-root prefixes for bucket `data_path` values (audit finding M1).
+    /// Each bucket's `data_path` — which is symlinked into the staged
+    /// `posix_root` *and* passed to the launcher as a Landlock `--ro`/`--rw`
+    /// allowed path — must live under one of these roots. Matching is
+    /// component-boundary aware (`/srv/s3` admits `/srv/s3/foo` but not
+    /// `/srv/s3-evil`). A bucket whose `data_path` is outside every root is
+    /// dropped from the worker's set (logged at warn). An **empty list means
+    /// no restriction** (preserves prior behavior for existing configs).
+    #[serde(default)]
+    pub allowed_data_path_roots: Vec<String>,
+
     pub launcher:  LauncherConfig,
     pub lifecycle: LifecycleConfig,
 
@@ -529,6 +540,14 @@ impl Config {
 
         if self.workers.posix_root.trim().is_empty() {
             return Err(anyhow!("workers.posix_root must not be empty"));
+        }
+
+        for root in &self.workers.allowed_data_path_roots {
+            if !std::path::Path::new(root).is_absolute() {
+                return Err(anyhow!(
+                    "workers.allowed_data_path_roots entry must be an absolute path (got {root:?})"
+                ));
+            }
         }
 
         if self.workers.launcher.path.trim().is_empty() {

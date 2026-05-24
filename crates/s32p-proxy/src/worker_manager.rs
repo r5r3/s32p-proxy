@@ -2,7 +2,7 @@ use std::{
     fmt, fs,
     net::{SocketAddr, TcpListener},
     os::unix::{ffi::OsStrExt, fs as unix_fs},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
@@ -290,6 +290,34 @@ impl WorkerManager {
             .ok_or_else(|| anyhow!("unknown worker profile '{profile_name}'"))?;
 
         let euid_is_root = unsafe { libc::geteuid() == 0 };
+
+        // M1: restrict bucket `data_path` to `workers.allowed_data_path_roots`.
+        // A bucket whose `data_path` is outside every configured root is
+        // dropped from this worker's set entirely — no symlink, not in the
+        // Landlock allow-list (`--ro`/`--rw` below), and not in
+        // `S32P_BUCKET_ACL` — so a misconfigured or compromised directory
+        // entry can never widen the worker's filesystem reach. The caller's
+        // other buckets are unaffected. An empty roots list keeps every
+        // bucket (no restriction).
+        let filtered_buckets: Vec<BucketView> = buckets
+            .iter()
+            .filter(|b| {
+                let allowed =
+                    data_path_under_allowed_root(&b.data_path, &self.cfg.allowed_data_path_roots);
+                if !allowed {
+                    tracing::warn!(
+                        access_key = %user.access_key,
+                        bucket = %b.bucket_name,
+                        data_path = %b.data_path,
+                        "bucket data_path is outside workers.allowed_data_path_roots; \
+                         dropping bucket from worker set"
+                    );
+                }
+                allowed
+            })
+            .cloned()
+            .collect();
+        let buckets: &[BucketView] = &filtered_buckets;
 
         // Create fresh staged root with bucket links
         let (tempdir, staged_root) = create_staged_posix_root(
@@ -781,6 +809,32 @@ fn chown_if_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether `data_path` is contained within one of `allowed_roots` (audit
+/// finding M1). Matching is component-boundary aware via `Path::starts_with`,
+/// so `/srv/s3` admits `/srv/s3` and `/srv/s3/foo` but rejects `/srv/s3-evil`.
+///
+/// - An **empty** `allowed_roots` means "no restriction" → always `true`.
+/// - A non-absolute `data_path`, or one containing a `..` component, is never
+///   allowed: that closes the textual-prefix escape `/srv/s3/../../etc`, which
+///   `starts_with` alone would accept.
+/// - Roots that are themselves non-absolute or contain `..` are ignored
+///   (config validation already rejects non-absolute roots at startup).
+fn data_path_under_allowed_root(data_path: &str, allowed_roots: &[String]) -> bool {
+    if allowed_roots.is_empty() {
+        return true;
+    }
+    let p = Path::new(data_path);
+    if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    allowed_roots.iter().any(|root| {
+        let r = Path::new(root);
+        r.is_absolute()
+            && !r.components().any(|c| matches!(c, Component::ParentDir))
+            && p.starts_with(r)
+    })
+}
+
 /// Create a fresh temp dir under cfg.posix_root (used as "runtime root"),
 /// chown it to the target user if running as root, and add symlinks:
 ///   <temp>/<bucket_name> -> <bucket.data_path>
@@ -936,5 +990,43 @@ mod tests {
             bv("charlie", AccessLevel::ReadWrite),
         ];
         assert_eq!(format_bucket_acl(&buckets), "alpha:rw,bravo:ro,charlie:rw");
+    }
+
+    #[test]
+    fn empty_allowed_roots_means_no_restriction() {
+        assert!(data_path_under_allowed_root("/etc", &[]));
+        assert!(data_path_under_allowed_root("/anywhere/at/all", &[]));
+    }
+
+    #[test]
+    fn allows_paths_under_a_root() {
+        let roots = vec!["/srv/s3".to_string(), "/data/buckets".to_string()];
+        assert!(data_path_under_allowed_root("/srv/s3", &roots)); // root itself
+        assert!(data_path_under_allowed_root("/srv/s3/alice", &roots));
+        assert!(data_path_under_allowed_root("/data/buckets/x/y", &roots));
+    }
+
+    #[test]
+    fn rejects_paths_outside_roots() {
+        let roots = vec!["/srv/s3".to_string()];
+        assert!(!data_path_under_allowed_root("/etc", &roots));
+        assert!(!data_path_under_allowed_root("/srv", &roots)); // parent of root
+    }
+
+    #[test]
+    fn rejects_sibling_prefix_collision() {
+        // Component-boundary match: "/srv/s3-evil" must not pass under "/srv/s3".
+        let roots = vec!["/srv/s3".to_string()];
+        assert!(!data_path_under_allowed_root("/srv/s3-evil", &roots));
+        assert!(!data_path_under_allowed_root("/srv/s3evil/x", &roots));
+    }
+
+    #[test]
+    fn rejects_parent_dir_traversal_and_relative() {
+        let roots = vec!["/srv/s3".to_string()];
+        // Textual prefix that escapes via `..` is rejected.
+        assert!(!data_path_under_allowed_root("/srv/s3/../../etc", &roots));
+        // Non-absolute is never allowed when a restriction is set.
+        assert!(!data_path_under_allowed_root("srv/s3/x", &roots));
     }
 }
