@@ -66,6 +66,7 @@ tests-integration/
     ├── test_get_put_delete.py      # smoke round-trip + metadata xfail
     ├── test_openbao.py             # OpenBao directory backend smoke (auto-spawned bao)
     ├── test_mountpoint.py          # FUSE mount tests (mount-s3 + rclone)
+    ├── test_restic.py              # restic backup tool: init/backup/restore/check
     └── interop/                    # POSIX <-> S3 contracts
         ├── test_basic.py           # write/read both ways, rename, listing
         ├── test_symlinks.py        # live + broken symlink behavior
@@ -82,6 +83,17 @@ with `@pytest.mark.parametrize("mount_backend", ["mount-s3"],
 indirect=True)`. Per-backend availability is checked inside the `mount`
 fixture, so a one-binary-missing host still runs the other half of the
 matrix instead of skipping the whole file.
+
+`test_restic.py` drives the [restic](https://restic.net) backup tool —
+another "point a real application at the proxy" probe, complementary to
+the FUSE mounts. It initializes an encrypted repository on a bucket,
+backs up a directory tree, restores it, and runs `restic check
+--read-data`, asserting both the byte-for-byte roundtrip and that the
+repo layout (`config`, `data/`, `index/`, `snapshots/`, `keys/`) lands on
+the POSIX backend. restic's S3 client (minio-go) is driven via
+`s32p_test/restic.py`. The whole file is marked `slow` (init + backup +
+restore + check exceeds the 5s bar) and skipped when `restic` isn't on
+PATH.
 
 ## Adding a test
 
