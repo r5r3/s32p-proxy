@@ -131,25 +131,27 @@ pub fn versioning_not_configured() -> HttpResponse {
 ///
 /// The message names the specific variant so a user reading the response
 /// knows exactly which SDK option to remove.
-pub fn sse_not_supported(
-    kind: crate::utils::DetectedSse,
-    resource: Option<&str>,
-) -> HttpResponse {
+pub fn sse_not_supported(kind: crate::utils::DetectedSse, resource: Option<&str>) -> HttpResponse {
     use crate::utils::DetectedSse;
     let message = match kind {
-        DetectedSse::CustomerKey =>
+        DetectedSse::CustomerKey => {
             "Server-side encryption with customer-provided keys (SSE-C) \
-             is not supported by this proxy",
-        DetectedSse::ServerS3 =>
+             is not supported by this proxy"
+        }
+        DetectedSse::ServerS3 => {
             "Server-side encryption (SSE-S3, x-amz-server-side-encryption: AES256) \
-             is not supported by this proxy",
-        DetectedSse::ServerKms =>
-            "Server-side encryption with AWS KMS (SSE-KMS) is not supported by this proxy",
-        DetectedSse::ServerKmsDsse =>
+             is not supported by this proxy"
+        }
+        DetectedSse::ServerKms => {
+            "Server-side encryption with AWS KMS (SSE-KMS) is not supported by this proxy"
+        }
+        DetectedSse::ServerKmsDsse => {
             "Server-side encryption with AWS KMS dual-layer (SSE-KMS-DSSE) is not \
-             supported by this proxy",
-        DetectedSse::Unknown =>
-            "The requested server-side encryption algorithm is not supported by this proxy",
+             supported by this proxy"
+        }
+        DetectedSse::Unknown => {
+            "The requested server-side encryption algorithm is not supported by this proxy"
+        }
     };
     invalid_request(message, resource)
 }
@@ -424,9 +426,98 @@ pub fn object_content_range(start: u64, end_incl: u64, total: u64) -> String {
     format!("bytes {}-{}/{}", start, end_incl, total)
 }
 
+/* -------------------------
+ * Multi-range (RFC 7233 `multipart/byteranges`) response helpers
+ *
+ * These are the single source of truth for the on-the-wire byte layout of a
+ * multi-range GET body. Both the `Content-Length` computation
+ * (`multirange_content_length`) and the streaming emitter call the same
+ * `multirange_part_header` / `multirange_closing`, so the advertised length
+ * can never diverge from the bytes actually sent.
+ *
+ * The gateway stores no per-object content type (POSIX-interop design), so
+ * every part advertises the gateway's constant media type.
+ * ------------------------- */
+
+/// Media type advertised for each part of a `multipart/byteranges` body, and
+/// the gateway's content type for object responses generally.
+pub const OBJECT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Generate a boundary string for a `multipart/byteranges` response.
+///
+/// Uniqueness — not secrecy — is what matters: a boundary that happens to
+/// appear in the body would corrupt framing, the standard negligible RFC 7233
+/// risk. Uses OS randomness (`getrandom`) with a time + process-local counter
+/// fallback so it never blocks or fails.
+pub fn multirange_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let mut buf = [0u8; 16];
+    let rc = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    if rc != buf.len() as isize {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        buf[..8].copy_from_slice(&t.to_le_bytes());
+        buf[8..].copy_from_slice(&n.to_le_bytes());
+    }
+
+    let mut s = String::with_capacity(buf.len() * 2);
+    for b in buf {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// The MIME part-header block that precedes one range's bytes:
+/// `--{boundary}\r\nContent-Type: …\r\nContent-Range: bytes A-B/TOTAL\r\n\r\n`.
+pub fn multirange_part_header(boundary: &str, start: u64, end_incl: u64, total: u64) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\n\
+         Content-Type: {OBJECT_CONTENT_TYPE}\r\n\
+         Content-Range: bytes {start}-{end_incl}/{total}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// The closing delimiter of a `multipart/byteranges` body: `--{boundary}--\r\n`.
+pub fn multirange_closing(boundary: &str) -> Vec<u8> {
+    format!("--{boundary}--\r\n").into_bytes()
+}
+
+/// The `Content-Type` header value for a multi-range response.
+pub fn multirange_content_type(boundary: &str) -> String {
+    format!("multipart/byteranges; boundary={boundary}")
+}
+
+/// Exact `Content-Length` of the `multipart/byteranges` body for `ranges`.
+///
+/// Each range contributes its part header, its bytes, and a trailing `\r\n`;
+/// the body ends with the closing delimiter. Mirrors exactly what the
+/// streaming emitter sends.
+pub fn multirange_content_length(
+    boundary: &str,
+    ranges: &[crate::utils::ByteRange],
+    total: u64,
+) -> u64 {
+    let mut len: u64 = 0;
+    for r in ranges {
+        let end_incl = r.end_excl.saturating_sub(1);
+        len += multirange_part_header(boundary, r.start, end_incl, total).len() as u64;
+        len += r.end_excl - r.start; // body bytes
+        len += 2; // trailing CRLF after the body
+    }
+    len += multirange_closing(boundary).len() as u64;
+    len
+}
+
 fn apply_object_headers(
     headers: &mut http::HeaderMap,
-    content_type: &'static str,
+    content_type: &str,
     content_length: u64,
     etag: &str,
     last_modified: &str,
@@ -456,7 +547,7 @@ fn apply_object_headers(
 pub fn object_response(
     status: StatusCode,
     body: RespBody,
-    content_type: &'static str,
+    content_type: &str,
     content_length: u64,
     etag: &str,
     last_modified: &str,
@@ -675,4 +766,39 @@ pub fn abort_multipart_upload_no_content() -> HttpResponse {
     let mut resp = response_bytes(StatusCode::NO_CONTENT, "application/xml", Vec::new(), []);
     resp.headers_mut().insert("server", "s32p-gateway".parse().unwrap());
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::ByteRange;
+
+    /// The assembled body must be exactly `multirange_content_length` bytes —
+    /// this guards against the part-header serialization and the length math
+    /// drifting apart.
+    #[test]
+    fn multirange_length_matches_assembled_body() {
+        let total = 200u64;
+        let ranges = vec![
+            ByteRange { start: 0, end_excl: 10 },
+            ByteRange { start: 20, end_excl: 30 },
+            ByteRange { start: 199, end_excl: 200 },
+        ];
+        let boundary = "TESTBOUNDARY0123456789abcdef";
+
+        let mut body: Vec<u8> = Vec::new();
+        for r in &ranges {
+            body.extend_from_slice(&multirange_part_header(
+                boundary,
+                r.start,
+                r.end_excl - 1,
+                total,
+            ));
+            body.extend(std::iter::repeat_n(b'x', (r.end_excl - r.start) as usize));
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(&multirange_closing(boundary));
+
+        assert_eq!(body.len() as u64, multirange_content_length(boundary, &ranges, total));
+    }
 }

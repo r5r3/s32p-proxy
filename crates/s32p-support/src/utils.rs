@@ -216,6 +216,65 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
         return Err(anyhow!("multiple ranges not supported"));
     }
 
+    Ok(Some(parse_one_range(spec, size)?))
+}
+
+/// Maximum number of ranges accepted in a single multi-range `Range` header.
+/// Bounds the size of a `multipart/byteranges` response (overlapping ranges
+/// can otherwise amplify the response well beyond the object size).
+pub const MAX_RANGES: usize = 50;
+
+/// Parse a multi-range `Range` header (RFC 7233) into one or more byte ranges.
+///
+/// Accepts the same per-range forms as [`parse_range_header`] (`a-b`, `-suffix`,
+/// `a-`), comma-separated. Ranges are returned in request order with **no**
+/// coalescing of overlaps. Fails (so the caller answers `416`) if:
+/// - the unit is not `bytes=`,
+/// - any range is syntactically invalid or unsatisfiable (`start >= size`),
+/// - more than [`MAX_RANGES`] ranges are requested.
+///
+/// `end >= size` is clamped to `size - 1` (satisfiable), matching
+/// [`parse_range_header`]. The returned `Vec` is always non-empty.
+///
+/// # Examples
+/// ```
+/// use s32p_support::utils::{ByteRange, parse_ranges_header};
+///
+/// let ranges = parse_ranges_header("bytes=0-9,20-29", 200).unwrap();
+/// assert_eq!(
+///     ranges,
+///     vec![ByteRange { start: 0, end_excl: 10 }, ByteRange { start: 20, end_excl: 30 },]
+/// );
+/// ```
+pub fn parse_ranges_header(h: &str, size: u64) -> Result<Vec<ByteRange>> {
+    let h = h.trim();
+    if !h.starts_with("bytes=") {
+        return Err(anyhow!("unsupported Range unit"));
+    }
+    let specs = &h["bytes=".len()..];
+
+    let mut ranges = Vec::new();
+    for spec in specs.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err(anyhow!("empty range in Range header"));
+        }
+        if ranges.len() == MAX_RANGES {
+            return Err(anyhow!("too many ranges (max {MAX_RANGES})"));
+        }
+        ranges.push(parse_one_range(spec, size)?);
+    }
+
+    if ranges.is_empty() {
+        return Err(anyhow!("no ranges in Range header"));
+    }
+    Ok(ranges)
+}
+
+/// Parse a single range spec (the text after `bytes=`, e.g. `0-99`, `-50`,
+/// `100-`) against an object of `size` bytes. Shared by [`parse_range_header`]
+/// and [`parse_ranges_header`].
+fn parse_one_range(spec: &str, size: u64) -> Result<ByteRange> {
     let (a, b) = spec.split_once('-').ok_or_else(|| anyhow!("bad Range syntax"))?;
     if a.is_empty() {
         // Suffix case: bytes=-500
@@ -224,7 +283,7 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
             return Err(anyhow!("bad Range suffix"));
         }
         let start = size.saturating_sub(suffix);
-        return Ok(Some(ByteRange { start, end_excl: size }));
+        return Ok(ByteRange { start, end_excl: size });
     }
 
     let start: u64 = a.parse().map_err(|_| anyhow!("bad Range start"))?;
@@ -248,7 +307,7 @@ pub fn parse_range_header(h: &str, size: u64) -> Result<Option<ByteRange>> {
         return Err(anyhow!("Range end < start"));
     }
 
-    Ok(Some(ByteRange { start, end_excl: end_incl + 1 }))
+    Ok(ByteRange { start, end_excl: end_incl + 1 })
 }
 
 /// Header names that signal a request is using SSE-C (server-side encryption
@@ -424,6 +483,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ranges_header() {
+        // Two normal ranges, order preserved.
+        let ranges = parse_ranges_header("bytes=0-9,20-29", 200).unwrap();
+        assert_eq!(
+            ranges,
+            vec![ByteRange { start: 0, end_excl: 10 }, ByteRange { start: 20, end_excl: 30 },]
+        );
+
+        // Single range via the multi-range parser still works.
+        let ranges = parse_ranges_header("bytes=0-99", 200).unwrap();
+        assert_eq!(ranges, vec![ByteRange { start: 0, end_excl: 100 }]);
+
+        // Mix of normal, open-ended and suffix specs; whitespace tolerated.
+        let ranges = parse_ranges_header("bytes=0-9, 100-, -50", 200).unwrap();
+        assert_eq!(
+            ranges,
+            vec![
+                ByteRange { start: 0, end_excl: 10 },
+                ByteRange { start: 100, end_excl: 200 },
+                ByteRange { start: 150, end_excl: 200 },
+            ]
+        );
+
+        // Any unsatisfiable range (start past EOF) fails the whole request.
+        assert!(parse_ranges_header("bytes=0-9,300-400", 200).is_err());
+
+        // Wrong unit.
+        assert!(parse_ranges_header("items=0-9,20-29", 200).is_err());
+
+        // Empty element between commas.
+        assert!(parse_ranges_header("bytes=0-9,,20-29", 200).is_err());
+
+        // Exactly MAX_RANGES is fine; one more is rejected.
+        let ok = (0..MAX_RANGES).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(",");
+        assert_eq!(parse_ranges_header(&format!("bytes={ok}"), 200).unwrap().len(), MAX_RANGES);
+        let too_many = (0..=MAX_RANGES).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(",");
+        assert!(parse_ranges_header(&format!("bytes={too_many}"), 200).is_err());
+    }
+
+    #[test]
     fn detect_sse_empty_map() {
         let h = http::HeaderMap::new();
         assert_eq!(detect_unsupported_sse(&h), None);
@@ -508,10 +607,7 @@ mod tests {
         // the gate — middleware paths sometimes set kms-key-id first and
         // let the SDK add the algorithm header later.
         let mut h = http::HeaderMap::new();
-        h.insert(
-            "x-amz-server-side-encryption-aws-kms-key-id",
-            "alias/some-key".parse().unwrap(),
-        );
+        h.insert("x-amz-server-side-encryption-aws-kms-key-id", "alias/some-key".parse().unwrap());
         assert_eq!(detect_unsupported_sse(&h), Some(DetectedSse::ServerKms));
     }
 

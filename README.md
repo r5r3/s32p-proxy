@@ -167,7 +167,7 @@ Experimental alternative to `versitygw`. Implements a growing subset of the S3 R
 
 #### Notes / behavior:
 
-- Supports single-range `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`).
+- Supports `Range: bytes=...` (returns `206 Partial Content`; invalid ranges return `416 InvalidRange`). A single range returns the bytes directly; **multiple ranges** return a `multipart/byteranges` body (RFC 7233), one part per range — capped at 50 ranges, and any unsatisfiable range fails the whole request with `416`. A multi-range `HEAD` ignores the `Range` and returns the full object (`200`).
 - Rejects most query parameters for now, except those required for:
   - `?location`, `?list-type=2`, `?delete`, `?acl`, `?renameObject`, `?session`, and the multipart query parameters (`?uploads`, `?uploadId=...`, `?partNumber=...`)
 - **SigV4 presigned URL query parameters** (`X-Amz-*`) are supported and do **not** count as "effective" query parameters for routing/handling. A small fixed set of other keys is also treated as non-effective: `x-id`, `content-type`, `cache-control`, `content-encoding`, `content-disposition`, `expires`, `x-amz-storage-class`.

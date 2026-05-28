@@ -49,12 +49,79 @@ pub async fn stream_range_body(
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight);
 
     tokio::spawn(async move {
-        if let Err(e) = stream_range_task(path, file_size, want, cfg, uring, pool, tx).await {
+        let mut tx = tx;
+        if let Err(e) = emit_range(path, file_size, want, cfg, uring, pool, &mut tx).await {
             tracing::warn!(error = %e, "stream task failed");
         }
     });
 
     Ok(StreamBody::new(ReceiverStream::new(rx)))
+}
+
+/// Stream a `multipart/byteranges` (RFC 7233) body for multiple ranges.
+///
+/// Emits, for each range in order: the MIME part header
+/// (`s32p_support::s3resp::multirange_part_header`), the range's bytes (via the
+/// same per-range machinery as a single-range GET), and a trailing CRLF; then
+/// the closing delimiter. The part-header / closing bytes come from `s3resp`,
+/// the same source the `Content-Length` was computed from, so the body length
+/// matches the advertised header exactly.
+pub async fn stream_multirange_body(
+    path: PathBuf,
+    file_size: u64,
+    ranges: Vec<ByteRange>,
+    boundary: String,
+    cfg: StreamCfg,
+    uring: Arc<UringIO>,
+    pool: Arc<BufPool>,
+) -> Result<impl Body<Data = Bytes, Error = Infallible>> {
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(cfg.inflight);
+
+    tokio::spawn(async move {
+        let mut tx = tx;
+        if let Err(e) =
+            emit_multirange(path, file_size, ranges, &boundary, cfg, uring, pool, &mut tx).await
+        {
+            tracing::warn!(error = %e, "multirange stream task failed");
+        }
+    });
+
+    Ok(StreamBody::new(ReceiverStream::new(rx)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_multirange(
+    path: PathBuf,
+    file_size: u64,
+    ranges: Vec<ByteRange>,
+    boundary: &str,
+    cfg: StreamCfg,
+    uring: Arc<UringIO>,
+    pool: Arc<BufPool>,
+    out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+) -> Result<()> {
+    for want in ranges {
+        let header = s32p_support::s3resp::multirange_part_header(
+            boundary,
+            want.start,
+            want.end_excl - 1,
+            file_size,
+        );
+        if out.send(Ok(Frame::data(Bytes::from(header)))).await.is_err() {
+            return Ok(()); // receiver gone
+        }
+
+        emit_range(path.clone(), file_size, want, cfg.clone(), uring.clone(), pool.clone(), out)
+            .await?;
+
+        if out.send(Ok(Frame::data(Bytes::from_static(b"\r\n")))).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    let closing = s32p_support::s3resp::multirange_closing(boundary);
+    let _ = out.send(Ok(Frame::data(Bytes::from(closing)))).await;
+    Ok(())
 }
 
 fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
@@ -65,14 +132,18 @@ fn chunks_needed(seg_start: u64, eff_end: u64, chunk_size: usize) -> usize {
     ((span + chunk_size as u64 - 1) / chunk_size as u64) as usize
 }
 
-async fn stream_range_task(
+/// Emit the data frames for a single byte range to `out`. Shared by the
+/// single-range body (`stream_range_body`) and the multi-range body
+/// (`stream_multirange_body`), which calls it once per range.
+#[allow(clippy::too_many_arguments)]
+async fn emit_range(
     path: PathBuf,
     file_size: u64,
     want: ByteRange,
     cfg: StreamCfg,
     uring: Arc<UringIO>,
     pool: Arc<BufPool>,
-    mut out: mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+    out: &mut mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) -> Result<()> {
     let chunk = cfg.chunk_size;
     let inflight_cfg = cfg.inflight.max(1);
@@ -132,7 +203,7 @@ async fn stream_range_task(
             direct,
             pool.clone(),
             stream_sem,
-            &mut out,
+            out,
         )
         .await?;
     }

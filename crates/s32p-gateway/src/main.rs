@@ -38,7 +38,7 @@ use s32p_support::{
         PreconditionOutcome, evaluate_copy_source_preconditions, evaluate_read_preconditions,
         evaluate_write_preconditions, parse_conditional_headers,
     },
-    utils::{ByteRange, parse_range_header},
+    utils::{ByteRange, parse_ranges_header},
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, UnixListener};
@@ -78,7 +78,8 @@ use crate::{
         join_object_path, open_file, statx_info,
     },
     streaming::{
-        StreamCfg, WriteObjectDest, copy_file_to_file, stream_range_body, write_object_body,
+        StreamCfg, WriteObjectDest, copy_file_to_file, stream_multirange_body, stream_range_body,
+        write_object_body,
     },
     uring_io::UringIO,
 };
@@ -1101,9 +1102,7 @@ pub(crate) async fn collect_body_capped(
     cap: usize,
 ) -> Result<Bytes, BodyCapErr> {
     if let Some(advertised) = content_length_over_cap(headers, cap) {
-        return Err(BodyCapErr::TooLarge {
-            advertised: Some(advertised),
-        });
+        return Err(BodyCapErr::TooLarge { advertised: Some(advertised) });
     }
 
     let limited = http_body_util::Limited::new(body, cap);
@@ -1557,20 +1556,74 @@ async fn handle_get_object(
         );
     }
 
-    // Range parsing (single-range only)
-    let range_present = req.headers().get("range").is_some();
-    let range = match req.headers().get("range") {
+    // Range parsing (RFC 7233). A single range keeps the plain 206 path; two
+    // or more ranges produce a `multipart/byteranges` body (GET only). Any
+    // unsatisfiable range or more than `MAX_RANGES` → 416 (in the parser).
+    let ranges: Option<Vec<ByteRange>> = match req.headers().get("range") {
         None => None,
         Some(v) => match v.to_str() {
-            Ok(s) => match parse_range_header(s, size) {
-                Ok(r) => r,
+            Ok(s) => match parse_ranges_header(s, size) {
+                Ok(r) => Some(r),
                 Err(e) => return s32p_support::s3resp::invalid_range(&e.to_string(), None),
             },
             Err(_) => return s32p_support::s3resp::invalid_range("bad Range header", None),
         },
     };
 
-    let want = range.unwrap_or(ByteRange { start: 0, end_excl: size });
+    // Multi-range GET → multipart/byteranges. HEAD ignores multi-range (a
+    // multipart body is meaningless without a body) and falls through to the
+    // full-object 200 path below.
+    if !is_head_object && ranges.as_ref().is_some_and(|r| r.len() >= 2) {
+        let ranges = ranges.unwrap();
+        let boundary = s32p_support::s3resp::multirange_boundary();
+        let content_length =
+            s32p_support::s3resp::multirange_content_length(&boundary, &ranges, size);
+        let content_type = s32p_support::s3resp::multirange_content_type(&boundary);
+
+        let body = match stream_multirange_body(
+            obj_path.clone(),
+            size,
+            ranges,
+            boundary,
+            StreamCfg {
+                chunk_size: cfg.chunk_size,
+                inflight:   cfg.inflight,
+                direct_io:  cfg.direct_io,
+            },
+            app.uring.clone(),
+            app.pool.clone(),
+        )
+        .await
+        {
+            Ok(b) => b.boxed(),
+            Err(e) => {
+                return s32p_support::s3resp::internal_error(
+                    &e.to_string(),
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+
+        return s32p_support::s3resp::object_response(
+            StatusCode::PARTIAL_CONTENT,
+            body,
+            &content_type,
+            content_length,
+            &etag,
+            &last_modified,
+            None,
+        );
+    }
+
+    // Single-range (or no-range) path. A multi-range HEAD lands here with the
+    // Range deliberately ignored (range_present = false → full-object 200).
+    let single_range = match &ranges {
+        Some(r) if r.len() == 1 => Some(r[0]),
+        _ => None,
+    };
+    let range_present = single_range.is_some();
+    let want = single_range.unwrap_or(ByteRange { start: 0, end_excl: size });
     let want_len = want.end_excl - want.start;
 
     // HeadObject: same headers as GetObject, but no body
@@ -2221,11 +2274,8 @@ async fn handle_list_objects_v2(
         let etag = format_inode_etag(stx.ino);
         let size = stx.size;
 
-        let owner = if fetch_owner {
-            Some(owner_info(&app.nss_client, stx.uid).await)
-        } else {
-            None
-        };
+        let owner =
+            if fetch_owner { Some(owner_info(&app.nss_client, stx.uid).await) } else { None };
 
         contents.push(s32p_support::s3xml::ListObjectInfo {
             key,
@@ -4499,10 +4549,7 @@ mod tests {
     fn content_length_huge_value_rejected() {
         // The realistic DoS path: client claims a gigabyte body.
         let h = cl_headers("1073741824");
-        assert_eq!(
-            content_length_over_cap(&h, XML_BODY_MAX_BYTES),
-            Some(1_073_741_824)
-        );
+        assert_eq!(content_length_over_cap(&h, XML_BODY_MAX_BYTES), Some(1_073_741_824));
     }
 
     #[test]
