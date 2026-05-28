@@ -3293,12 +3293,13 @@ async fn handle_put_object(
     }
 
     // When the client supplied tagging at creation time, fail-fast before
-    // streaming the body if the backing FS can't store the xattr.
-    // Probing the bucket root (which is a symlink to the real bucket
-    // data dir — `xattr::list` follows it) avoids the alternative of
-    // streaming the body, materializing the object, and then discovering
-    // ENOTSUP from setxattr (which would leave a tagless object on disk
-    // contradicting the client's PUT contract).
+    // streaming the body if the backing FS can't store the xattr. The
+    // bucket root is a symlink to the real bucket data dir; the probe
+    // uses the deref variant so it lands on the same filesystem where
+    // `setxattr` will run. Avoids the alternative of streaming the body,
+    // materializing the object, and then discovering ENOTSUP from
+    // setxattr (which would leave a tagless object on disk contradicting
+    // the client's PUT contract).
     if tagging_header.is_some() {
         let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
             Ok(p) => p,
@@ -3920,28 +3921,12 @@ async fn handle_copy_object(
         );
     }
 
-    if let Err(e) = copy_file_to_file(
-        src_path.clone(),
-        dst_path.clone(),
-        size,
-        dst_striping,
-        StreamCfg {
-            chunk_size: cfg.chunk_size,
-            inflight:   cfg.inflight,
-            direct_io:  cfg.direct_io,
-        },
-        app.uring.clone(),
-        app.pool.clone(),
-    )
-    .await
-    {
-        return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
-    }
-
-    // Apply tagging on the destination per the directive resolved up top.
-    // REPLACE was already validated; COPY validates the source xattr now
-    // (strict: a corrupt source tagset fails the whole COPY rather than
-    // silently writing it through).
+    // Resolve the tag set the destination should end up with, validating
+    // any source xattr now (strict COPY: a corrupt source tag set fails
+    // the whole COPY rather than silently writing it through). Doing this
+    // before `copy_file_to_file` means a validation error doesn't leave a
+    // half-applied copy — the destination is never materialized when the
+    // source xattr is malformed. REPLACE was already validated up top.
     let dst_tags: String = match &copy_replace_tags {
         Some(s) => s.clone(),
         None => match read_tags(&src_path) {
@@ -3978,6 +3963,25 @@ async fn handle_copy_object(
             }
         },
     };
+
+    if let Err(e) = copy_file_to_file(
+        src_path.clone(),
+        dst_path.clone(),
+        size,
+        dst_striping,
+        StreamCfg {
+            chunk_size: cfg.chunk_size,
+            inflight:   cfg.inflight,
+            direct_io:  cfg.direct_io,
+        },
+        app.uring.clone(),
+        app.pool.clone(),
+    )
+    .await
+    {
+        return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+    }
+
     if let Err(e) = write_tags(&dst_path, &dst_tags) {
         tracing::warn!(
             dst = %dst_path.display(),

@@ -1184,6 +1184,82 @@ pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
 ///
 /// An empty body yields `false` (private). A body that fails to parse is an
 /// error so the caller can reject the request.
+pub fn parse_put_acl_request_world_readable(xml: &[u8]) -> Result<bool> {
+    if xml.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut in_grantee = false;
+    let mut in_uri = false;
+    let mut in_permission = false;
+
+    let mut current_uri: Option<String> = None;
+    let mut current_permission: Option<String> = None;
+    let mut world_readable = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"Grantee" {
+                    in_grantee = true;
+                    current_uri = None;
+                } else if in_grantee && local == b"URI" {
+                    in_uri = true;
+                } else if local == b"Grant" {
+                    current_permission = None;
+                } else if local == b"Permission" {
+                    in_permission = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"Grantee" {
+                    in_grantee = false;
+                } else if local == b"URI" {
+                    in_uri = false;
+                } else if local == b"Permission" {
+                    in_permission = false;
+                } else if local == b"Grant" {
+                    let public = current_uri.as_deref().is_some_and(|u| u.contains("AllUsers"));
+                    let perm = current_permission.as_deref().unwrap_or("");
+                    if public
+                        && (perm.eq_ignore_ascii_case("READ")
+                            || perm.eq_ignore_ascii_case("FULL_CONTROL"))
+                    {
+                        world_readable = true;
+                    }
+                    current_uri = None;
+                    current_permission = None;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let s = t
+                    .xml_content(XmlVersion::Implicit1_0)
+                    .map_err(|e| anyhow!("xml text decode error: {e}"))?
+                    .into_owned();
+                if in_uri {
+                    current_uri = Some(s);
+                } else if in_permission {
+                    current_permission = Some(s);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!("bad PutAcl XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(world_readable)
+}
+
 /// Parse a PutObjectTagging request body and return the tag set as
 /// URL-form-encoded text (`team=a&stage=raw`) — the same shape as the
 /// `x-amz-tagging` header and the on-disk xattr.
@@ -1316,80 +1392,4 @@ fn is_allowed_tag_chars(s: &str) -> bool {
         c.is_ascii_alphanumeric()
             || matches!(c, ' ' | '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
     })
-}
-
-pub fn parse_put_acl_request_world_readable(xml: &[u8]) -> Result<bool> {
-    if xml.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
-    }
-
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut buf = Vec::new();
-    let mut in_grantee = false;
-    let mut in_uri = false;
-    let mut in_permission = false;
-
-    let mut current_uri: Option<String> = None;
-    let mut current_permission: Option<String> = None;
-    let mut world_readable = false;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name = e.name();
-                let local = local_name(name.as_ref());
-                if local == b"Grantee" {
-                    in_grantee = true;
-                    current_uri = None;
-                } else if in_grantee && local == b"URI" {
-                    in_uri = true;
-                } else if local == b"Grant" {
-                    current_permission = None;
-                } else if local == b"Permission" {
-                    in_permission = true;
-                }
-            }
-            Ok(Event::End(e)) => {
-                let name = e.name();
-                let local = local_name(name.as_ref());
-                if local == b"Grantee" {
-                    in_grantee = false;
-                } else if local == b"URI" {
-                    in_uri = false;
-                } else if local == b"Permission" {
-                    in_permission = false;
-                } else if local == b"Grant" {
-                    let public = current_uri.as_deref().is_some_and(|u| u.contains("AllUsers"));
-                    let perm = current_permission.as_deref().unwrap_or("");
-                    if public
-                        && (perm.eq_ignore_ascii_case("READ")
-                            || perm.eq_ignore_ascii_case("FULL_CONTROL"))
-                    {
-                        world_readable = true;
-                    }
-                    current_uri = None;
-                    current_permission = None;
-                }
-            }
-            Ok(Event::Text(t)) => {
-                let s = t
-                    .xml_content(XmlVersion::Implicit1_0)
-                    .map_err(|e| anyhow!("xml text decode error: {e}"))?
-                    .into_owned();
-                if in_uri {
-                    current_uri = Some(s);
-                } else if in_permission {
-                    current_permission = Some(s);
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(anyhow!("bad PutAcl XML: {e}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    Ok(world_readable)
 }

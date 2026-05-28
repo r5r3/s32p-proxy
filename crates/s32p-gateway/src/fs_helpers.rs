@@ -475,11 +475,17 @@ pub fn remove_tags(path: &Path) -> io::Result<()> {
 }
 
 /// Probe whether the filesystem backing `path` supports `user.*` extended
-/// attributes. Uses `listxattr(path, NULL, 0)` (via `xattr::list`) — a
-/// read-only operation that requires no write permission and does not
-/// mutate any inode state. Returns `false` only for the canonical "no
-/// xattr support" errnos (`ENOTSUP` / `EOPNOTSUPP`); other errors propagate
-/// so callers don't infer "unsupported" from permission or quota issues.
+/// attributes. Uses `listxattr` (via `xattr::list_deref`) — a read-only
+/// operation that requires no write permission and does not mutate any
+/// inode state. Returns `false` only for the canonical "no xattr support"
+/// errnos (`ENOTSUP` / `EOPNOTSUPP`); other errors propagate so callers
+/// don't infer "unsupported" from permission or quota issues.
+///
+/// The deref variant matters because the staged `posix_root` layout
+/// exposes each bucket as a symlink to `bucket.data_path`. Probing the
+/// symlink with `llistxattr` would test the staging area's filesystem,
+/// not the bucket data filesystem — so we explicitly follow the final
+/// symlink to land on the same filesystem where `setxattr` will run.
 ///
 /// `user.*` xattr support is a property of the mount, so callers should
 /// cache by device id (see `MetadataExt::dev()`).
@@ -488,7 +494,7 @@ pub fn probe_user_xattrs_supported(path: &Path) -> io::Result<bool> {
     // arm is sufficient. The xattr crate also surfaces other errnos
     // (e.g. EACCES) as is — propagate so callers don't infer "unsupported"
     // from permission/quota issues.
-    match xattr::list(path) {
+    match xattr::list_deref(path) {
         Ok(_) => Ok(true),
         Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(false),
         Err(e) => Err(e),
