@@ -76,8 +76,8 @@ use crate::{
     buffer::{BufPool, PooledBuf, SliceOwner},
     fs_helpers::{
         LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path, flock_exclusive,
-        join_object_path, open_file, probe_user_xattrs_supported, read_tags, remove_tags,
-        statx_info, write_tags,
+        join_object_path, open_file, probe_user_xattrs_supported, read_content_type, read_tags,
+        read_user_meta, remove_tags, statx_info, write_content_type, write_tags, write_user_meta,
     },
     streaming::{
         StreamCfg, WriteObjectDest, copy_file_to_file, stream_multirange_body, stream_range_body,
@@ -329,6 +329,32 @@ fn user_xattrs_supported_for(app: &App, probe_path: &Path) -> io::Result<bool> {
     let supported = probe_user_xattrs_supported(probe_path)?;
     app.xattr_support.insert(dev, supported);
     Ok(supported)
+}
+
+/// Resolve the Content-Type and user metadata that HEAD/GET should report
+/// for `obj_path`. Implements the documented fallback ladder:
+///
+/// 1. `user.s32p.content_type` xattr (explicit, set by PutObject).
+/// 2. `user.mime_type` xattr (freedesktop standard, set by POSIX desktop
+///    tooling — read-only POSIX-interop).
+/// 3. `mime_guess::from_path(...).first_raw()` — extension map, zero-I/O.
+/// 4. `application/octet-stream` (the existing default).
+///
+/// User metadata is read from `user.s32p.meta` and decoded into ordered
+/// pairs. Both xattr reads gracefully degrade to "absent" on filesystems
+/// without `user.*` support (matches the POSIX-created file case).
+fn resolve_object_headers(obj_path: &Path) -> (String, Vec<(String, String)>) {
+    let content_type = read_content_type(obj_path)
+        .ok()
+        .flatten()
+        .or_else(|| mime_guess::from_path(obj_path).first_raw().map(str::to_string))
+        .unwrap_or_else(|| s32p_support::s3resp::OBJECT_CONTENT_TYPE.to_string());
+    let user_meta_urlform = read_user_meta(obj_path).unwrap_or_default();
+    let user_meta: Vec<(String, String)> =
+        url::form_urlencoded::parse(user_meta_urlform.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+    (content_type, user_meta)
 }
 
 pub(crate) fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
@@ -1746,14 +1772,20 @@ fn head_response_from_lstat(req: &Request<Incoming>, lmeta: &std::fs::Metadata) 
         }
     }
 
+    // Broken-symlink HEAD: we have only `lstat()` on the symlink itself, no
+    // resolved object path to read xattrs from. Fall back to the default
+    // Content-Type and no user metadata — same as a regular file with no
+    // metadata set. Listing already shows the symlink as a normal entry,
+    // so this keeps HEAD consistent.
     s32p_support::s3resp::object_response(
         StatusCode::OK,
         s32p_support::s3resp::empty_body(),
-        "application/octet-stream",
+        s32p_support::s3resp::OBJECT_CONTENT_TYPE,
         size,
         &etag,
         &last_modified,
         None,
+        &[],
     )
 }
 
@@ -1884,16 +1916,24 @@ async fn handle_get_object(
         }
     }
 
+    // Resolve stored Content-Type + user metadata once; reuse on every
+    // response branch (empty, multi-range, HEAD, fast-path, streamed).
+    // Multi-range responses still use `multirange_content_type` for the
+    // outer response (RFC 7233 requires `multipart/byteranges`), but
+    // x-amz-meta-* still echoes the stored set.
+    let (stored_content_type, user_meta) = resolve_object_headers(&obj_path);
+
     // Empty object: 200 + Content-Length: 0 (+ common headers)
     if size == 0 {
         return s32p_support::s3resp::object_response(
             StatusCode::OK,
             s32p_support::s3resp::empty_body(),
-            "application/octet-stream",
+            &stored_content_type,
             0,
             &etag,
             &last_modified,
             None,
+            &user_meta,
         );
     }
 
@@ -1954,6 +1994,7 @@ async fn handle_get_object(
             &etag,
             &last_modified,
             None,
+            &user_meta,
         );
     }
 
@@ -1986,11 +2027,12 @@ async fn handle_get_object(
         return s32p_support::s3resp::object_response(
             status,
             s32p_support::s3resp::empty_body(),
-            "application/octet-stream",
+            &stored_content_type,
             content_length,
             &etag,
             &last_modified,
             content_range.as_deref(),
+            &user_meta,
         );
     }
 
@@ -2023,11 +2065,12 @@ async fn handle_get_object(
         return s32p_support::s3resp::object_response(
             status,
             s32p_support::s3resp::body_bytes(bytes),
-            "application/octet-stream",
+            &stored_content_type,
             content_length,
             &etag,
             &last_modified,
             content_range.as_deref(),
+            &user_meta,
         );
     }
 
@@ -2069,11 +2112,12 @@ async fn handle_get_object(
     s32p_support::s3resp::object_response(
         status,
         body,
-        "application/octet-stream",
+        &stored_content_type,
         content_length,
         &etag,
         &last_modified,
         content_range.as_deref(),
+        &user_meta,
     )
 }
 
@@ -3292,15 +3336,71 @@ async fn handle_put_object(
         );
     }
 
-    // When the client supplied tagging at creation time, fail-fast before
-    // streaming the body if the backing FS can't store the xattr. The
-    // bucket root is a symlink to the real bucket data dir; the probe
-    // uses the deref variant so it lands on the same filesystem where
-    // `setxattr` will run. Avoids the alternative of streaming the body,
-    // materializing the object, and then discovering ENOTSUP from
-    // setxattr (which would leave a tagless object on disk contradicting
-    // the client's PUT contract).
-    if tagging_header.is_some() {
+    // Extract and validate the optional user metadata (`x-amz-meta-*`
+    // headers) and explicit `Content-Type`. Both rejected up front so a
+    // malformed value can't materialize a half-tagged object on disk.
+    let user_meta_urlform: String =
+        match s32p_support::s3resp::extract_user_meta_headers(req.headers()) {
+            Ok(s) => s,
+            Err(reason) => {
+                tracing::debug!("PutObject x-amz-meta-* invalid: {reason}");
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid x-amz-meta-* header",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        };
+    if let Err(reason) = s32p_support::s3xml::validate_user_metadata_urlform(&user_meta_urlform) {
+        tracing::debug!("PutObject user metadata invalid: {reason}");
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+            "invalid user metadata",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    let content_type_header: Option<String> =
+        match req.headers().get(http::header::CONTENT_TYPE).map(|v| v.to_str()) {
+            Some(Ok(s)) => Some(s.to_string()),
+            Some(Err(_)) => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid Content-Type header encoding",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            None => None,
+        };
+    if let Some(ct) = &content_type_header
+        && let Err(reason) = s32p_support::s3xml::validate_content_type(ct)
+    {
+        tracing::debug!("PutObject Content-Type invalid: {reason}");
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+            "invalid Content-Type header",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // When the client supplied tagging, user metadata, or an explicit
+    // Content-Type at creation time, fail-fast before streaming the body
+    // if the backing FS can't store xattrs. The bucket root is a symlink
+    // to the real bucket data dir; the probe uses the deref variant so it
+    // lands on the same filesystem where `setxattr` will run. Avoids
+    // streaming the body, materializing the object, and then discovering
+    // ENOTSUP from setxattr (which would leave an object on disk lacking
+    // the metadata the client believed they wrote).
+    let needs_xattr_probe =
+        tagging_header.is_some() || !user_meta_urlform.is_empty() || content_type_header.is_some();
+    if needs_xattr_probe {
         let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
             Ok(p) => p,
             Err(e) => {
@@ -3365,6 +3465,35 @@ async fn handle_put_object(
         );
         return s32p_support::s3resp::internal_error(
             "failed to write object tags",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
+
+    // Apply user metadata and Content-Type xattrs with the same
+    // create-or-replace semantics. Empty payload removes the xattr so
+    // PutObject of an existing key always lands on a clean slate.
+    if let Err(e) = write_user_meta(&obj_path, &user_meta_urlform) {
+        tracing::warn!(
+            path = %obj_path.display(),
+            error = %e,
+            "PutObject: failed to write user metadata xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write user metadata",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
+    let ct_to_write = content_type_header.as_deref().unwrap_or("");
+    if let Err(e) = write_content_type(&obj_path, ct_to_write) {
+        tracing::warn!(
+            path = %obj_path.display(),
+            error = %e,
+            "PutObject: failed to write Content-Type xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write Content-Type",
             Some(parts.uri.path()),
             None,
         );
@@ -3748,6 +3877,116 @@ async fn handle_copy_object(
         }
     }
 
+    // Resolve metadata directive and validate any REPLACE inputs up front.
+    // Parallel to the tagging directive block above. Default COPY mirrors
+    // the source's user metadata + Content-Type; REPLACE uses request
+    // headers (clears when none are supplied).
+    let metadata_directive_replace = match req
+        .headers()
+        .get("x-amz-metadata-directive")
+        .map(|v| v.to_str())
+    {
+        Some(Ok(s)) => match s.trim() {
+            "COPY" | "" => false,
+            "REPLACE" => true,
+            other => {
+                tracing::debug!(directive = %other, "CopyObject invalid x-amz-metadata-directive");
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid x-amz-metadata-directive (expected COPY or REPLACE)",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+        Some(Err(_)) => {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                "invalid x-amz-metadata-directive encoding",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+        None => false,
+    };
+    let copy_replace_user_meta: Option<String> = if metadata_directive_replace {
+        match s32p_support::s3resp::extract_user_meta_headers(req.headers()) {
+            Ok(s) => {
+                if let Err(reason) = s32p_support::s3xml::validate_user_metadata_urlform(&s) {
+                    tracing::debug!("CopyObject REPLACE user metadata invalid: {reason}");
+                    return s32p_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                        "invalid user metadata",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                Some(s)
+            }
+            Err(reason) => {
+                tracing::debug!("CopyObject REPLACE x-amz-meta-* invalid: {reason}");
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid x-amz-meta-* header",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let copy_replace_content_type: Option<String> = if metadata_directive_replace {
+        match req.headers().get(http::header::CONTENT_TYPE).map(|v| v.to_str()) {
+            Some(Ok(s)) => {
+                if let Err(reason) = s32p_support::s3xml::validate_content_type(s) {
+                    tracing::debug!("CopyObject REPLACE Content-Type invalid: {reason}");
+                    return s32p_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                        "invalid Content-Type header",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                Some(s.to_string())
+            }
+            Some(Err(_)) => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid Content-Type header encoding",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            None => Some(String::new()),
+        }
+    } else {
+        None
+    };
+
+    // Fail-fast probe for REPLACE with non-empty metadata/Content-Type
+    // on a backing FS that doesn't support `user.*` xattrs. COPY and
+    // REPLACE-clears go through paths that handle ENOTSUP gracefully.
+    let metadata_needs_probe = copy_replace_user_meta.as_deref().is_some_and(|s| !s.is_empty())
+        || copy_replace_content_type.as_deref().is_some_and(|s| !s.is_empty());
+    if metadata_needs_probe {
+        let dst_root = match bucket_root_path(&cfg.posix_root, dst_bucket) {
+            Ok(p) => p,
+            Err(e) => {
+                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+            }
+        };
+        if let Some(resp) = require_xattr_support(&app, &dst_root, req.uri().path()) {
+            return resp;
+        }
+    }
+
     // source and destination must not contain the multipart upload directory
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
         || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
@@ -3964,6 +4203,93 @@ async fn handle_copy_object(
         },
     };
 
+    // Resolve destination user metadata and Content-Type — same strict-
+    // validate-before-copy posture as tagging. REPLACE values were
+    // validated above; COPY reads the source xattr now so a corrupt
+    // source rejects the COPY before the file content is materialized.
+    // Reading absent xattrs from the source yields the empty string,
+    // which translates to "destination has no metadata" — same as a
+    // fresh POSIX-created file.
+    let dst_user_meta: String = match &copy_replace_user_meta {
+        Some(s) => s.clone(),
+        None => match read_user_meta(&src_path) {
+            Ok(s) => {
+                if !s.is_empty()
+                    && let Err(reason) = s32p_support::s3xml::validate_user_metadata_urlform(&s)
+                {
+                    tracing::debug!(
+                        src = %src_path.display(),
+                        reason,
+                        "CopyObject: source user metadata fails validation"
+                    );
+                    return s32p_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                        "source object has invalid user metadata",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                s
+            }
+            Err(e) => {
+                tracing::warn!(
+                    src = %src_path.display(),
+                    error = %e,
+                    "CopyObject: failed to read source user metadata xattr"
+                );
+                return s32p_support::s3resp::internal_error(
+                    "failed to read source user metadata",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+    };
+    let dst_content_type: String = match &copy_replace_content_type {
+        Some(s) => s.clone(),
+        None => {
+            // Default COPY: mirror what HEAD/GET on the source would have
+            // reported — including the freedesktop `user.mime_type`
+            // fallback. Writing the resolved value to the dst's explicit
+            // `user.s32p.content_type` xattr keeps S3-visible state stable
+            // across COPY (S3 client sees the same Content-Type as before).
+            // The source's freedesktop xattr is unchanged.
+            match read_content_type(&src_path) {
+                Ok(Some(s)) => {
+                    if let Err(reason) = s32p_support::s3xml::validate_content_type(&s) {
+                        tracing::debug!(
+                            src = %src_path.display(),
+                            reason,
+                            "CopyObject: source Content-Type fails validation"
+                        );
+                        return s32p_support::s3resp::s3_error(
+                            StatusCode::BAD_REQUEST,
+                            s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                            "source object has invalid Content-Type",
+                            Some(req.uri().path()),
+                            None,
+                        );
+                    }
+                    s
+                }
+                Ok(None) => String::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        src = %src_path.display(),
+                        error = %e,
+                        "CopyObject: failed to read source Content-Type xattr"
+                    );
+                    return s32p_support::s3resp::internal_error(
+                        "failed to read source Content-Type",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+            }
+        }
+    };
+
     if let Err(e) = copy_file_to_file(
         src_path.clone(),
         dst_path.clone(),
@@ -3990,6 +4316,31 @@ async fn handle_copy_object(
         );
         return s32p_support::s3resp::internal_error(
             "failed to write destination object tags",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    if let Err(e) = write_user_meta(&dst_path, &dst_user_meta) {
+        tracing::warn!(
+            dst = %dst_path.display(),
+            error = %e,
+            "CopyObject: failed to write destination user metadata xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write destination user metadata",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if let Err(e) = write_content_type(&dst_path, &dst_content_type) {
+        tracing::warn!(
+            dst = %dst_path.display(),
+            error = %e,
+            "CopyObject: failed to write destination Content-Type xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write destination Content-Type",
             Some(req.uri().path()),
             None,
         );

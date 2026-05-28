@@ -542,6 +542,7 @@ fn apply_object_headers(
     etag: &str,
     last_modified: &str,
     content_range: Option<&str>,
+    user_meta: &[(String, String)],
 ) {
     // Required / expected by most S3 clients
     headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
@@ -552,6 +553,19 @@ fn apply_object_headers(
 
     if let Some(cr) = content_range {
         headers.insert(CONTENT_RANGE, cr.parse().unwrap());
+    }
+
+    for (k, v) in user_meta {
+        // Keys are pre-lowercased by `extract_user_meta_headers` and validated;
+        // value HeaderValue may still reject control characters — silently
+        // skip pairs that fail the conversion so a malformed stored value
+        // can't poison the entire response.
+        let name = format!("x-amz-meta-{k}");
+        if let (Ok(name), Ok(value)) =
+            (http::HeaderName::try_from(name.as_str()), http::HeaderValue::try_from(v.as_str()))
+        {
+            headers.insert(name, value);
+        }
     }
 
     // Keep consistent across all object responses from the gateway.
@@ -572,6 +586,7 @@ pub fn object_response(
     etag: &str,
     last_modified: &str,
     content_range: Option<&str>,
+    user_meta: &[(String, String)],
 ) -> HttpResponse {
     let mut resp = Response::new(body);
     *resp.status_mut() = status;
@@ -583,9 +598,39 @@ pub fn object_response(
         etag,
         last_modified,
         content_range,
+        user_meta,
     );
 
     resp
+}
+
+/// Extract `x-amz-meta-*` headers from a request and return them as a
+/// URL-form-encoded payload (`author=alice&purpose=demo`) suitable for
+/// storing in the `user.s32p.meta` xattr. Keys are lowercased on the way
+/// out — AWS lowercases user-metadata keys on response, so storing them
+/// lowercased matches the wire shape.
+///
+/// Returns `Err` only when an `x-amz-meta-` header value is not valid
+/// HTTP (already enforced by the HTTP layer, so this is mostly a
+/// belt-and-braces guard). Returns an empty string when no metadata
+/// headers are present.
+pub fn extract_user_meta_headers(
+    headers: &http::HeaderMap,
+) -> std::result::Result<String, &'static str> {
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    let mut any = false;
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if let Some(suffix) = name_str.strip_prefix("x-amz-meta-") {
+            if suffix.is_empty() {
+                return Err("x-amz-meta- header with empty key");
+            }
+            let v = value.to_str().map_err(|_| "non-ASCII x-amz-meta-* header value")?;
+            out.append_pair(&suffix.to_ascii_lowercase(), v);
+            any = true;
+        }
+    }
+    if any { Ok(out.finish()) } else { Ok(String::new()) }
 }
 
 /// Convenience: ListObjectsV1 success (200).

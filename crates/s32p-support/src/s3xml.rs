@@ -1393,3 +1393,120 @@ fn is_allowed_tag_chars(s: &str) -> bool {
             || matches!(c, ' ' | '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
     })
 }
+
+/// Validate a URL-form-encoded user-metadata payload against the limits
+/// the gateway will enforce.
+///
+/// The payload is the same shape the gateway stores in `user.s32p.meta`
+/// (`author=alice&purpose=demo`). Keys are expected to be already
+/// lowercased by the caller (`extract_user_meta_headers`).
+///
+/// Enforces:
+/// - total URL-form payload ≤ 2048 bytes (AWS's documented user-metadata cap)
+/// - ≤ 32 pairs (defensive; AWS bounds via size, count caps prevent abuse)
+/// - keys 1..=128 chars; charset `[A-Za-z0-9_-]` (HTTP-token shape after the
+///   `x-amz-meta-` prefix is stripped)
+/// - values 0..=1024 chars; UTF-8; no C0 control bytes other than tab/CR/LF
+/// - no duplicate keys (already lowercased; AWS treats meta keys case-
+///   insensitively on the wire)
+///
+/// Returns `Err` with a static reason string suitable for tracing; callers
+/// should respond `400 InvalidArgument`.
+pub fn validate_user_metadata_urlform(s: &str) -> std::result::Result<(), &'static str> {
+    if s.len() > 2048 {
+        return Err("user metadata payload exceeds 2048 bytes");
+    }
+    if s.is_empty() {
+        return Ok(());
+    }
+
+    let mut count = 0usize;
+    let mut seen_keys: Vec<String> = Vec::with_capacity(8);
+    for (k, v) in url::form_urlencoded::parse(s.as_bytes()) {
+        count += 1;
+        if count > 32 {
+            return Err("user metadata contains more than 32 pairs");
+        }
+        let k_chars = k.chars().count();
+        if k_chars == 0 || k_chars > 128 {
+            return Err("user metadata key length out of range (1..=128)");
+        }
+        if !is_allowed_meta_key_chars(&k) {
+            return Err("user metadata key contains disallowed characters");
+        }
+        let v_chars = v.chars().count();
+        if v_chars > 1024 {
+            return Err("user metadata value length out of range (0..=1024)");
+        }
+        if !is_allowed_meta_value_chars(&v) {
+            return Err("user metadata value contains disallowed control characters");
+        }
+        if seen_keys.iter().any(|seen| seen == k.as_ref()) {
+            return Err("duplicate user metadata key");
+        }
+        seen_keys.push(k.into_owned());
+    }
+    Ok(())
+}
+
+/// Validate a Content-Type value. Minimal grammar — accepts
+/// `type/subtype` with optional `; param=value` runs. Caps total length at
+/// 256 bytes. Designed to reject obviously bad input (no slash, empty
+/// type/subtype, control characters); not a full RFC 2045 parser.
+pub fn validate_content_type(s: &str) -> std::result::Result<(), &'static str> {
+    if s.is_empty() {
+        return Err("Content-Type must not be empty");
+    }
+    if s.len() > 256 {
+        return Err("Content-Type exceeds 256 bytes");
+    }
+    if s.bytes().any(|b| (b < 0x20 && !matches!(b, b'\t')) || b == 0x7f) {
+        return Err("Content-Type contains control characters");
+    }
+    // Split off parameters at the first `;`; the part before must be type/subtype.
+    let (head, _params) = match s.split_once(';') {
+        Some((h, p)) => (h.trim(), Some(p)),
+        None => (s.trim(), None),
+    };
+    let (ty, sub) = head.split_once('/').ok_or("Content-Type missing '/'")?;
+    let ty = ty.trim();
+    let sub = sub.trim();
+    if ty.is_empty() || sub.is_empty() {
+        return Err("Content-Type has empty type or subtype");
+    }
+    if !ty.bytes().all(is_mime_token_byte) || !sub.bytes().all(is_mime_token_byte) {
+        return Err("Content-Type type/subtype contains disallowed characters");
+    }
+    Ok(())
+}
+
+fn is_allowed_meta_key_chars(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_allowed_meta_value_chars(s: &str) -> bool {
+    // Permit UTF-8 freely. Reject C0 control bytes except common whitespace.
+    s.bytes().all(|b| b >= 0x20 || matches!(b, b'\t' | b'\r' | b'\n'))
+}
+
+fn is_mime_token_byte(b: u8) -> bool {
+    // RFC 7230 / 2045 token: visible ASCII minus separators.
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}

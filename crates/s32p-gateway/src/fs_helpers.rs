@@ -500,3 +500,94 @@ pub fn probe_user_xattrs_supported(path: &Path) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
+
+/* -------------------------
+ * Object metadata xattrs
+ *
+ * User-defined metadata (`x-amz-meta-*`) lives in a single xattr
+ * `user.s32p.meta` whose value is the URL-form encoding of the pair set
+ * (`author=alice&purpose=demo`). Content-Type lives in `user.s32p.content_type`.
+ * Both are absent for POSIX-created files, in which case the gateway falls back
+ * to derived values (empty user metadata, ladder-resolved Content-Type).
+ *
+ * Read-only POSIX-interop: `user.mime_type` is the freedesktop standard
+ * xattr populated by file managers (GNOME/KDE) and `gio set`. The gateway
+ * consults it as a Content-Type fallback but never writes it, leaving the
+ * desktop xattr under POSIX users' control.
+ * ------------------------- */
+
+pub const USER_META_XATTR: &str = "user.s32p.meta";
+pub const CONTENT_TYPE_XATTR: &str = "user.s32p.content_type";
+pub const FREEDESKTOP_MIME_XATTR: &str = "user.mime_type";
+
+/// Read the user-metadata xattr from `path`. Returns the empty string when
+/// the attribute is absent or the backing filesystem doesn't support
+/// `user.*` xattrs.
+pub fn read_user_meta(path: &Path) -> io::Result<String> {
+    match xattr::get(path, USER_META_XATTR) {
+        Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(None) => Ok(String::new()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace (or remove, if `meta_urlform` is empty) the user-metadata xattr.
+pub fn write_user_meta(path: &Path, meta_urlform: &str) -> io::Result<()> {
+    if meta_urlform.is_empty() {
+        return remove_user_meta(path);
+    }
+    xattr::set(path, USER_META_XATTR, meta_urlform.as_bytes())
+}
+
+/// Remove the user-metadata xattr from `path`. Idempotent.
+pub fn remove_user_meta(path: &Path) -> io::Result<()> {
+    match xattr::remove(path, USER_META_XATTR) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resolve a stored Content-Type. Prefers `user.s32p.content_type` (set by
+/// PutObject), falls back to `user.mime_type` (freedesktop standard, set by
+/// POSIX desktop tooling). Returns `None` when neither is set or the
+/// filesystem doesn't support `user.*` xattrs — callers then continue
+/// down the resolution ladder (extension map, then default octet-stream).
+pub fn read_content_type(path: &Path) -> io::Result<Option<String>> {
+    if let Some(v) = read_xattr_string(path, CONTENT_TYPE_XATTR)? {
+        return Ok(Some(v));
+    }
+    read_xattr_string(path, FREEDESKTOP_MIME_XATTR)
+}
+
+/// Write the explicit Content-Type xattr (or remove it when `ct` is empty).
+/// Only ever touches `user.s32p.content_type` — never `user.mime_type`, so
+/// the freedesktop xattr stays under POSIX users' control.
+pub fn write_content_type(path: &Path, ct: &str) -> io::Result<()> {
+    if ct.is_empty() {
+        return remove_content_type(path);
+    }
+    xattr::set(path, CONTENT_TYPE_XATTR, ct.as_bytes())
+}
+
+/// Remove the explicit Content-Type xattr. Idempotent. Does not touch
+/// `user.mime_type`.
+pub fn remove_content_type(path: &Path) -> io::Result<()> {
+    match xattr::remove(path, CONTENT_TYPE_XATTR) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_xattr_string(path: &Path, name: &str) -> io::Result<Option<String>> {
+    match xattr::get(path, name) {
+        Ok(Some(bytes)) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Ok(None) => Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
