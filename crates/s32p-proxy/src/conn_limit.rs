@@ -93,10 +93,7 @@ impl ConnectionLimiter {
             return AcquireOutcome::Bypassed;
         }
 
-        let counter = self
-            .inflight
-            .entry(ip)
-            .or_insert_with(|| AtomicU64::new(0));
+        let counter = self.inflight.entry(ip).or_insert_with(|| AtomicU64::new(0));
         let prev = counter.fetch_add(1, Ordering::Relaxed);
         if prev >= self.per_ip {
             counter.fetch_sub(1, Ordering::Relaxed);

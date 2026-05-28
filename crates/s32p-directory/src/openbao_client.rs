@@ -57,9 +57,9 @@ impl OpenBaoClient {
         let token = token.into();
         Self {
             address: address.into().trim_end_matches('/').to_string(),
-            auth:    OpenBaoAuth::Token(token.clone()),
+            auth: OpenBaoAuth::Token(token.clone()),
             http,
-            state:   Arc::new(Mutex::new(TokenState { token: Some(token), expires_at: None })),
+            state: Arc::new(Mutex::new(TokenState { token: Some(token), expires_at: None })),
         }
     }
 
@@ -73,13 +73,13 @@ impl OpenBaoClient {
     ) -> Self {
         Self {
             address: address.into().trim_end_matches('/').to_string(),
-            auth:    OpenBaoAuth::AppRole {
+            auth: OpenBaoAuth::AppRole {
                 mount:     trim_slashes(&approle_mount.into()),
                 role_id:   role_id.into(),
                 secret_id: secret_id.into(),
             },
             http,
-            state:   Arc::new(Mutex::new(TokenState { token: None, expires_at: None })),
+            state: Arc::new(Mutex::new(TokenState { token: None, expires_at: None })),
         }
     }
 

@@ -38,15 +38,15 @@ impl WorkerKey {
 }
 
 pub struct WorkerManager {
-    cfg:             WorkersConfig,
-    server_cfg:      ServerConfig,
-    slots:           DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
-    sweeper_started: AtomicBool,
+    cfg:                WorkersConfig,
+    server_cfg:         ServerConfig,
+    slots:              DashMap<WorkerKey, Arc<WorkerSlot>>, // keyed by (access_key, worker_profile)
+    sweeper_started:    AtomicBool,
     /// `S32P_NSS_PROXY_SOCK` value to inject into every worker's env. Empty
     /// string disables the lookup proxy (workers fall back to direct
     /// `getpwuid_r` — only sensible without Landlock). Set at construction
     /// from the proxy's pre-bound abstract socket name.
-    nss_sock_env:    String,
+    nss_sock_env:       String,
     /// Directory handle (the same cached one the request path uses) so the
     /// reconciler can refetch a worker's user + bucket snapshot and detect
     /// revocations / new grants.
@@ -90,23 +90,23 @@ impl fmt::Display for WorkerEndpoint {
 }
 
 pub struct WorkerHandle {
-    pub key:          WorkerKey,
-    pub username:     String,
-    pub endpoint:     WorkerEndpoint,
-    pub posix_root:   PathBuf,
+    pub key:           WorkerKey,
+    pub username:      String,
+    pub endpoint:      WorkerEndpoint,
+    pub posix_root:    PathBuf,
     /// Random per-spawn secret. Echoed back by the proxy's
     /// `upstream_request_filter` as `X-S32P-Validated: <worker_token>` when
     /// forwarding session-validated requests; the worker compares against its
     /// env-loaded `S32P_WORKER_TOKEN` to short-circuit SigV4 re-validation.
     /// Regenerated on every spawn; never persisted.
-    pub worker_token: String,
+    pub worker_token:  String,
     /// SipHash of the directory snapshot (user credentials + accessible bucket
     /// set) this worker was spawned from. The reconciler recomputes it from the
     /// current directory and recycles the worker on a mismatch.
     spawn_fingerprint: u64,
-    tempdir:          Mutex<Option<TempDir>>,
-    last_used_unix:   AtomicU64,
-    child:            Mutex<Child>,
+    tempdir:           Mutex<Option<TempDir>>,
+    last_used_unix:    AtomicU64,
+    child:             Mutex<Child>,
 }
 
 impl WorkerHandle {
@@ -322,7 +322,12 @@ impl WorkerManager {
     /// park the old process on the retiring list to drain its in-flight
     /// requests until `grace_secs` elapses, at which point `sweep_once`
     /// terminates it.
-    async fn retire_worker(self: &Arc<Self>, key: &WorkerKey, handle: Arc<WorkerHandle>, grace_secs: u64) {
+    async fn retire_worker(
+        self: &Arc<Self>,
+        key: &WorkerKey,
+        handle: Arc<WorkerHandle>,
+        grace_secs: u64,
+    ) {
         if let Some(slot) = self.slots.get(key) {
             let mut state = slot.state.lock().await;
             // Only retire if this exact handle is still the running one — a

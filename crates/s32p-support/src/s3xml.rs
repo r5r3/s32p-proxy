@@ -67,6 +67,17 @@ pub mod error_code {
     /// when the object has no retention or legal-hold metadata. Used by the
     /// `aws_compat` routing target for the same reason.
     pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION: &str = "NoSuchObjectLockConfiguration";
+
+    /// Returned by tagging operations when the supplied tag set violates AWS
+    /// constraints: too many pairs, key/value length out of range, disallowed
+    /// characters, duplicate keys, or oversized total payload. AWS uses this
+    /// single code for all tag-shape violations.
+    pub const INVALID_TAG: &str = "InvalidTag";
+
+    /// Body of a PUT-style request could not be parsed as the expected XML
+    /// schema. Used by PutObjectTagging when the body isn't valid XML or
+    /// doesn't match the `<Tagging>` structure.
+    pub const MALFORMED_XML: &str = "MalformedXML";
 }
 
 /// Minimal bucket info used by ListBuckets.
@@ -221,6 +232,21 @@ pub fn get_acl_body(
         access_control_list: AccessControlList { grant: grants },
     };
 
+    let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
+    Ok(xml.into_bytes())
+}
+
+/// Build XML body for GetObjectTagging.
+///
+/// `tags_urlform` is the stored URL-form payload (`team=a&stage=raw`), matching
+/// the wire shape of the `x-amz-tagging` header. An empty input renders an
+/// empty `<TagSet/>` — the AWS-required response when no tags exist.
+pub fn get_object_tagging_body(tags_urlform: &str) -> Result<Vec<u8>> {
+    let tags: Vec<TagEntry> = url::form_urlencoded::parse(tags_urlform.as_bytes())
+        .map(|(k, v)| TagEntry { key: k.into_owned(), value: v.into_owned() })
+        .collect();
+
+    let doc = TaggingDoc { xmlns: S3_XMLNS, tag_set: TagSetDoc { tag: tags } };
     let xml = to_xml_string(&doc).map_err(|e| anyhow!("xml serialize error: {e}"))?;
     Ok(xml.into_bytes())
 }
@@ -753,6 +779,31 @@ struct Grantee {
     uri:          Option<String>,
 }
 
+// --- internal DTOs for GetObjectTagging ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "Tagging")]
+struct TaggingDoc {
+    #[serde(rename = "@xmlns")]
+    xmlns:   &'static str,
+    #[serde(rename = "TagSet")]
+    tag_set: TagSetDoc,
+}
+
+#[derive(Debug, Serialize)]
+struct TagSetDoc {
+    #[serde(rename = "Tag", default)]
+    tag: Vec<TagEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct TagEntry {
+    #[serde(rename = "Key")]
+    key:   String,
+    #[serde(rename = "Value")]
+    value: String,
+}
+
 // --- public DTOs for ListObjectsV2 ---
 
 #[derive(Clone, Debug)]
@@ -1133,6 +1184,140 @@ pub fn parse_complete_parts(xml: &[u8]) -> Result<Vec<u32>> {
 ///
 /// An empty body yields `false` (private). A body that fails to parse is an
 /// error so the caller can reject the request.
+/// Parse a PutObjectTagging request body and return the tag set as
+/// URL-form-encoded text (`team=a&stage=raw`) — the same shape as the
+/// `x-amz-tagging` header and the on-disk xattr.
+///
+/// Accepts AWS's documented shape:
+/// `<Tagging><TagSet><Tag><Key>…</Key><Value>…</Value></Tag>…</TagSet></Tagging>`.
+/// Empty body or empty `<TagSet/>` produces an empty string (caller treats as
+/// "clear all tags"). The returned string is **unvalidated** — call
+/// `validate_tagging_urlform` separately to enforce S3 size/count/charset
+/// limits.
+pub fn parse_object_tagging_request(xml: &[u8]) -> Result<String> {
+    if xml.iter().all(u8::is_ascii_whitespace) {
+        return Ok(String::new());
+    }
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut in_key = false;
+    let mut in_value = false;
+    let mut current_key: Option<String> = None;
+    let mut current_value: Option<String> = None;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"Tag" {
+                    current_key = None;
+                    current_value = None;
+                } else if local == b"Key" {
+                    in_key = true;
+                } else if local == b"Value" {
+                    in_value = true;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+                if local == b"Key" {
+                    in_key = false;
+                } else if local == b"Value" {
+                    in_value = false;
+                } else if local == b"Tag" {
+                    // Both Key and Value must be present per AWS schema;
+                    // a missing Value is treated as empty string.
+                    let k = current_key.take().ok_or_else(|| anyhow!("Tag missing Key"))?;
+                    let v = current_value.take().unwrap_or_default();
+                    pairs.push((k, v));
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let s = t
+                    .xml_content(XmlVersion::Implicit1_0)
+                    .map_err(|e| anyhow!("xml text decode error: {e}"))?
+                    .into_owned();
+                if in_key {
+                    current_key = Some(s);
+                } else if in_value {
+                    current_value = Some(s);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(anyhow!("bad Tagging XML: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        out.append_pair(&k, &v);
+    }
+    Ok(out.finish())
+}
+
+/// Validate a URL-form-encoded tag set against S3 limits.
+///
+/// Enforces:
+/// - ≤ 10 pairs
+/// - total payload ≤ 2048 bytes (fits comfortably in one ext4 xattr block)
+/// - keys 1..=128 chars, values 0..=256 chars (after URL-decode, in chars)
+/// - charset (after URL-decode): letters, digits, space, and `+-=._:/@`
+///   — AWS's documented allowed set for tag keys/values
+/// - no duplicate keys
+///
+/// Returns `Err` with a static reason string suitable for tracing on failure;
+/// callers should respond `400 InvalidTag`.
+pub fn validate_tagging_urlform(s: &str) -> std::result::Result<(), &'static str> {
+    if s.len() > 2048 {
+        return Err("tag set payload exceeds 2048 bytes");
+    }
+    if s.is_empty() {
+        return Ok(());
+    }
+
+    let mut count = 0usize;
+    let mut seen_keys: Vec<String> = Vec::with_capacity(10);
+    for (k, v) in url::form_urlencoded::parse(s.as_bytes()) {
+        count += 1;
+        if count > 10 {
+            return Err("tag set contains more than 10 pairs");
+        }
+        let k_chars = k.chars().count();
+        if k_chars == 0 || k_chars > 128 {
+            return Err("tag key length out of range (1..=128)");
+        }
+        if v.chars().count() > 256 {
+            return Err("tag value length out of range (0..=256)");
+        }
+        if !is_allowed_tag_chars(&k) {
+            return Err("tag key contains disallowed characters");
+        }
+        if !is_allowed_tag_chars(&v) {
+            return Err("tag value contains disallowed characters");
+        }
+        if seen_keys.iter().any(|seen| seen == k.as_ref()) {
+            return Err("duplicate tag key");
+        }
+        seen_keys.push(k.into_owned());
+    }
+    Ok(())
+}
+
+fn is_allowed_tag_chars(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, ' ' | '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
+    })
+}
+
 pub fn parse_put_acl_request_world_readable(xml: &[u8]) -> Result<bool> {
     if xml.iter().all(u8::is_ascii_whitespace) {
         return Ok(false);

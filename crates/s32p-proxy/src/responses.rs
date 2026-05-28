@@ -3,13 +3,12 @@ use pingora::{
     http::{ResponseHeader, StatusCode},
     proxy::Session,
 };
-use s32p_support::{
-    classifier::{ObjectLockOp, S3Op, VersioningOp},
-    s3resp,
-    s3xml,
-};
 // Re-export shared error codes + shared bucket info type to keep call-sites unchanged.
 pub use s32p_support::s3xml::error_code;
+use s32p_support::{
+    classifier::{ObjectLockOp, S3Op, VersioningOp},
+    s3resp, s3xml,
+};
 
 /* -------------------------
  * Hyper -> Pingora adapter
@@ -142,10 +141,7 @@ pub fn aws_compat_response(op: &S3Op, resource: Option<&str>) -> s3resp::HttpRes
         // AWS returns 400 InvalidRequest with this exact message string
         // (clients sometimes match on it).
         S3Op::ObjectLock(ObjectLockOp::PutObjectRetention | ObjectLockOp::PutObjectLegalHold) => {
-            s3resp::invalid_request(
-                "Bucket is missing Object Lock Configuration",
-                resource,
-            )
+            s3resp::invalid_request("Bucket is missing Object Lock Configuration", resource)
         }
 
         // HeadService: `HEAD /` is not a documented S3 op (only `GET /` for
@@ -182,8 +178,9 @@ pub async fn respond_aws_compat(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use s32p_support::classifier::BucketAdminOp;
+
+    use super::*;
 
     /// Drain the HttpResponse body for inspection. Returns (status, body bytes).
     /// Async because BodyExt::collect is — but BoxBody<_, Infallible> never
@@ -279,10 +276,7 @@ mod tests {
         // see the spec-accurate response without a SigV4 round-trip or
         // worker involvement.
         let resp = aws_compat_response(&S3Op::HeadService, None);
-        let allow = resp
-            .headers()
-            .get("Allow")
-            .map(|v| v.to_str().unwrap().to_string());
+        let allow = resp.headers().get("Allow").map(|v| v.to_str().unwrap().to_string());
         let (status, body) = body_bytes(resp).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(allow.as_deref(), Some("GET"));

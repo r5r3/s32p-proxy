@@ -591,13 +591,9 @@ pub fn verify_sigv4_presigned_url(
 /// Called from both [`parse_authorization`] and [`parse_presigned_query`]
 /// so the requirement holds for header-signed and presigned-URL paths.
 fn require_host_signed(signed_headers: &str) -> Result<()> {
-    let has_host = signed_headers
-        .split(';')
-        .any(|h| h.trim().eq_ignore_ascii_case("host"));
+    let has_host = signed_headers.split(';').any(|h| h.trim().eq_ignore_ascii_case("host"));
     if !has_host {
-        return Err(anyhow!(
-            "SignedHeaders must include 'host' (AWS SigV4 requirement)"
-        ));
+        return Err(anyhow!("SignedHeaders must include 'host' (AWS SigV4 requirement)"));
     }
     Ok(())
 }
@@ -1073,8 +1069,7 @@ mod fastfail_tests {
 
     /// Canonical-shape valid signature: 64 lowercase hex chars + 8-digit date.
     /// The HMAC step alone validates the actual bytes; we only check structure.
-    const GOOD_SIG: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const GOOD_SIG: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const GOOD_DATE: &str = "20260521";
 
     #[test]
@@ -1163,10 +1158,8 @@ mod host_signed_tests {
 
     use super::{parse_authorization, parse_presigned_query};
 
-    const CRED: &str =
-        "AKIAIOSFODNN7EXAMPLE/20260521/us-east-1/s3/aws4_request";
-    const SIG: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CRED: &str = "AKIAIOSFODNN7EXAMPLE/20260521/us-east-1/s3/aws4_request";
+    const SIG: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn auth_header(signed_headers: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1199,10 +1192,7 @@ mod host_signed_tests {
     fn header_auth_without_host_rejected() {
         let err = parse_authorization(&auth_header("x-amz-content-sha256;x-amz-date"))
             .expect_err("no host → reject");
-        assert!(
-            err.to_string().to_lowercase().contains("host"),
-            "error should name host: {err}"
-        );
+        assert!(err.to_string().to_lowercase().contains("host"), "error should name host: {err}");
     }
 
     #[test]
@@ -1211,8 +1201,7 @@ mod host_signed_tests {
         // AWS canonical form is lowercase; the check is case-insensitive
         // to avoid spurious rejections at the parse layer (the HMAC step
         // is what actually compares bytes).
-        parse_authorization(&auth_header("Host;x-amz-date"))
-            .expect("uppercase Host → ok");
+        parse_authorization(&auth_header("Host;x-amz-date")).expect("uppercase Host → ok");
     }
 
     #[test]
@@ -1224,12 +1213,8 @@ mod host_signed_tests {
 
     #[test]
     fn presign_without_host_rejected() {
-        let err = parse_presigned_query(&presign_uri("x-amz-date"))
-            .expect_err("no host → reject");
-        assert!(
-            err.to_string().to_lowercase().contains("host"),
-            "error should name host: {err}"
-        );
+        let err = parse_presigned_query(&presign_uri("x-amz-date")).expect_err("no host → reject");
+        assert!(err.to_string().to_lowercase().contains("host"), "error should name host: {err}");
     }
 }
 

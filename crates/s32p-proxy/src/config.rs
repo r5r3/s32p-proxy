@@ -348,8 +348,8 @@ pub struct LauncherConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LifecycleConfig {
-    pub idle_timeout_secs:   u64,
-    pub sweep_interval_secs: u64,
+    pub idle_timeout_secs:       u64,
+    pub sweep_interval_secs:     u64,
     /// How often the reconciler re-checks each live worker's directory
     /// snapshot (user credentials + accessible bucket set) and recycles any
     /// whose snapshot changed (revocation propagation and new-bucket

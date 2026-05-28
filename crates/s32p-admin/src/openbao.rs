@@ -60,13 +60,7 @@ impl OpenBaoAdmin {
         Ok(Self {
             kv_mount: trim_slashes(&kv_mount.into()),
             layout:   DirectoryLayout::new(prefix.into()),
-            client:   OpenBaoClient::new_approle(
-                address,
-                approle_mount,
-                role_id,
-                secret_id,
-                http,
-            ),
+            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id, http),
         })
     }
 
@@ -472,8 +466,7 @@ path "{kv_mount}/metadata/{prefix}/*" {{
             .mode(0o600)
             .open(path)
             .with_context(|| format!("open yaml file {path}"))?;
-        f.write_all(s.as_bytes())
-            .with_context(|| format!("write yaml file {path}"))?;
+        f.write_all(s.as_bytes()).with_context(|| format!("write yaml file {path}"))?;
         fs::set_permissions(path, Permissions::from_mode(0o600))
             .with_context(|| format!("chmod 0600 yaml file {path}"))?;
         Ok(())

@@ -27,10 +27,7 @@ fn head_root_with_xid_still_head_service() {
     // `x-id` is the AWS SDK's diagnostic query param; the classifier is
     // explicitly tolerant of it everywhere (see is_empty_effective and
     // validate_xid). HEAD / with x-id must still classify as HeadService.
-    assert!(matches!(
-        classify("HEAD", "/?x-id=HeadService"),
-        S3Op::HeadService
-    ));
+    assert!(matches!(classify("HEAD", "/?x-id=HeadService"), S3Op::HeadService));
 }
 
 #[test]
@@ -47,10 +44,7 @@ fn get_root_remains_list_buckets() {
     // Regression guard: adding HeadService must not have shifted the
     // ListBuckets branch.
     use s32p_support::classifier::ReadOp;
-    assert!(matches!(
-        classify("GET", "/"),
-        S3Op::Read(ReadOp::ListBuckets)
-    ));
+    assert!(matches!(classify("GET", "/"), S3Op::Read(ReadOp::ListBuckets)));
 }
 
 #[test]

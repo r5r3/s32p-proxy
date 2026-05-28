@@ -428,3 +428,69 @@ pub fn statx_info(path: &Path) -> Option<StatxInfo> {
         mtime,
     })
 }
+
+/* -------------------------
+ * Object tagging xattrs
+ *
+ * Tags live in a single xattr `user.s32p.tags` whose value is the URL-form
+ * encoding of the tag set (`team=a&stage=raw`) — the same wire shape as the
+ * `x-amz-tagging` header. One attr matches S3's whole-set atomic semantics
+ * (Put replaces, Delete clears, Get reads). Absent xattr means "no tags".
+ * ------------------------- */
+
+pub const TAGGING_XATTR: &str = "user.s32p.tags";
+
+/// Read the tag set xattr from `path`. Returns the empty string when the
+/// attribute is absent or the underlying filesystem doesn't support
+/// `user.*` xattrs (treated as "no tags" — same as a freshly POSIX-created
+/// file).
+pub fn read_tags(path: &Path) -> io::Result<String> {
+    match xattr::get(path, TAGGING_XATTR) {
+        Ok(Some(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(None) => Ok(String::new()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace (or remove, if `tags_urlform` is empty) the tag set xattr on
+/// `path`. Empty input maps to `removexattr` so the on-disk state matches
+/// what a freshly POSIX-created file would have — no orphan attribute.
+pub fn write_tags(path: &Path, tags_urlform: &str) -> io::Result<()> {
+    if tags_urlform.is_empty() {
+        return remove_tags(path);
+    }
+    xattr::set(path, TAGGING_XATTR, tags_urlform.as_bytes())
+}
+
+/// Remove the tag set xattr from `path`. Idempotent — absent attribute or
+/// no-xattr-support filesystem are not errors.
+pub fn remove_tags(path: &Path) -> io::Result<()> {
+    match xattr::remove(path, TAGGING_XATTR) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Probe whether the filesystem backing `path` supports `user.*` extended
+/// attributes. Uses `listxattr(path, NULL, 0)` (via `xattr::list`) — a
+/// read-only operation that requires no write permission and does not
+/// mutate any inode state. Returns `false` only for the canonical "no
+/// xattr support" errnos (`ENOTSUP` / `EOPNOTSUPP`); other errors propagate
+/// so callers don't infer "unsupported" from permission or quota issues.
+///
+/// `user.*` xattr support is a property of the mount, so callers should
+/// cache by device id (see `MetadataExt::dev()`).
+pub fn probe_user_xattrs_supported(path: &Path) -> io::Result<bool> {
+    // Linux: ENOTSUP == EOPNOTSUPP (same errno value), so a single match
+    // arm is sufficient. The xattr crate also surfaces other errnos
+    // (e.g. EACCES) as is — propagate so callers don't infer "unsupported"
+    // from permission/quota issues.
+    match xattr::list(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => Ok(false),
+        Err(e) => Err(e),
+    }
+}

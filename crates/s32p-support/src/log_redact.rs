@@ -84,8 +84,7 @@ pub fn redact_query_for_log(query: &str) -> String {
 }
 
 fn is_sensitive_param(key: &str) -> bool {
-    key.eq_ignore_ascii_case("X-Amz-Signature")
-        || key.eq_ignore_ascii_case("X-Amz-Security-Token")
+    key.eq_ignore_ascii_case("X-Amz-Signature") || key.eq_ignore_ascii_case("X-Amz-Security-Token")
 }
 
 /// Keep the first [`PREFIX_CHARS`] chars; append `…` if anything was
@@ -123,14 +122,12 @@ mod tests {
 
     #[test]
     fn presigned_get_signature_truncated() {
-        let u = uri(
-            "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+        let u = uri("/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256\
              &X-Amz-Credential=AKIA123/20260521/us-east-1/s3/aws4_request\
              &X-Amz-Date=20260521T120000Z\
              &X-Amz-Expires=60\
              &X-Amz-SignedHeaders=host\
-             &X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
+             &X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         let got = redact_uri_for_log(&u);
         assert!(got.contains("X-Amz-Signature=01234567…"), "got: {got}");
         // Other params untouched.
@@ -204,9 +201,7 @@ mod tests {
                  &X-Amz-Signature=0123456789abcdef0123456789abcdef\
                  0123456789abcdef0123456789abcdef";
         let got = redact_query_for_log(q);
-        assert!(got.contains(
-            "X-Amz-Credential=AKIA%2F20260521%2Fus-east-1%2Fs3%2Faws4_request"
-        ));
+        assert!(got.contains("X-Amz-Credential=AKIA%2F20260521%2Fus-east-1%2Fs3%2Faws4_request"));
         assert!(got.contains("X-Amz-Signature=01234567…"));
     }
 

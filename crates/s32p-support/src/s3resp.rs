@@ -380,6 +380,26 @@ pub fn put_acl_ok() -> HttpResponse {
     resp
 }
 
+/// GetObjectTagging success (200, `<Tagging><TagSet>…</TagSet></Tagging>` body).
+/// `tags_urlform` is the stored URL-form payload (`team=a&stage=raw`);
+/// empty input produces an empty `<TagSet/>`.
+pub fn get_object_tagging(tags_urlform: &str) -> HttpResponse {
+    let body = s3xml::get_object_tagging_body(tags_urlform).unwrap_or_else(|_| {
+        b"<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet/></Tagging>".to_vec()
+    });
+    response_bytes(StatusCode::OK, "application/xml", body, [])
+}
+
+/// PutObjectTagging success (200, empty body — AWS responds with no payload).
+pub fn put_object_tagging_ok() -> HttpResponse {
+    response_bytes(StatusCode::OK, "application/xml", Vec::new(), [])
+}
+
+/// DeleteObjectTagging success (204 No Content).
+pub fn delete_object_tagging_ok() -> HttpResponse {
+    response_bytes(StatusCode::NO_CONTENT, "application/xml", Vec::new(), [])
+}
+
 /// Convenience: GetBucketLocation success (200).
 pub fn get_bucket_location(region: &str) -> HttpResponse {
     let body = s3xml::get_bucket_location_body(region).unwrap_or_else(|_| {

@@ -17,7 +17,7 @@ mod lustre;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fs,
+    fs, io,
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -27,6 +27,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
+use dashmap::DashMap;
 use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use httpdate::fmt_http_date;
@@ -75,7 +76,8 @@ use crate::{
     buffer::{BufPool, PooledBuf, SliceOwner},
     fs_helpers::{
         LustreStriping, OpenDirect, OpenMode, bucket_exists_dir, bucket_root_path, flock_exclusive,
-        join_object_path, open_file, statx_info,
+        join_object_path, open_file, probe_user_xattrs_supported, read_tags, remove_tags,
+        statx_info, write_tags,
     },
     streaming::{
         StreamCfg, WriteObjectDest, copy_file_to_file, stream_multirange_body, stream_range_body,
@@ -301,6 +303,32 @@ struct App {
     /// `getpwuid_r` call (only useful when running standalone without
     /// Landlock). See `nss_client.rs`.
     nss_client:              Arc<nss_client::NssClient>,
+    /// Per-device cache of `user.*` xattr support, populated lazily on
+    /// first tagging request that touches a given mount. Key is the
+    /// device id from `MetadataExt::dev()`. Used to fail-fast on
+    /// tagging writes (PutObjectTagging, x-amz-tagging on PutObject,
+    /// etc.) when the backing filesystem doesn't support extended
+    /// attributes — without that gate, a PutObject would stream the
+    /// body, then discover `ENOTSUP` from setxattr after the object
+    /// landed.
+    xattr_support:           DashMap<u64, bool>,
+}
+
+/// Look up whether `path`'s filesystem supports `user.*` xattrs, using
+/// the per-device cache on `App`. On cache miss, probes via
+/// `probe_user_xattrs_supported` (a `listxattr` syscall — read-only,
+/// no write permission required). Bubbles I/O errors other than the
+/// canonical "no xattr support" errnos so callers don't mis-attribute
+/// permission/quota failures as missing FS capability.
+fn user_xattrs_supported_for(app: &App, probe_path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(probe_path)?.dev();
+    if let Some(v) = app.xattr_support.get(&dev) {
+        return Ok(*v);
+    }
+    let supported = probe_user_xattrs_supported(probe_path)?;
+    app.xattr_support.insert(dev, supported);
+    Ok(supported)
 }
 
 pub(crate) fn is_reserved_first_segment(key_or_prefix: &str, mpu_dir_name: &str) -> bool {
@@ -509,6 +537,15 @@ async fn handle(
         s32p_support::classifier::S3Op::Write(s32p_support::classifier::WriteOp::DeleteObjects) => {
             handle_delete_objects(req, app, &class).await
         }
+        s32p_support::classifier::S3Op::Read(
+            s32p_support::classifier::ReadOp::GetObjectTagging,
+        ) => handle_get_object_tagging(req, app, &class).await,
+        s32p_support::classifier::S3Op::Write(
+            s32p_support::classifier::WriteOp::PutObjectTagging,
+        ) => handle_put_object_tagging(req, app, &class).await,
+        s32p_support::classifier::S3Op::Write(
+            s32p_support::classifier::WriteOp::DeleteObjectTagging,
+        ) => handle_delete_object_tagging(req, app, &class).await,
         s32p_support::classifier::S3Op::Multipart(_) => handle_multipart(req, app, &class).await,
         s32p_support::classifier::S3Op::Versioning(_) => handle_versioning(req, app, &class).await,
         _ => handle_other(req, app, &class).await,
@@ -1316,6 +1353,310 @@ async fn handle_put_bucket_acl(
             Some(parts.uri.path()),
         )
     }
+}
+
+/* -------------------------
+ * Object tagging
+ *
+ * Tags live in the `user.s32p.tags` xattr on the object file. The stored
+ * payload is the URL-form encoding of the tag set (matches the
+ * `x-amz-tagging` header wire shape). See `fs_helpers::read_tags` /
+ * `write_tags` for the storage layer.
+ * ------------------------- */
+
+/// Fail-fast gate for tagging writes: probes the filesystem's `user.*`
+/// xattr support (cached per device on `App`). Returns `Some(resp)`
+/// when the caller should short-circuit — `501 NotImplemented` when
+/// the backing FS doesn't support xattrs, or `500 InternalError` when
+/// the probe itself failed (e.g. the bucket symlink target is missing).
+/// `probe_path` should exist; the bucket root is a safe choice when an
+/// object doesn't exist yet (e.g. PutObject creating a fresh key).
+fn require_xattr_support(app: &App, probe_path: &Path, uri_path: &str) -> Option<Resp> {
+    match user_xattrs_supported_for(app, probe_path) {
+        Ok(true) => None,
+        Ok(false) => {
+            tracing::debug!(
+                probe = %probe_path.display(),
+                "tagging rejected: filesystem does not support user.* xattrs"
+            );
+            Some(s32p_support::s3resp::not_implemented(
+                "object tagging not supported on this storage backend",
+                Some(uri_path),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(
+                probe = %probe_path.display(),
+                error = %e,
+                "tagging xattr-support probe failed"
+            );
+            Some(s32p_support::s3resp::internal_error(
+                "failed to probe object tagging support",
+                Some(uri_path),
+                None,
+            ))
+        }
+    }
+}
+
+async fn handle_get_object_tagging(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    match std::fs::metadata(&obj_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key("object not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+
+    let tags = match read_tags(&obj_path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                path = %obj_path.display(),
+                error = %e,
+                "GetObjectTagging: failed to read xattr"
+            );
+            return s32p_support::s3resp::internal_error(
+                "failed to read object tags",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+    };
+
+    s32p_support::s3resp::get_object_tagging(&tags)
+}
+
+async fn handle_put_object_tagging(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    match std::fs::metadata(&obj_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key("object not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+
+    if let Some(resp) = require_xattr_support(&app, &obj_path, req.uri().path()) {
+        return resp;
+    }
+
+    let (parts, body) = req.into_parts();
+    let collected = match collect_body_capped(&parts.headers, body, XML_BODY_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyCapErr::TooLarge { advertised }) => {
+            tracing::debug!(
+                op = "PutObjectTagging",
+                advertised = ?advertised,
+                cap = XML_BODY_MAX_BYTES,
+                "request body exceeds XML body cap"
+            );
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_REQUEST,
+                "request body too large",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+        Err(BodyCapErr::Read(e)) => {
+            return s32p_support::s3resp::invalid_request(
+                &format!("failed to read body: {e}"),
+                Some(parts.uri.path()),
+            );
+        }
+    };
+
+    let tags_urlform = match s32p_support::s3xml::parse_object_tagging_request(&collected) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("PutObjectTagging malformed XML: {e}");
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::MALFORMED_XML,
+                "malformed Tagging XML",
+                Some(parts.uri.path()),
+                None,
+            );
+        }
+    };
+
+    if let Err(reason) = s32p_support::s3xml::validate_tagging_urlform(&tags_urlform) {
+        tracing::debug!("PutObjectTagging invalid: {reason}");
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_TAG,
+            "invalid tag set",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
+
+    if let Err(e) = write_tags(&obj_path, &tags_urlform) {
+        tracing::warn!(
+            path = %obj_path.display(),
+            error = %e,
+            "PutObjectTagging: failed to write xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write object tags",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
+
+    s32p_support::s3resp::put_object_tagging_ok()
+}
+
+async fn handle_delete_object_tagging(
+    req: Request<Incoming>,
+    app: Arc<App>,
+    class: &s32p_support::classifier::S3RequestClass,
+) -> Resp {
+    let cfg = app.cfg.clone();
+
+    let bucket = class.bucket.as_deref().unwrap_or("");
+    let key = class.key.as_deref().unwrap_or("");
+    if bucket.is_empty() || key.is_empty() {
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_REQUEST,
+            "missing bucket or key",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+    if is_reserved_first_segment(key, &cfg.mpu_dir_name) {
+        return s32p_support::s3resp::access_denied("reserved key prefix", Some(req.uri().path()));
+    }
+
+    match bucket_exists_dir(&cfg.posix_root, bucket) {
+        Ok(true) => {}
+        Ok(false) => {
+            return s32p_support::s3resp::no_such_bucket(
+                "bucket not found",
+                Some(req.uri().path()),
+            );
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    }
+
+    let obj_path = match join_object_path(&cfg.posix_root, bucket, key) {
+        Ok(p) => p,
+        Err(e) => return s32p_support::s3resp::access_denied(&e.to_string(), None),
+    };
+
+    match std::fs::metadata(&obj_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return s32p_support::s3resp::no_such_key("object not found", Some(req.uri().path()));
+        }
+        Err(e) => {
+            return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+        }
+    };
+
+    if let Some(resp) = require_xattr_support(&app, &obj_path, req.uri().path()) {
+        return resp;
+    }
+
+    if let Err(e) = remove_tags(&obj_path) {
+        tracing::warn!(
+            path = %obj_path.display(),
+            error = %e,
+            "DeleteObjectTagging: failed to remove xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to remove object tags",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    s32p_support::s3resp::delete_object_tagging_ok()
 }
 
 async fn handle_head_bucket(
@@ -2920,6 +3261,56 @@ async fn handle_put_object(
         );
     }
 
+    // Extract and validate the optional `x-amz-tagging` header up front.
+    // The header value is already URL-form (`team=a&stage=raw`) — the wire
+    // shape matches the on-disk xattr, so it stores verbatim. Validating
+    // here means a malformed tag set is rejected before any I/O.
+    let tagging_header: Option<String> =
+        match req.headers().get("x-amz-tagging").map(|v| v.to_str()) {
+            Some(Ok(s)) => Some(s.to_string()),
+            Some(Err(_)) => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_TAG,
+                    "invalid x-amz-tagging header encoding",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            None => None,
+        };
+    if let Some(s) = &tagging_header
+        && let Err(reason) = s32p_support::s3xml::validate_tagging_urlform(s)
+    {
+        tracing::debug!("PutObject x-amz-tagging invalid: {reason}");
+        return s32p_support::s3resp::s3_error(
+            StatusCode::BAD_REQUEST,
+            s32p_support::s3xml::error_code::INVALID_TAG,
+            "invalid x-amz-tagging header",
+            Some(req.uri().path()),
+            None,
+        );
+    }
+
+    // When the client supplied tagging at creation time, fail-fast before
+    // streaming the body if the backing FS can't store the xattr.
+    // Probing the bucket root (which is a symlink to the real bucket
+    // data dir — `xattr::list` follows it) avoids the alternative of
+    // streaming the body, materializing the object, and then discovering
+    // ENOTSUP from setxattr (which would leave a tagless object on disk
+    // contradicting the client's PUT contract).
+    if tagging_header.is_some() {
+        let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
+            Ok(p) => p,
+            Err(e) => {
+                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+            }
+        };
+        if let Some(resp) = require_xattr_support(&app, &bucket_root, req.uri().path()) {
+            return resp;
+        }
+    }
+
     let (parts, body) = req.into_parts();
 
     #[cfg(feature = "lustre")]
@@ -2960,6 +3351,23 @@ async fn handle_put_object(
             );
         }
     };
+
+    // Apply tagging xattr after the object is materialized. PutObject is
+    // create-or-replace, so any pre-existing tagging on the same key/inode
+    // is replaced by write_tags (or cleared if the header was absent).
+    let to_write = tagging_header.as_deref().unwrap_or("");
+    if let Err(e) = write_tags(&obj_path, to_write) {
+        tracing::warn!(
+            path = %obj_path.display(),
+            error = %e,
+            "PutObject: failed to write tagging xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write object tags",
+            Some(parts.uri.path()),
+            None,
+        );
+    }
 
     let etag = format_inode_etag(meta.ino());
     s32p_support::s3resp::put_object_ok(&etag)
@@ -3256,6 +3664,89 @@ async fn handle_copy_object(
         }
     };
 
+    // Resolve tagging directive and validate any REPLACE header up front.
+    // Default directive is COPY (mirror source tags). REPLACE uses the
+    // `x-amz-tagging` header value (or clears tags when the header is
+    // absent). Validating here means a malformed header rejects the COPY
+    // before any file I/O.
+    let tagging_directive_replace = match req
+        .headers()
+        .get("x-amz-tagging-directive")
+        .map(|v| v.to_str())
+    {
+        Some(Ok(s)) => match s.trim() {
+            "COPY" | "" => false,
+            "REPLACE" => true,
+            other => {
+                tracing::debug!(directive = %other, "CopyObject invalid x-amz-tagging-directive");
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                    "invalid x-amz-tagging-directive (expected COPY or REPLACE)",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+        Some(Err(_)) => {
+            return s32p_support::s3resp::s3_error(
+                StatusCode::BAD_REQUEST,
+                s32p_support::s3xml::error_code::INVALID_ARGUMENT,
+                "invalid x-amz-tagging-directive encoding",
+                Some(req.uri().path()),
+                None,
+            );
+        }
+        None => false,
+    };
+    let copy_replace_tags: Option<String> = if tagging_directive_replace {
+        match req.headers().get("x-amz-tagging").map(|v| v.to_str()) {
+            Some(Ok(s)) => {
+                if let Err(reason) = s32p_support::s3xml::validate_tagging_urlform(s) {
+                    tracing::debug!("CopyObject REPLACE x-amz-tagging invalid: {reason}");
+                    return s32p_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s32p_support::s3xml::error_code::INVALID_TAG,
+                        "invalid x-amz-tagging header",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                Some(s.to_string())
+            }
+            Some(Err(_)) => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_TAG,
+                    "invalid x-amz-tagging header encoding",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+            None => Some(String::new()),
+        }
+    } else {
+        None
+    };
+
+    // Fail-fast for REPLACE with a non-empty `x-amz-tagging` header on a
+    // backing FS that doesn't support `user.*` xattrs. Default COPY
+    // directive and REPLACE-clears go through paths that handle ENOTSUP
+    // gracefully, so the probe is unneeded for them. The dst bucket
+    // existence was already confirmed above, so the bucket root is a
+    // valid probe target.
+    if copy_replace_tags.as_deref().is_some_and(|s| !s.is_empty()) {
+        let dst_root = match bucket_root_path(&cfg.posix_root, dst_bucket) {
+            Ok(p) => p,
+            Err(e) => {
+                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+            }
+        };
+        if let Some(resp) = require_xattr_support(&app, &dst_root, req.uri().path()) {
+            return resp;
+        }
+    }
+
     // source and destination must not contain the multipart upload directory
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
         || is_reserved_first_segment(&src_key, &cfg.mpu_dir_name)
@@ -3430,7 +3921,7 @@ async fn handle_copy_object(
     }
 
     if let Err(e) = copy_file_to_file(
-        src_path,
+        src_path.clone(),
         dst_path.clone(),
         size,
         dst_striping,
@@ -3445,6 +3936,59 @@ async fn handle_copy_object(
     .await
     {
         return s32p_support::s3resp::internal_error(&e.to_string(), Some(req.uri().path()), None);
+    }
+
+    // Apply tagging on the destination per the directive resolved up top.
+    // REPLACE was already validated; COPY validates the source xattr now
+    // (strict: a corrupt source tagset fails the whole COPY rather than
+    // silently writing it through).
+    let dst_tags: String = match &copy_replace_tags {
+        Some(s) => s.clone(),
+        None => match read_tags(&src_path) {
+            Ok(s) => {
+                if !s.is_empty()
+                    && let Err(reason) = s32p_support::s3xml::validate_tagging_urlform(&s)
+                {
+                    tracing::debug!(
+                        src = %src_path.display(),
+                        reason,
+                        "CopyObject: source xattr tag set fails validation"
+                    );
+                    return s32p_support::s3resp::s3_error(
+                        StatusCode::BAD_REQUEST,
+                        s32p_support::s3xml::error_code::INVALID_TAG,
+                        "source object has invalid tag set",
+                        Some(req.uri().path()),
+                        None,
+                    );
+                }
+                s
+            }
+            Err(e) => {
+                tracing::warn!(
+                    src = %src_path.display(),
+                    error = %e,
+                    "CopyObject: failed to read source tagging xattr"
+                );
+                return s32p_support::s3resp::internal_error(
+                    "failed to read source object tags",
+                    Some(req.uri().path()),
+                    None,
+                );
+            }
+        },
+    };
+    if let Err(e) = write_tags(&dst_path, &dst_tags) {
+        tracing::warn!(
+            dst = %dst_path.display(),
+            error = %e,
+            "CopyObject: failed to write destination tagging xattr"
+        );
+        return s32p_support::s3resp::internal_error(
+            "failed to write destination object tags",
+            Some(req.uri().path()),
+            None,
+        );
     }
 
     let dst_meta = match std::fs::metadata(&dst_path) {
@@ -4333,6 +4877,7 @@ async fn async_main() -> Result<()> {
         virtual_hosted_suffixes: cfg.virtual_hosted_suffixes.clone(),
         idempotency,
         nss_client,
+        xattr_support: DashMap::new(),
     });
 
     if let Some(sock_path) = cfg.bind_uds.clone() {

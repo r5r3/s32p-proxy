@@ -1555,39 +1555,34 @@ async fn handle_complete(
     // CompleteMultipartUpload XML body before allocation — even at the
     // 10,000-part S3 cap, the part list comfortably fits.
     let (parts, body) = req.into_parts();
-    let collected = match crate::collect_body_capped(
-        &parts.headers,
-        body,
-        crate::XML_BODY_MAX_BYTES,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(crate::BodyCapErr::TooLarge { advertised }) => {
-            tracing::debug!(
-                op = "CompleteMultipartUpload",
-                advertised = ?advertised,
-                cap = crate::XML_BODY_MAX_BYTES,
-                "request body exceeds XML body cap"
-            );
-            return s32p_support::s3resp::s3_error(
-                StatusCode::BAD_REQUEST,
-                s32p_support::s3xml::error_code::INVALID_REQUEST,
-                "request body too large",
-                Some(parts.uri.path()),
-                None,
-            );
-        }
-        Err(crate::BodyCapErr::Read(e)) => {
-            return s32p_support::s3resp::s3_error(
-                StatusCode::BAD_REQUEST,
-                s32p_support::s3xml::error_code::INVALID_REQUEST,
-                &format!("failed to read body: {e}"),
-                Some(parts.uri.path()),
-                None,
-            );
-        }
-    };
+    let collected =
+        match crate::collect_body_capped(&parts.headers, body, crate::XML_BODY_MAX_BYTES).await {
+            Ok(b) => b,
+            Err(crate::BodyCapErr::TooLarge { advertised }) => {
+                tracing::debug!(
+                    op = "CompleteMultipartUpload",
+                    advertised = ?advertised,
+                    cap = crate::XML_BODY_MAX_BYTES,
+                    "request body exceeds XML body cap"
+                );
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_REQUEST,
+                    "request body too large",
+                    Some(parts.uri.path()),
+                    None,
+                );
+            }
+            Err(crate::BodyCapErr::Read(e)) => {
+                return s32p_support::s3resp::s3_error(
+                    StatusCode::BAD_REQUEST,
+                    s32p_support::s3xml::error_code::INVALID_REQUEST,
+                    &format!("failed to read body: {e}"),
+                    Some(parts.uri.path()),
+                    None,
+                );
+            }
+        };
 
     let requested_parts = match s32p_support::s3xml::parse_complete_parts(&collected) {
         Ok(v) => v,

@@ -120,6 +120,8 @@ pub enum ReadOp {
     GetObjectAcl,
     /// GET /{bucket}?acl
     GetBucketAcl,
+    /// GET /{bucket}/{key}?tagging
+    GetObjectTagging,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +140,10 @@ pub enum WriteOp {
     PutObjectAcl,
     /// PUT /{bucket}?acl
     PutBucketAcl,
+    /// PUT /{bucket}/{key}?tagging
+    PutObjectTagging,
+    /// DELETE /{bucket}/{key}?tagging
+    DeleteObjectTagging,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,6 +411,30 @@ pub fn classify_with_headers(
         }
         if key.is_none() && query.validate_xid("PutBucketAcl") {
             return S3RequestClass { bucket, key, query, op: S3Op::Write(WriteOp::PutBucketAcl) };
+        }
+    }
+
+    // Object tagging (?tagging). Object-level only — bucket-level ?tagging
+    // intentionally falls through to `other` (versitygw) for now.
+    if bucket.is_some() && key.is_some() && query.has("tagging") {
+        if method == "GET" && query.validate_xid("GetObjectTagging") {
+            return S3RequestClass { bucket, key, query, op: S3Op::Read(ReadOp::GetObjectTagging) };
+        }
+        if method == "PUT" && query.validate_xid("PutObjectTagging") {
+            return S3RequestClass {
+                bucket,
+                key,
+                query,
+                op: S3Op::Write(WriteOp::PutObjectTagging),
+            };
+        }
+        if method == "DELETE" && query.validate_xid("DeleteObjectTagging") {
+            return S3RequestClass {
+                bucket,
+                key,
+                query,
+                op: S3Op::Write(WriteOp::DeleteObjectTagging),
+            };
         }
     }
 

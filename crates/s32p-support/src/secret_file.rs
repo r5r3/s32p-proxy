@@ -14,11 +14,7 @@
 //! Callers invoke it before any `fs::read_to_string` or library handoff
 //! (Pingora's `TlsSettings::intermediate`, `YamlDirectory::from_path`).
 
-use std::{
-    fs::OpenOptions,
-    os::unix::fs::MetadataExt,
-    path::Path,
-};
+use std::{fs::OpenOptions, os::unix::fs::MetadataExt, path::Path};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -36,16 +32,10 @@ pub fn stat_or_reject(path: &Path) -> Result<()> {
         .read(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    let md = f
-        .metadata()
-        .with_context(|| format!("fstat {}", path.display()))?;
+    let md = f.metadata().with_context(|| format!("fstat {}", path.display()))?;
 
     if !md.is_file() {
-        return Err(anyhow!(
-            "{} is not a regular file (mode={:#o})",
-            path.display(),
-            md.mode()
-        ));
+        return Err(anyhow!("{} is not a regular file (mode={:#o})", path.display(), md.mode()));
     }
 
     let owner = md.uid();
@@ -96,6 +86,7 @@ mod tests {
             let p = std::env::temp_dir().join(format!("s32p-h6-{pid}-{n}-{name}"));
             Self(p)
         }
+
         fn path(&self) -> &Path {
             &self.0
         }
@@ -110,8 +101,7 @@ mod tests {
 
     fn create_with_mode(path: &Path, mode: u32) {
         File::create(path).expect("create tempfile");
-        fs::set_permissions(path, Permissions::from_mode(mode))
-            .expect("chmod tempfile");
+        fs::set_permissions(path, Permissions::from_mode(mode)).expect("chmod tempfile");
     }
 
     #[test]
@@ -173,8 +163,7 @@ mod tests {
     fn directory_rejected() {
         let t = Tmp::new("a-dir");
         fs::create_dir(t.path()).expect("mkdir tempdir");
-        fs::set_permissions(t.path(), Permissions::from_mode(0o700))
-            .expect("chmod tempdir");
+        fs::set_permissions(t.path(), Permissions::from_mode(0o700)).expect("chmod tempdir");
         let err = stat_or_reject(t.path()).expect_err("directory must reject");
         let msg = err.to_string();
         assert!(msg.contains("not a regular file"), "should name the type problem: {msg}");

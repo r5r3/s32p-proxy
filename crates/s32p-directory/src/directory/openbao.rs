@@ -33,13 +33,7 @@ impl OpenBaoDirectory {
         Ok(Self {
             kv_mount: trim_slashes(&kv_mount),
             layout:   DirectoryLayout::new(prefix),
-            client:   OpenBaoClient::new_approle(
-                address,
-                approle_mount,
-                role_id,
-                secret_id,
-                http,
-            ),
+            client:   OpenBaoClient::new_approle(address, approle_mount, role_id, secret_id, http),
         })
     }
 

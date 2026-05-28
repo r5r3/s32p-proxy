@@ -100,10 +100,9 @@ impl NssClient {
                 let name = raw[nss_proto::ABSTRACT_PREFIX.len_utf8()..].to_string();
                 Backend::Socket { addr: Address::Abstract(name), conn: Mutex::new(None) }
             }
-            Some(raw) => Backend::Socket {
-                addr: Address::Path(PathBuf::from(raw)),
-                conn: Mutex::new(None),
-            },
+            Some(raw) => {
+                Backend::Socket { addr: Address::Path(PathBuf::from(raw)), conn: Mutex::new(None) }
+            }
         };
         Self { cache: RwLock::new(HashMap::new()), ttl: CACHE_TTL, backend }
     }
@@ -146,12 +145,11 @@ impl NssClient {
 
         match &self.backend {
             Backend::Direct => {
-                let name = tokio::task::spawn_blocking(move || {
-                    nss_lookup::lookup_username_blocking(uid)
-                })
-                .await
-                .ok()
-                .flatten();
+                let name =
+                    tokio::task::spawn_blocking(move || nss_lookup::lookup_username_blocking(uid))
+                        .await
+                        .ok()
+                        .flatten();
                 self.cache_insert(uid, name.clone(), self.ttl);
                 name
             }
@@ -251,10 +249,7 @@ async fn connect(addr: &Address) -> Result<UnixStream, std::io::Error> {
     }
 }
 
-async fn one_query(
-    stream: &mut UnixStream,
-    uid: u32,
-) -> Result<Option<String>, std::io::Error> {
+async fn one_query(stream: &mut UnixStream, uid: u32) -> Result<Option<String>, std::io::Error> {
     let req = nss_proto::encode_request(uid);
     stream.write_all(&req).await?;
     let mut len_buf = [0u8; 1];

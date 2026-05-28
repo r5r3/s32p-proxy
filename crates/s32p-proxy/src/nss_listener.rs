@@ -39,7 +39,9 @@ pub fn bind() -> Result<(std::os::unix::net::UnixListener, String)> {
         .context("build abstract SocketAddr for nss listener")?;
     let std_listener = std::os::unix::net::UnixListener::bind_addr(&addr)
         .with_context(|| format!("bind abstract nss socket {env_value:?}"))?;
-    std_listener.set_nonblocking(true).context("set abstract nss listener non-blocking")?;
+    std_listener
+        .set_nonblocking(true)
+        .context("set abstract nss listener non-blocking")?;
     tracing::info!(socket = %env_value, "nss-proxy listener bound (accept loop pending)");
     Ok((std_listener, env_value))
 }
@@ -59,7 +61,9 @@ impl Drop for NssListenerHandle {
 /// Tokio-runtime half: wrap the pre-bound listener and spawn the accept
 /// loop. Must be called from inside a tokio runtime (same constraint as
 /// the replay-cache sweeper).
-pub fn start_accept_loop(std_listener: std::os::unix::net::UnixListener) -> Result<NssListenerHandle> {
+pub fn start_accept_loop(
+    std_listener: std::os::unix::net::UnixListener,
+) -> Result<NssListenerHandle> {
     let listener =
         UnixListener::from_std(std_listener).context("wrap std UnixListener into tokio")?;
     let accept_task = tokio::spawn(accept_loop(listener));
@@ -94,17 +98,16 @@ async fn serve_connection(mut stream: tokio::net::UnixStream) {
         }
         let uid = nss_proto::decode_request(req_buf);
 
-        let name = match tokio::task::spawn_blocking(move || {
-            nss_lookup::lookup_username_blocking(uid)
-        })
-        .await
-        {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!(uid, error = %e, "nss-proxy blocking lookup join error");
-                None
-            }
-        };
+        let name =
+            match tokio::task::spawn_blocking(move || nss_lookup::lookup_username_blocking(uid))
+                .await
+            {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(uid, error = %e, "nss-proxy blocking lookup join error");
+                    None
+                }
+            };
 
         let bytes = match nss_proto::encode_response(name.as_deref()) {
             Ok(b) => b,

@@ -25,8 +25,9 @@ static GROUP_NAME_RE: LazyLock<Regex> =
 /// and ending with a letter or digit. (`{1,61}` interior + the two anchored
 /// ends = length 3–63.) Adjacent dots are rejected by a separate check in
 /// [`validate_bucket_name`].
-static BUCKET_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$").expect("valid bucket regex"));
+static BUCKET_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$").expect("valid bucket regex")
+});
 
 /// Validate a bucket name against the S3 general-purpose naming rule, enforced
 /// at *creation* (not only when the name is later interpolated into a worker's
@@ -264,17 +265,17 @@ mod tests {
     fn invalid_bucket_names_rejected() {
         for s in [
             "",
-            "ab",                  // too short (<3)
-            &"b".repeat(64),       // too long (>63)
-            "UPPER",               // uppercase
-            "under_score",         // underscore not in charset
-            "-leading",            // must begin alphanumeric
-            "trailing-",           // must end alphanumeric
-            ".dot",                // must begin alphanumeric
-            "dot.",                // must end alphanumeric
-            "a..b",                // consecutive dots
-            "has space",           // whitespace
-            "bad/slash",           // path separator
+            "ab",            // too short (<3)
+            &"b".repeat(64), // too long (>63)
+            "UPPER",         // uppercase
+            "under_score",   // underscore not in charset
+            "-leading",      // must begin alphanumeric
+            "trailing-",     // must end alphanumeric
+            ".dot",          // must begin alphanumeric
+            "dot.",          // must end alphanumeric
+            "a..b",          // consecutive dots
+            "has space",     // whitespace
+            "bad/slash",     // path separator
         ] {
             assert!(validate_bucket_name(s).is_err(), "should reject bucket name {s:?}");
         }

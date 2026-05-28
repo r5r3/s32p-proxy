@@ -6,7 +6,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -185,10 +188,7 @@ impl ProxyHttp for S3ProxyApp {
         // lookups, or worker spawn. Loopback peers (and UDS — non-Inet
         // `client_addr`) bypass the cap; see `conn_limit.rs` for the
         // rationale. The slot is released in `logging()`.
-        let peer_ip = session
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.ip());
+        let peer_ip = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
         match self.conn_limiter.acquire(peer_ip) {
             conn_limit::AcquireOutcome::Acquired(ip) => {
                 ctx.limiter_slot = Some(ip);
@@ -285,7 +285,8 @@ impl ProxyHttp for S3ProxyApp {
         let path = req.uri.path();
         // SigV4 signature / STS token redacted to an 8-char prefix for
         // log output; everything else in the query passes through.
-        let query_log = s32p_support::log_redact::redact_query_for_log(req.uri.query().unwrap_or(""));
+        let query_log =
+            s32p_support::log_redact::redact_query_for_log(req.uri.query().unwrap_or(""));
 
         let host = req.headers.get("host").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
@@ -1135,9 +1136,7 @@ fn main() -> Result<()> {
         "session store initialized"
     );
 
-    let conn_limiter = Arc::new(conn_limit::ConnectionLimiter::new(
-        &cfg.server.connection_limits,
-    ));
+    let conn_limiter = Arc::new(conn_limit::ConnectionLimiter::new(&cfg.server.connection_limits));
     tracing::info!(
         per_ip = cfg.server.connection_limits.max_concurrent_requests_per_ip,
         keepalive_idle_secs = cfg.server.connection_limits.keepalive_idle_secs,
@@ -1171,11 +1170,9 @@ fn main() -> Result<()> {
         let key_path = cfg.server.tls_key_path.as_ref().unwrap();
         s32p_support::secret_file::stat_or_reject(std::path::Path::new(key_path))
             .context("server.tls_key_path")?;
-        let mut tls_settings = TlsSettings::intermediate(
-            cfg.server.tls_cert_path.as_ref().unwrap(),
-            key_path,
-        )
-        .context("failed to load TLS settings (check certificate/key paths and format)")?;
+        let mut tls_settings =
+            TlsSettings::intermediate(cfg.server.tls_cert_path.as_ref().unwrap(), key_path)
+                .context("failed to load TLS settings (check certificate/key paths and format)")?;
         tls_settings.enable_h2();
         proxy.add_tls_with_settings(&cfg.server.listen, None, tls_settings);
         tracing::info!("TLS enabled, listening on {}", listen);
