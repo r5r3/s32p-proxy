@@ -6,12 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::directory::types::{AccessLevel, AclEntry, Principal};
 
-/// Allowed access-key principal: 1–128 chars of `[A-Za-z0-9_-]`. Excludes
-/// empty/whitespace/`/`/`.`/`*` so the value is safe as an OpenBao KV path
-/// segment (`users/<access_key>`, `index/access_key/<access_key>`) and can
-/// never be a path-traversal token or a "matches nothing" stray.
-static ACCESS_KEY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,128}$").expect("valid access_key regex"));
+/// Allowed access-key principal: must start with `[A-Za-z0-9_]`, then up to 127
+/// more of `[A-Za-z0-9_.-]`. Same shape as [`GROUP_NAME_RE`], because access
+/// keys are commonly POSIX usernames (`first.last`) and the two rules must not
+/// disagree about which identifiers are nameable. Excludes
+/// empty/whitespace/`/`/`*` so the value is safe as an OpenBao KV path segment
+/// (`users/<access_key>`, `index/access_key/<access_key>`); the leading-char
+/// rule means the value can never be `.` or `..`, keeping it traversal-safe.
+static ACCESS_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$").expect("valid access_key regex")
+});
 
 /// Allowed group-name principal: must start with `[A-Za-z0-9_]`, then up to 63
 /// more of `[A-Za-z0-9_.-]`. Permits typical POSIX group names (e.g.
@@ -201,16 +205,22 @@ mod tests {
 
     #[test]
     fn valid_access_keys_accepted() {
-        for s in ["TESTACCESSKEY123", "AKIA1234567890", "a", "user_1-2", &"k".repeat(128)] {
+        // Dots are allowed after the first char: access keys are commonly POSIX
+        // usernames (`first.last`).
+        for s in
+            ["TESTACCESSKEY123", "AKIA1234567890", "a", "user_1-2", "first.last", &"k".repeat(128)]
+        {
             assert!(validate_principal(&ak(s)).is_ok(), "should accept access_key {s:?}");
         }
     }
 
     #[test]
     fn invalid_access_keys_rejected() {
-        // empty, whitespace, wildcard, path separator, dot/traversal, control,
-        // and over-length all rejected.
-        for s in ["", " ", "ab cd", "*", "a/b", "..", "a.b", "key\n", &"k".repeat(129)] {
+        // empty, whitespace, wildcard, path separator, leading separator (can't
+        // become `.`/`..`), control, and over-length all rejected.
+        for s in
+            ["", " ", "ab cd", "*", "a/b", ".", "..", ".hidden", "-bad", "key\n", &"k".repeat(129)]
+        {
             assert!(validate_principal(&ak(s)).is_err(), "should reject access_key {s:?}");
         }
     }
@@ -235,11 +245,11 @@ mod tests {
     fn validate_access_key_matches_principal_rule() {
         // User-creation validation must agree with the ACL access-key
         // principal rule, so a created user can always be named by a grant.
-        for s in ["TESTACCESSKEY123", "user_1-2"] {
+        for s in ["TESTACCESSKEY123", "user_1-2", "first.last"] {
             assert!(validate_access_key(s).is_ok());
             assert!(validate_principal(&ak(s)).is_ok());
         }
-        for s in ["", "*", "a/b", "..", "bad key"] {
+        for s in ["", "*", "a/b", "..", "-bad", "bad key"] {
             assert!(validate_access_key(s).is_err());
             assert!(validate_principal(&ak(s)).is_err());
         }

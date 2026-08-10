@@ -1406,7 +1406,15 @@ fn is_allowed_tag_chars(s: &str) -> bool {
 /// - ≤ 32 pairs (defensive; AWS bounds via size, count caps prevent abuse)
 /// - keys 1..=128 chars; charset `[A-Za-z0-9_-]` (HTTP-token shape after the
 ///   `x-amz-meta-` prefix is stripped)
-/// - values 0..=1024 chars; UTF-8; no C0 control bytes other than tab/CR/LF
+/// - values 0..=1024 chars; printable ASCII only (plus tab/CR/LF). Matches
+///   AWS's documented ASCII-only constraint on `x-amz-meta-*` values and
+///   avoids interop ambiguity — `HeaderValue` accepts obs-text bytes
+///   (0x80..=0xff), but most HTTP clients reinterpret them as latin-1,
+///   so UTF-8 stored in a header round-trips as mojibake. AWS SDKs
+///   URL-encode non-ASCII before sending, so the wire form is always
+///   ASCII; mirroring that constraint server-side keeps the contract
+///   coherent. Bytes `HeaderValue` rejects outright (most controls,
+///   0x7f) would silently disappear from HEAD/GET responses.
 /// - no duplicate keys (already lowercased; AWS treats meta keys case-
 ///   insensitively on the wire)
 ///
@@ -1452,7 +1460,13 @@ pub fn validate_user_metadata_urlform(s: &str) -> std::result::Result<(), &'stat
 /// Validate a Content-Type value. Minimal grammar — accepts
 /// `type/subtype` with optional `; param=value` runs. Caps total length at
 /// 256 bytes. Designed to reject obviously bad input (no slash, empty
-/// type/subtype, control characters); not a full RFC 2045 parser.
+/// type/subtype, non-ASCII or control bytes anywhere in the string); not a
+/// full RFC 2045 parser. Restricts the *entire* string to printable ASCII
+/// (plus `\t`) — MIME types are ASCII per RFC 6838, and any obs-text would
+/// round-trip as mojibake through most HTTP clients. Control bytes are
+/// rejected outright (`HeaderValue` would refuse them and a HEAD/GET
+/// would fall back to `application/octet-stream`, silently losing the
+/// stored value).
 pub fn validate_content_type(s: &str) -> std::result::Result<(), &'static str> {
     if s.is_empty() {
         return Err("Content-Type must not be empty");
@@ -1460,13 +1474,13 @@ pub fn validate_content_type(s: &str) -> std::result::Result<(), &'static str> {
     if s.len() > 256 {
         return Err("Content-Type exceeds 256 bytes");
     }
-    if s.bytes().any(|b| (b < 0x20 && !matches!(b, b'\t')) || b == 0x7f) {
-        return Err("Content-Type contains control characters");
+    if s.bytes().any(|b| !((0x20..=0x7e).contains(&b) || b == b'\t')) {
+        return Err("Content-Type contains non-printable or non-ASCII bytes");
     }
     // Split off parameters at the first `;`; the part before must be type/subtype.
-    let (head, _params) = match s.split_once(';') {
-        Some((h, p)) => (h.trim(), Some(p)),
-        None => (s.trim(), None),
+    let head = match s.split_once(';') {
+        Some((h, _)) => h.trim(),
+        None => s.trim(),
     };
     let (ty, sub) = head.split_once('/').ok_or("Content-Type missing '/'")?;
     let ty = ty.trim();
@@ -1485,8 +1499,16 @@ fn is_allowed_meta_key_chars(s: &str) -> bool {
 }
 
 fn is_allowed_meta_value_chars(s: &str) -> bool {
-    // Permit UTF-8 freely. Reject C0 control bytes except common whitespace.
-    s.bytes().all(|b| b >= 0x20 || matches!(b, b'\t' | b'\r' | b'\n'))
+    // Restrict to printable ASCII (plus tab/CR/LF). AWS documents user
+    // metadata as ASCII-only and SDKs URL-encode non-ASCII before sending;
+    // mirroring that server-side keeps the contract coherent across
+    // clients. `HeaderValue` accepts obs-text (0x80..=0xff) but most HTTP
+    // clients reinterpret those bytes as latin-1, so UTF-8 stored in a
+    // header round-trips as mojibake. Reject at PUT to avoid that, and
+    // also catch control bytes (`HeaderValue` rejects most of them, which
+    // would otherwise silently disappear from HEAD/GET responses).
+    s.bytes()
+        .all(|b| (0x20..=0x7e).contains(&b) || matches!(b, b'\t' | b'\r' | b'\n'))
 }
 
 fn is_mime_token_byte(b: u8) -> bool {

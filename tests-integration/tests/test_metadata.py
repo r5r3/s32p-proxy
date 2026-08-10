@@ -262,6 +262,36 @@ def test_bad_content_type_rejected(boto3_raw, bucket):
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
 
 
+# ---------------------------------------------------------------- robustness against corrupt xattrs
+
+
+def test_corrupt_content_type_xattr_falls_back(boto3_raw, bucket, bucket_fs):
+    """A POSIX user can write arbitrary bytes into `user.s32p.content_type`
+    via `setfattr`, bypassing PUT-time validation. HEAD/GET must NOT
+    panic on a value that contains bytes `HeaderValue` rejects (control
+    bytes < 0x20 other than tab; 0x7f) — they fall back to the default
+    Content-Type and the worker keeps serving. Without the runtime
+    defense in `apply_object_headers` this would panic the worker."""
+    path = bucket_fs.write("corrupt-ct", b"data")
+    # 0x01 (SOH) is in the C0 control range and is unambiguously rejected
+    # by `HeaderValue::try_from`. The validator screens this at PUT, but
+    # a POSIX user with `setfattr` access can write it directly.
+    os.setxattr(str(path), "user.s32p.content_type", b"text/plain\x01injected")
+
+    head = boto3_raw.head_object(Bucket=bucket, Key="corrupt-ct")
+    assert head["ContentType"] == "application/octet-stream"
+
+
+def test_corrupt_freedesktop_mime_xattr_falls_back(boto3_raw, bucket, bucket_fs):
+    """Same as above but on the freedesktop fallback xattr — also POSIX-
+    writable, also must not panic."""
+    path = bucket_fs.write("corrupt-mime", b"data")
+    os.setxattr(str(path), "user.mime_type", b"image/svg\x01injected")
+
+    head = boto3_raw.head_object(Bucket=bucket, Key="corrupt-mime")
+    assert head["ContentType"] == "application/octet-stream"
+
+
 # ---------------------------------------------------------------- LastModified
 
 

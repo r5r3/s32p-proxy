@@ -544,8 +544,17 @@ fn apply_object_headers(
     content_range: Option<&str>,
     user_meta: &[(String, String)],
 ) {
-    // Required / expected by most S3 clients
-    headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+    // Required / expected by most S3 clients.
+    //
+    // Content-Type can reach us from a stored xattr (`user.s32p.content_type`
+    // or freedesktop `user.mime_type`) — and a POSIX user can write
+    // arbitrary bytes via `setfattr`, bypassing PUT-time validation.
+    // `HeaderValue::try_from` rejects bytes < 0x20 (other than `\t`) and
+    // 0x7f, so fall back to the default rather than panic when a stored
+    // value contains control bytes that `setfattr` happily wrote through.
+    let ct_value = http::HeaderValue::try_from(content_type)
+        .unwrap_or_else(|_| http::HeaderValue::from_static(OBJECT_CONTENT_TYPE));
+    headers.insert(CONTENT_TYPE, ct_value);
     headers.insert(CONTENT_LENGTH, content_length.to_string().parse().unwrap());
     headers.insert(ACCEPT_RANGES, "bytes".parse().unwrap());
     headers.insert(ETAG, etag.parse().unwrap());

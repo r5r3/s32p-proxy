@@ -3859,24 +3859,6 @@ async fn handle_copy_object(
         None
     };
 
-    // Fail-fast for REPLACE with a non-empty `x-amz-tagging` header on a
-    // backing FS that doesn't support `user.*` xattrs. Default COPY
-    // directive and REPLACE-clears go through paths that handle ENOTSUP
-    // gracefully, so the probe is unneeded for them. The dst bucket
-    // existence was already confirmed above, so the bucket root is a
-    // valid probe target.
-    if copy_replace_tags.as_deref().is_some_and(|s| !s.is_empty()) {
-        let dst_root = match bucket_root_path(&cfg.posix_root, dst_bucket) {
-            Ok(p) => p,
-            Err(e) => {
-                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
-            }
-        };
-        if let Some(resp) = require_xattr_support(&app, &dst_root, req.uri().path()) {
-            return resp;
-        }
-    }
-
     // Resolve metadata directive and validate any REPLACE inputs up front.
     // Parallel to the tagging directive block above. Default COPY mirrors
     // the source's user metadata + Content-Type; REPLACE uses request
@@ -3969,23 +3951,6 @@ async fn handle_copy_object(
     } else {
         None
     };
-
-    // Fail-fast probe for REPLACE with non-empty metadata/Content-Type
-    // on a backing FS that doesn't support `user.*` xattrs. COPY and
-    // REPLACE-clears go through paths that handle ENOTSUP gracefully.
-    let metadata_needs_probe = copy_replace_user_meta.as_deref().is_some_and(|s| !s.is_empty())
-        || copy_replace_content_type.as_deref().is_some_and(|s| !s.is_empty());
-    if metadata_needs_probe {
-        let dst_root = match bucket_root_path(&cfg.posix_root, dst_bucket) {
-            Ok(p) => p,
-            Err(e) => {
-                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
-            }
-        };
-        if let Some(resp) = require_xattr_support(&app, &dst_root, req.uri().path()) {
-            return resp;
-        }
-    }
 
     // source and destination must not contain the multipart upload directory
     if is_reserved_first_segment(dst_key, &cfg.mpu_dir_name)
@@ -4289,6 +4254,30 @@ async fn handle_copy_object(
             }
         }
     };
+
+    // Fail-fast probe for the destination FS once the final tag / metadata
+    // / Content-Type values are known. Covers both REPLACE-with-headers
+    // (values come from request) and default-COPY (values come from
+    // source xattrs) — without the probe a default COPY of a tagged or
+    // metadata-bearing source onto an xattr-less dst would silently
+    // succeed at `copy_file_to_file` and then 500 from `xattr::set`,
+    // leaving a half-applied destination object on disk. Empty-payload
+    // writes go through the `remove*` helpers, which already swallow
+    // ENOTSUP gracefully, so the probe is only needed when something
+    // would actually be set.
+    let needs_xattr_probe =
+        !dst_tags.is_empty() || !dst_user_meta.is_empty() || !dst_content_type.is_empty();
+    if needs_xattr_probe {
+        let dst_root = match bucket_root_path(&cfg.posix_root, dst_bucket) {
+            Ok(p) => p,
+            Err(e) => {
+                return s32p_support::s3resp::access_denied(&e.to_string(), Some(req.uri().path()));
+            }
+        };
+        if let Some(resp) = require_xattr_support(&app, &dst_root, req.uri().path()) {
+            return resp;
+        }
+    }
 
     if let Err(e) = copy_file_to_file(
         src_path.clone(),
