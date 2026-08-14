@@ -31,7 +31,7 @@ aligned-buffer = "0.2"
 libc = { workspace = true }
 dashmap = "6"
 
-base64 = "0.22"
+base64 = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 quick-xml = { workspace = true }

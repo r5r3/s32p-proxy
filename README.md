@@ -635,7 +635,32 @@ Commands:
 - `user rm`
 - `user ls`
 
-Add a user:
+Add a user. Only `--username` is required; everything else is derived from it:
+
+```bash
+s32p-ctl ... user add --username alice
+```
+
+```
+ok
+user alice uid=1001 gid=1001 access_key=alice
+secret_key=xXDk-bbkR7GweeyJM_mfMjkSJ0UG-BLK79PItgebzDA
+```
+
+- `--username` is lower-cased (POSIX user names are lower-case by convention,
+  and `getpwnam_r` matches exactly)
+- `--access-key` defaults to that lower-cased user name
+- `--uid` / `--gid` default to the passwd entry of that user name; without one,
+  both must be given explicitly
+- `--secret-key` defaults to 32 CSPRNG bytes as URL-safe base64, **printed only
+  at creation** — it cannot be recovered afterwards, only replaced by re-running
+  `user add`
+
+Any of them can still be given explicitly, e.g. for an account this host's
+passwd database doesn't know, or for an access key that differs from the user
+name. An explicit `--access-key` is stored verbatim, case included — SigV4
+compares it byte-for-byte against what the client sends, and AWS-style keys are
+upper-case:
 
 ```bash
 s32p-ctl ... user add \

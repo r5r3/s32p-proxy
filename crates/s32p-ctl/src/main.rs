@@ -9,8 +9,11 @@ use s32p_admin::{
         render_directory_yaml_string, save_directory_yaml_file,
     },
 };
-use s32p_directory::directory::layout::normalize_acl; // ensure layout.rs is public
-use s32p_directory::types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc};
+use s32p_directory::directory::layout::{normalize_acl, validate_access_key}; // ensure layout.rs is public
+use s32p_directory::{
+    directory::posix_users::ids_for_username,
+    types::{AccessLevel, AclEntry, BucketDoc, Principal, UserDoc},
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -318,16 +321,86 @@ enum UserCmd {
 
 #[derive(Args, Debug)]
 struct UserAddArgs {
+    /// POSIX user name the workers run as. Lower-cased before use.
     #[arg(long)]
-    access_key: String,
+    username: String,
+
+    /// Access key clients authenticate with. Defaults to `--username`.
+    /// Stored verbatim when given — SigV4 matches it exactly.
     #[arg(long)]
-    secret_key: String,
+    access_key: Option<String>,
+
+    /// Secret key clients sign with. Defaults to a freshly generated random
+    /// secret, printed once on creation.
     #[arg(long)]
-    username:   String,
+    secret_key: Option<String>,
+
+    /// Numeric uid. Defaults to the uid in `--username`'s passwd entry.
     #[arg(long)]
-    uid:        u32,
+    uid: Option<u32>,
+
+    /// Numeric gid. Defaults to the gid in `--username`'s passwd entry.
     #[arg(long)]
-    gid:        u32,
+    gid: Option<u32>,
+}
+
+/// Fill in the fields `user add` can derive from `--username`, so creating a
+/// user for an existing POSIX account needs nothing but that account's name.
+///
+/// The user name is lower-cased first: POSIX user names are lower-case by
+/// convention (`getpwnam_r` matches exactly, so `Alice` would not resolve to
+/// the account `alice`), and the access key derived from it inherits that
+/// form. An explicitly given `--access-key` is *not* folded — SigV4 compares
+/// access keys byte-for-byte against what the client sends, and AWS-style keys
+/// are upper-case.
+///
+/// Returns the resolved user plus the generated secret if one was generated:
+/// that value exists nowhere else, so the caller has to print it.
+fn resolve_user_add(args: UserAddArgs) -> Result<(UserDoc, Option<String>)> {
+    let username = args.username.to_ascii_lowercase();
+    if username.is_empty() {
+        return Err(anyhow!("--username must not be empty"));
+    }
+
+    let access_key = args.access_key.unwrap_or_else(|| username.clone());
+    validate_access_key(&access_key)?;
+
+    let (uid, gid) = match (args.uid, args.gid) {
+        // Both given: no passwd entry needed, so a directory can be built on a
+        // host that doesn't know the account.
+        (Some(uid), Some(gid)) => (uid, gid),
+        (uid, gid) => {
+            let ids = ids_for_username(&username)?.ok_or_else(|| {
+                anyhow!(
+                    "no passwd entry for user {username:?}; pass --uid and --gid explicitly to \
+                     create the user anyway"
+                )
+            })?;
+            (uid.unwrap_or(ids.uid), gid.unwrap_or(ids.gid))
+        }
+    };
+
+    let (secret_key, generated) = match args.secret_key {
+        Some(s) => (s, None),
+        None => {
+            let s = gen_secret_key();
+            (s.clone(), Some(s))
+        }
+    };
+
+    Ok((UserDoc { access_key, secret_key, username, uid, gid }, generated))
+}
+
+/// Fresh secret for a `user add` without `--secret-key`: 32 CSPRNG bytes →
+/// 43-char URL-safe base64. Same shape and source as the proxy's ephemeral
+/// session secrets — `OsRng`, not the thread RNG, since this gates SigV4.
+fn gen_secret_key() -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rand::RngCore;
+
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
 }
 
 #[derive(Args, Debug)]
@@ -615,34 +688,35 @@ async fn async_main() -> Result<()> {
         },
 
         Cmd::User(sub) => match sub {
-            UserCmd::Add(args) => match backend {
-                Backend::Openbao => {
-                    let admin = openbao_admin(&openbao).await?;
-                    let user = UserDoc {
-                        access_key: args.access_key,
-                        secret_key: args.secret_key,
-                        username:   args.username,
-                        uid:        args.uid,
-                        gid:        args.gid,
-                    };
-                    admin.upsert_user(user).await?;
-                    println!("ok");
+            UserCmd::Add(args) => {
+                let (user, generated_secret) = resolve_user_add(args)?;
+                let summary = format!(
+                    "user {} uid={} gid={} access_key={}",
+                    user.username, user.uid, user.gid, user.access_key
+                );
+
+                match backend {
+                    Backend::Openbao => {
+                        let admin = openbao_admin(&openbao).await?;
+                        admin.upsert_user(user).await?;
+                    }
+                    Backend::Yaml => {
+                        let path = require_yaml_path(&yaml_path)?;
+                        let mut doc = load_yaml_or_default(&path)?;
+                        yaml_user_upsert(&mut doc, user);
+                        save_directory_yaml_file(path.to_str().unwrap(), &doc)?;
+                    }
                 }
-                Backend::Yaml => {
-                    let path = require_yaml_path(&yaml_path)?;
-                    let mut doc = load_yaml_or_default(&path)?;
-                    let user = UserDoc {
-                        access_key: args.access_key,
-                        secret_key: args.secret_key,
-                        username:   args.username,
-                        uid:        args.uid,
-                        gid:        args.gid,
-                    };
-                    yaml_user_upsert(&mut doc, user);
-                    save_directory_yaml_file(path.to_str().unwrap(), &doc)?;
-                    println!("ok");
+
+                println!("ok");
+                println!("{summary}");
+                // Only shown when generated here — a caller-supplied secret is
+                // already in the caller's hands, and this one is unrecoverable
+                // afterwards.
+                if let Some(secret) = generated_secret {
+                    println!("secret_key={secret}");
                 }
-            },
+            }
 
             UserCmd::Rm(args) => match backend {
                 Backend::Openbao => {
@@ -874,4 +948,78 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(username: &str) -> UserAddArgs {
+        UserAddArgs {
+            username:   username.to_string(),
+            access_key: None,
+            secret_key: None,
+            // Supplied so the resolution path under test never depends on the
+            // build host's passwd database.
+            uid:        Some(1001),
+            gid:        Some(2002),
+        }
+    }
+
+    #[test]
+    fn username_only_derives_access_key_and_secret() {
+        let (user, generated) = resolve_user_add(args("alice")).expect("resolve");
+
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.access_key, "alice");
+        assert_eq!(generated.as_deref(), Some(user.secret_key.as_str()));
+        assert_eq!(user.secret_key.len(), 43); // 32 bytes, URL-safe base64, no pad
+    }
+
+    #[test]
+    fn user_name_and_derived_access_key_are_lower_cased() {
+        let (user, _) = resolve_user_add(args("Robert.Redl")).expect("resolve");
+
+        assert_eq!(user.username, "robert.redl");
+        assert_eq!(user.access_key, "robert.redl");
+    }
+
+    /// SigV4 compares access keys byte-for-byte against what the client sends,
+    /// so an explicitly named one is stored exactly as typed.
+    #[test]
+    fn explicit_access_key_keeps_its_case() {
+        let (user, _) = resolve_user_add(UserAddArgs {
+            access_key: Some("TESTACCESSKEY123".into()),
+            ..args("Alice")
+        })
+        .expect("resolve");
+
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.access_key, "TESTACCESSKEY123");
+    }
+
+    #[test]
+    fn explicit_secret_key_is_kept_and_not_reported_as_generated() {
+        let (user, generated) =
+            resolve_user_add(UserAddArgs { secret_key: Some("sekrit".into()), ..args("alice") })
+                .expect("resolve");
+
+        assert_eq!(user.secret_key, "sekrit");
+        assert_eq!(generated, None);
+    }
+
+    #[test]
+    fn two_generated_secrets_differ() {
+        let (a, _) = resolve_user_add(args("alice")).expect("resolve");
+        let (b, _) = resolve_user_add(args("alice")).expect("resolve");
+        assert_ne!(a.secret_key, b.secret_key);
+    }
+
+    /// A user name that cannot be a valid access key must fail at creation
+    /// rather than produce a user no ACL grant could ever name.
+    #[test]
+    fn user_name_that_is_not_a_valid_access_key_is_rejected() {
+        assert!(resolve_user_add(args("foo/bar")).is_err());
+        assert!(resolve_user_add(args("")).is_err());
+    }
 }
