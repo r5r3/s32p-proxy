@@ -3146,27 +3146,25 @@ async fn handle_put_object(
     // don't send If-Match on dir markers, and the precondition path below
     // assumes a regular file (etag-from-inode, etc.).
     if key.ends_with('/') {
-        // Markers are 0-byte by S3 convention. Require an explicit
-        // Content-Length: 0 and reject anything else rather than silently
-        // dropping a body the client thought we'd store.
-        let claimed_len = req
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        match claimed_len {
-            Some(0) => {}
-            Some(_) => {
+        // Markers are 0-byte by S3 convention. Require an explicit zero
+        // length and reject anything else rather than silently dropping a
+        // body the client thought we'd store. The size is read through
+        // compute_logical_len because an aws-chunked body carries no
+        // Content-Length at all — it announces its length in
+        // `x-amz-decoded-content-length`.
+        match compute_logical_len(req.headers()) {
+            Ok((_, 0)) => {}
+            Ok(_) => {
                 return s32p_support::s3resp::invalid_request(
                     "directory-marker PUT must have zero length",
                     Some(req.uri().path()),
                 );
             }
-            None => {
+            Err(e) => {
                 return s32p_support::s3resp::s3_error(
                     StatusCode::BAD_REQUEST,
                     s32p_support::s3xml::error_code::INVALID_REQUEST,
-                    "missing Content-Length",
+                    &e.to_string(),
                     Some(req.uri().path()),
                     None,
                 );
@@ -3294,8 +3292,14 @@ async fn handle_put_object(
         }
     }
 
-    // Still require Content-Length at HTTP layer
-    if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
+    // A plain body must announce its size in Content-Length — that is the
+    // only length the write path can trust. An aws-chunked body announces
+    // it in `x-amz-decoded-content-length` and rides `Transfer-Encoding:
+    // chunked`, so it legitimately has no Content-Length; compute_logical_len
+    // has already taken its size from the decoded header. AWS SDKs send
+    // exactly that shape for an ordinary upload over https, where the
+    // default CRC32 checksum moves into an aws-chunked trailer.
+    if !is_aws_chunked && req.headers().get(http::header::CONTENT_LENGTH).is_none() {
         return s32p_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
             s32p_support::s3xml::error_code::INVALID_REQUEST,
@@ -3574,10 +3578,10 @@ async fn handle_put_object_append(
         }
     };
 
-    // HTTP layer must still announce a Content-Length (or aws-chunked
-    // payload metadata, captured by compute_logical_len). Mirror the
-    // ordinary PUT check.
-    if req.headers().get(http::header::CONTENT_LENGTH).is_none() {
+    // Mirror the ordinary PUT check: Content-Length is required only for
+    // a plain body. An aws-chunked one carries its length in
+    // `x-amz-decoded-content-length` (already resolved into `logical_len`).
+    if !is_aws_chunked && req.headers().get(http::header::CONTENT_LENGTH).is_none() {
         return s32p_support::s3resp::s3_error(
             StatusCode::BAD_REQUEST,
             s32p_support::s3xml::error_code::INVALID_REQUEST,
