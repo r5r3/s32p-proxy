@@ -682,29 +682,8 @@ async fn handle_upload_part(
 
     let (is_aws_chunked, logical_len) = match crate::compute_logical_len(req.headers()) {
         Ok(v) => v,
-        Err(e) => {
-            return s32p_support::s3resp::s3_error(
-                StatusCode::BAD_REQUEST,
-                s32p_support::s3xml::error_code::INVALID_REQUEST,
-                &e.to_string(),
-                Some(req.uri().path()),
-                None,
-            );
-        }
+        Err(e) => return e.into_response(req.uri().path()),
     };
-
-    // Need Content-Length at HTTP layer (consistent with PutObject) — but
-    // only for a plain body: an aws-chunked part has none, and its size
-    // came from `x-amz-decoded-content-length` above.
-    if !is_aws_chunked && req.headers().get(http::header::CONTENT_LENGTH).is_none() {
-        return s32p_support::s3resp::s3_error(
-            StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
-            "missing Content-Length",
-            Some(req.uri().path()),
-            None,
-        );
-    }
 
     let bucket_root = match bucket_root_path(&cfg.posix_root, bucket) {
         Ok(p) => p,

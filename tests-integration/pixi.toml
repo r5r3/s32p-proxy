@@ -36,6 +36,7 @@ awscli = ">=2.34.46,<3"             # backs the aws-cli client adapter
 mountpoint-s3 = ">=1.21.0,<2"       # FUSE mount of an S3 bucket; directory-bucket-aware
 rclone = ">=1.69,<2"                # FUSE mount of an S3 bucket via the generic S3 backend
 restic = ">=0.18,<1"                # backup tool driven against the proxy's S3 backend
+curl = ">=8.21.0,<9"
 
 [feature.dev.dependencies]
 ruff = "*"

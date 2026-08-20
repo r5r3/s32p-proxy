@@ -65,6 +65,12 @@ class ProxyHarness:
     listen_port: int = 0  # 0 = auto-pick
     region: str = "us-east-1"
     public_scheme: str = "http"
+    # TLS material for the public listener. The proxy requires both when
+    # `public_scheme` is "https" (config.rs rejects the config otherwise),
+    # and it runs the key through the same secret-file check as the
+    # directory file: mode 0600 or stricter, owned by the proxy uid.
+    tls_cert_path: Path | None = None
+    tls_key_path: Path | None = None
     log_level: str = (
         "s32p_proxy=info,s32p_gateway=info,pingora=warn,pingora_proxy=warn"
     )
@@ -151,21 +157,30 @@ class ProxyHarness:
             # spawn time; not exposed as a YAML placeholder.
         }
 
+        server: dict = {
+            "listen": f"{self.listen_host}:{self.listen_port}",
+            "public_scheme": self.public_scheme,
+            "region": self.region,
+            "log_level": self.log_level,
+            "shutdown_grace_period_secs": 5,
+            "virtual_hosted_suffixes": list(self.virtual_hosted_suffixes),
+            "connection_limits": {
+                "max_concurrent_requests_per_ip": self.max_concurrent_requests_per_ip,
+                "keepalive_idle_secs": self.keepalive_idle_secs,
+                "trusted_loopback_bypass": self.trusted_loopback_bypass,
+            },
+        }
+        if self.public_scheme == "https":
+            if self.tls_cert_path is None or self.tls_key_path is None:
+                raise ValueError(
+                    "public_scheme='https' needs tls_cert_path and tls_key_path"
+                )
+            server["tls_cert_path"] = str(self.tls_cert_path)
+            server["tls_key_path"] = str(self.tls_key_path)
+
         return {
             "version": 1,
-            "server": {
-                "listen": f"{self.listen_host}:{self.listen_port}",
-                "public_scheme": self.public_scheme,
-                "region": self.region,
-                "log_level": self.log_level,
-                "shutdown_grace_period_secs": 5,
-                "virtual_hosted_suffixes": list(self.virtual_hosted_suffixes),
-                "connection_limits": {
-                    "max_concurrent_requests_per_ip": self.max_concurrent_requests_per_ip,
-                    "keepalive_idle_secs": self.keepalive_idle_secs,
-                    "trusted_loopback_bypass": self.trusted_loopback_bypass,
-                },
-            },
+            "server": server,
             "auth": self.auth_config or {
                 "backend": "yaml",
                 "yaml": {"path": str(self.directory_path)},

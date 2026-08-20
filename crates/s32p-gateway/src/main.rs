@@ -3015,13 +3015,40 @@ async fn handle_list_objects_v1(
 // PutObject and other write operations
 // -------------------------
 
-fn parse_u64_header(headers: &HeaderMap, name: &str) -> Result<u64> {
+/// Why the body length could not be determined. The two cases get
+/// different answers: a length the client never sent is `411 Length
+/// Required` (AWS's `MissingContentLength`), while one that is present but
+/// unusable is a malformed request.
+#[derive(Debug)]
+pub(crate) enum LengthError {
+    /// The header announcing the body size is absent.
+    Missing(&'static str),
+    /// Present but not a u64 (non-UTF-8, or not an integer).
+    Malformed(String),
+}
+
+impl LengthError {
+    pub(crate) fn into_response(self, resource: &str) -> Resp {
+        match self {
+            LengthError::Missing(header) => s32p_support::s3resp::missing_content_length(
+                &format!("missing header {header}"),
+                Some(resource),
+            ),
+            LengthError::Malformed(msg) => {
+                s32p_support::s3resp::invalid_request(&msg, Some(resource))
+            }
+        }
+    }
+}
+
+fn parse_u64_header(headers: &HeaderMap, name: &'static str) -> Result<u64, LengthError> {
     let v = headers
         .get(name)
-        .ok_or_else(|| anyhow!("missing header {name}"))?
+        .ok_or(LengthError::Missing(name))?
         .to_str()
-        .map_err(|_| anyhow!("invalid utf8 in header {name}"))?;
-    v.parse::<u64>().map_err(|_| anyhow!("invalid integer in header {name}: {v}"))
+        .map_err(|_| LengthError::Malformed(format!("invalid utf8 in header {name}")))?;
+    v.parse::<u64>()
+        .map_err(|_| LengthError::Malformed(format!("invalid integer in header {name}: {v}")))
 }
 
 pub(crate) fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)> {
@@ -3075,7 +3102,7 @@ pub(crate) fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String)>
 /// uppercase but the canonical-request layer is byte-exact, leaving the
 /// header value the SDK chooses) covers the current taxonomy and any future
 /// `STREAMING-*-TRAILER` variants without another code change.
-fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64)> {
+fn compute_logical_len(headers: &HeaderMap) -> Result<(bool, u64), LengthError> {
     let is_streaming = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
@@ -3160,15 +3187,7 @@ async fn handle_put_object(
                     Some(req.uri().path()),
                 );
             }
-            Err(e) => {
-                return s32p_support::s3resp::s3_error(
-                    StatusCode::BAD_REQUEST,
-                    s32p_support::s3xml::error_code::INVALID_REQUEST,
-                    &e.to_string(),
-                    Some(req.uri().path()),
-                    None,
-                );
-            }
+            Err(e) => return e.into_response(req.uri().path()),
         }
 
         if let Err(e) = std::fs::create_dir_all(&obj_path) {
@@ -3210,15 +3229,7 @@ async fn handle_put_object(
     // pick decoded length for streaming payloads
     let (is_aws_chunked, logical_len) = match compute_logical_len(req.headers()) {
         Ok(v) => v,
-        Err(e) => {
-            return s32p_support::s3resp::s3_error(
-                StatusCode::BAD_REQUEST,
-                s32p_support::s3xml::error_code::INVALID_REQUEST,
-                &e.to_string(),
-                Some(req.uri().path()),
-                None,
-            );
-        }
+        Err(e) => return e.into_response(req.uri().path()),
     };
 
     // S3 Express directory-bucket append (PutObject with
@@ -3290,23 +3301,6 @@ async fn handle_put_object(
                 Some(req.uri().path()),
             );
         }
-    }
-
-    // A plain body must announce its size in Content-Length — that is the
-    // only length the write path can trust. An aws-chunked body announces
-    // it in `x-amz-decoded-content-length` and rides `Transfer-Encoding:
-    // chunked`, so it legitimately has no Content-Length; compute_logical_len
-    // has already taken its size from the decoded header. AWS SDKs send
-    // exactly that shape for an ordinary upload over https, where the
-    // default CRC32 checksum moves into an aws-chunked trailer.
-    if !is_aws_chunked && req.headers().get(http::header::CONTENT_LENGTH).is_none() {
-        return s32p_support::s3resp::s3_error(
-            StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
-            "missing Content-Length",
-            Some(req.uri().path()),
-            None,
-        );
     }
 
     // Extract and validate the optional `x-amz-tagging` header up front.
@@ -3577,19 +3571,6 @@ async fn handle_put_object_append(
             );
         }
     };
-
-    // Mirror the ordinary PUT check: Content-Length is required only for
-    // a plain body. An aws-chunked one carries its length in
-    // `x-amz-decoded-content-length` (already resolved into `logical_len`).
-    if !is_aws_chunked && req.headers().get(http::header::CONTENT_LENGTH).is_none() {
-        return s32p_support::s3resp::s3_error(
-            StatusCode::BAD_REQUEST,
-            s32p_support::s3xml::error_code::INVALID_REQUEST,
-            "missing Content-Length",
-            Some(&uri_path),
-            None,
-        );
-    }
 
     // Open the destination. `WriteExistingNoTrunc` => O_WRONLY without
     // O_CREAT / O_TRUNC, so a missing key surfaces as NotFound and we

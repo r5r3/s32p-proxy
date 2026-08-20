@@ -17,6 +17,7 @@ import os
 import pwd
 import shutil
 import socket
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,15 +130,16 @@ def pytest_runtest_makereport(item, call):
     rep = outcome.get_result()
     if rep.when != "call" or not rep.failed:
         return
-    harness = getattr(item.session, "_s32p_harness", None)
-    if harness is None:
-        return
-    try:
-        log_bytes = harness.log_path.read_bytes()
-    except OSError:
-        return
-    tail = log_bytes[-_PROXY_LOG_TAIL_BYTES:].decode("utf-8", "replace")
-    rep.sections.append((f"proxy log tail ({harness.log_path})", tail))
+    for attr in ("_s32p_harness", "_s32p_tls_harness"):
+        harness = getattr(item.session, attr, None)
+        if harness is None:
+            continue
+        try:
+            log_bytes = harness.log_path.read_bytes()
+        except OSError:
+            continue
+        tail = log_bytes[-_PROXY_LOG_TAIL_BYTES:].decode("utf-8", "replace")
+        rep.sections.append((f"proxy log tail ({harness.log_path})", tail))
 
 
 # ----------------------------------------------------------------- client matrix
@@ -583,3 +585,124 @@ def acl_bucket(proxy_harness):
         _wipe_bucket_contents(data_dir)
         return name, BackendFs(root=data_dir)
     return lease
+
+
+# ------------------------------------------------------------------- TLS harness
+#
+# A second, minimal proxy with `public_scheme: https`. It exists because the
+# checksum shape an AWS SDK puts on the wire depends on the endpoint scheme:
+# over https botocore moves the default CRC32 checksum into an aws-chunked
+# trailer and drops Content-Length entirely
+# (botocore/httpchecksum.py::resolve_request_checksum_algorithm). The main
+# harness is plain HTTP, so no client in the matrix can produce that shape.
+#
+# Deliberately separate from `proxy_harness` rather than a flag on it: only
+# boto3 is wired for CA trust, and the CLI/FUSE adapters would fail against a
+# TLS listener until they grow a `--cacert` equivalent.
+
+TLS_BUCKET = "tls-bucket"
+
+
+@pytest.fixture(scope="session")
+def tls_material(tmp_path_factory) -> tuple[Path, Path]:
+    """Self-signed cert + key for the TLS listener.
+
+    Generated per run rather than checked in: a committed cert expires, and
+    its key would be a private key living in the repo. `openssl` ships in the
+    pixi env, so this costs no extra dependency.
+
+    The SANs cover both addressing styles — the loopback IP for path-style,
+    the nip.io wildcard for virtual-hosted. A wildcard matches one label
+    only, so a bucket name containing a dot would not verify under virtual
+    addressing.
+    """
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not on PATH; cannot generate TLS material")
+
+    d = tmp_path_factory.mktemp("tls")
+    cert, key = d / "cert.pem", d / "key.pem"
+    proc = subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert),
+            "-days", "30", "-subj", "/CN=s32p-test",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1,DNS:localhost,"
+            f"DNS:{VIRTUAL_HOSTED_SUFFIX},DNS:*.{VIRTUAL_HOSTED_SUFFIX}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"openssl could not generate TLS material: {proc.stderr.strip()}")
+
+    # The proxy puts the key through its secret-file check (owner-only mode,
+    # owned by the proxy uid) and refuses to start otherwise; openssl writes
+    # 0644 by default.
+    key.chmod(0o600)
+    return cert, key
+
+
+@pytest.fixture(scope="session")
+def tls_proxy_harness(tmp_path_factory, request, tls_material) -> ProxyHarness:
+    """Session-scoped TLS proxy: one user, one bucket. Only created when a
+    test actually asks for it."""
+    if request.config.getoption("--proxy-url"):
+        pytest.skip("--proxy-url targets an external endpoint; no local TLS proxy")
+
+    cert, key = tls_material
+    session_dir = tmp_path_factory.mktemp("s32p-tls")
+    me = pwd.getpwuid(os.getuid())
+
+    harness = ProxyHarness(
+        session_dir=session_dir,
+        public_scheme="https",
+        tls_cert_path=cert,
+        tls_key_path=key,
+    )
+    harness.directory.add_user(User(
+        access_key=TEST_ACCESS_KEY,
+        secret_key=TEST_SECRET_KEY,
+        username=me.pw_name,
+        uid=me.pw_uid,
+        gid=me.pw_gid,
+    ))
+    harness.directory.add_bucket(Bucket(
+        name=TLS_BUCKET,
+        data_path=session_dir / "buckets" / TLS_BUCKET,
+        grants=(Grant("ak", TEST_ACCESS_KEY, "read_write"),),
+        bucket_id="bkt-tls",
+    ))
+
+    harness.start()
+    request.session._s32p_tls_harness = harness
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+@pytest.fixture(scope="session")
+def tls_endpoint(tls_proxy_harness, tls_material) -> Endpoint:
+    """Endpoint for the TLS proxy, carrying the CA bundle to trust."""
+    cert, _ = tls_material
+    return Endpoint(
+        base_url=tls_proxy_harness.base_url,
+        region=tls_proxy_harness.region,
+        access_key=TEST_ACCESS_KEY,
+        secret_key=TEST_SECRET_KEY,
+        ca_bundle=str(cert),
+    )
+
+
+@pytest.fixture
+def tls_bucket(tls_proxy_harness) -> str:
+    """The TLS harness owns a single bucket; wiped before each test rather
+    than leased from a pool."""
+    _wipe_bucket_contents(tls_proxy_harness.session_dir / "buckets" / TLS_BUCKET)
+    return TLS_BUCKET
+
+
+@pytest.fixture
+def tls_bucket_fs(tls_proxy_harness, tls_bucket) -> BackendFs:
+    return BackendFs(root=tls_proxy_harness.session_dir / "buckets" / tls_bucket)

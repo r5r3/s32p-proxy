@@ -41,6 +41,13 @@ pub mod error_code {
     // for precondition checks
     pub const PRECONDITION_FAILED: &str = "PreconditionFailed";
 
+    /// The request did not declare a body length. AWS S3 answers this with
+    /// `411 Length Required`. Over HTTP/1.1 a client cannot really hit it
+    /// (the framing forces either `Content-Length` or chunked transfer),
+    /// but HTTP/2 frames bodies with DATA + END_STREAM, so a length-less
+    /// PUT is well-formed at the protocol layer and has to be refused here.
+    pub const MISSING_CONTENT_LENGTH: &str = "MissingContentLength";
+
     /// A retry of an idempotent operation (`x-amz-client-token`) reused
     /// the same token for a *different* request payload. AWS surfaces
     /// this as 409 with this code in services that support idempotency

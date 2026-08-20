@@ -27,6 +27,10 @@ is signed as `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, which `SigV4Auth`
 selects when the request context marks the checksum as trailer-located
 (`botocore/auth.py::_is_streaming_checksum_payload`).
 
+The last test closes the loop over TLS: against the `tls_endpoint`
+harness a stock boto3 client — no checksum configuration at all — produces
+the shape by itself, which is the reproducer from the bug report.
+
 Handlers:  crates/s32p-gateway/src/main.rs::handle_put_object
            crates/s32p-gateway/src/multipart.rs::handle_upload_part
 Length:    crates/s32p-gateway/src/main.rs::compute_logical_len
@@ -40,6 +44,7 @@ import os
 import stat
 from urllib.parse import quote
 
+import boto3
 import botocore.auth
 import botocore.awsrequest
 import botocore.credentials
@@ -159,3 +164,47 @@ def test_upload_part_aws_chunked_without_content_length(
         MultipartUpload={"Parts": [{"ETag": resp.headers["ETag"], "PartNumber": 1}]},
     )
     assert bucket_fs.read(key) == body
+
+
+# ------------------------------------------------------- end-to-end over https
+
+
+def test_default_boto3_client_put_object_over_https(
+    tls_endpoint, tls_bucket, tls_bucket_fs
+):
+    """A default-configured client against an https endpoint — the report's
+    own reproducer, with nothing hand-built.
+
+    The header assertions keep the test honest: without them it would still
+    pass if botocore ever stopped chunking, silently covering nothing.
+    """
+    sent: dict[str, dict[str, str]] = {}
+
+    def _capture(request, **_kwargs):
+        # Header values are bytes at before-send time.
+        sent["headers"] = {
+            k.lower(): v.decode() if isinstance(v, bytes) else v
+            for k, v in request.headers.items()
+        }
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=tls_endpoint.base_url,
+        region_name=tls_endpoint.region,
+        aws_access_key_id=tls_endpoint.access_key,
+        aws_secret_access_key=tls_endpoint.secret_key,
+        verify=tls_endpoint.ca_bundle,
+    )
+    s3.meta.events.register("before-send.s3.PutObject", _capture)
+
+    key = "https/probe.dat"
+    body = os.urandom(1024)
+    s3.put_object(Bucket=tls_bucket, Key=key, Body=body)
+
+    headers = sent["headers"]
+    assert "content-length" not in headers, headers
+    assert headers.get("content-encoding") == "aws-chunked", headers
+    assert headers.get("x-amz-content-sha256") == "STREAMING-UNSIGNED-PAYLOAD-TRAILER", headers
+    assert headers.get("x-amz-decoded-content-length") == str(len(body)), headers
+
+    assert tls_bucket_fs.read(key) == body

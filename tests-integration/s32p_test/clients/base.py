@@ -120,6 +120,10 @@ class Endpoint:
     # URL constructed from this suffix to its SDK so the SDK's URL
     # rewriter prepends the bucket as a host label.
     virtual_hosted_suffix: str | None = None
+    # Path to the CA bundle (here: the self-signed cert itself) that a
+    # client must trust to talk to a TLS-enabled proxy. None for plain
+    # HTTP endpoints, where clients pass no `verify` / `--cacert`.
+    ca_bundle: str | None = None
 
     def url_for_addressing(self, addressing: str) -> str:
         """Return the endpoint URL the SDK should be configured with for a

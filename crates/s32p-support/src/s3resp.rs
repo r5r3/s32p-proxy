@@ -161,6 +161,17 @@ pub fn invalid_request(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(StatusCode::BAD_REQUEST, s3xml::error_code::INVALID_REQUEST, message, resource, None)
 }
 
+/// Convenience: MissingContentLength (411).
+pub fn missing_content_length(message: &str, resource: Option<&str>) -> HttpResponse {
+    s3_error(
+        StatusCode::LENGTH_REQUIRED,
+        s3xml::error_code::MISSING_CONTENT_LENGTH,
+        message,
+        resource,
+        None,
+    )
+}
+
 /// Convenience: AccessDenied (403).
 pub fn access_denied(message: &str, resource: Option<&str>) -> HttpResponse {
     s3_error(StatusCode::FORBIDDEN, s3xml::error_code::ACCESS_DENIED, message, resource, None)

@@ -31,24 +31,23 @@ const PREFIX_CHARS: usize = 8;
 /// Visual marker appended after the truncated value.
 const ELLIPSIS: char = '…';
 
-/// Redact SigV4 credentials in `uri`'s query for log output. If the URI
-/// has no query, returns it unchanged. Scheme, authority, path, and
-/// fragment are preserved.
+/// Redact SigV4 credentials in `uri`'s query for log output, rendering
+/// `path[?query]`.
+///
+/// Scheme and authority are deliberately dropped. An HTTP/1.1 request
+/// arrives in origin-form (`/bucket/key`), while HTTP/2 carries `:scheme`
+/// and `:authority` as pseudo-headers and reconstructs an absolute URI
+/// (`https://host:port/bucket/key`) — logging the URI verbatim would make
+/// every access-log line depend on the protocol version the client
+/// happened to negotiate. The host is emitted as its own field on the
+/// same log entry, so nothing is lost.
 pub fn redact_uri_for_log(uri: &http::Uri) -> String {
     let Some(q) = uri.query() else {
-        return uri.to_string();
+        return uri.path().to_string();
     };
     let redacted = redact_query_for_log(q);
 
-    // Rebuild: [scheme://authority]path?redacted
-    let mut out = String::with_capacity(uri.path().len() + redacted.len() + 16);
-    if let Some(s) = uri.scheme_str() {
-        out.push_str(s);
-        out.push_str("://");
-    }
-    if let Some(a) = uri.authority() {
-        out.push_str(a.as_str());
-    }
+    let mut out = String::with_capacity(uri.path().len() + redacted.len() + 1);
     out.push_str(uri.path());
     out.push('?');
     out.push_str(&redacted);
@@ -218,15 +217,25 @@ mod tests {
     }
 
     #[test]
-    fn redact_uri_preserves_authority_and_scheme() {
-        // http::Uri can carry scheme+authority on absolute URIs.
+    fn redact_uri_drops_authority_and_scheme() {
+        // An absolute URI is what an HTTP/2 request looks like after the
+        // :scheme / :authority pseudo-headers are folded in. The log line
+        // must match the origin-form an HTTP/1.1 client produces, so that
+        // access logs don't vary with the negotiated protocol version.
         let u: http::Uri = "http://example.com:9000/bucket/key?X-Amz-Signature=\
             0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             .parse()
             .unwrap();
         let got = redact_uri_for_log(&u);
-        assert!(got.starts_with("http://example.com:9000/bucket/key?"), "got: {got}");
+        assert!(got.starts_with("/bucket/key?"), "got: {got}");
+        assert!(!got.contains("example.com"), "got: {got}");
         assert!(got.contains("X-Amz-Signature=01234567…"));
+    }
+
+    #[test]
+    fn redact_uri_drops_authority_when_there_is_no_query() {
+        let u: http::Uri = "https://example.com:9000/bucket/key".parse().unwrap();
+        assert_eq!(redact_uri_for_log(&u), "/bucket/key");
     }
 
     #[test]
