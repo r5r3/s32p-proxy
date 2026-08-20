@@ -25,6 +25,7 @@ the `--mode=multi-uid` pytest option.
 from __future__ import annotations
 
 import socket
+import ssl
 import subprocess
 import time
 from contextlib import closing
@@ -45,12 +46,33 @@ def _alloc_port(host: str = "127.0.0.1") -> int:
         return s.getsockname()[1]
 
 
-def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+def _port_open(host: str, port: int, timeout: float = 0.25, *, tls: bool = False) -> bool:
+    """Liveness probe for the listener.
+
+    With `tls=True` the probe completes a handshake before closing. A bare
+    TCP connect against a TLS listener is accepted and then hits EOF
+    mid-handshake, which pingora logs at ERROR — noise that lands in every
+    failed test's attached log tail and reads like a real fault.
+
+    Certificate validation is deliberately skipped: this asks "is the
+    listener accepting connections", not "is the cert trustworthy", and
+    the harness cert is self-signed anyway.
+    """
     try:
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-            s.settimeout(timeout)
-            s.connect((host, port))
-            return True
+        with closing(socket.create_connection((host, port), timeout=timeout)) as raw:
+            if not tls:
+                return True
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            tls_sock = ctx.wrap_socket(raw, server_hostname=host)
+            try:
+                tls_sock.unwrap()  # close_notify, so the server sees a clean close
+            except OSError:
+                pass  # server closed first; the handshake still completed
+            finally:
+                tls_sock.close()
+        return True
     except OSError:
         return False
 
@@ -269,7 +291,9 @@ class ProxyHarness:
                 rc = self._proc.returncode
                 self._tear_down_attempt()
                 return f"proxy exited early (rc={rc})"
-            if _port_open(self.listen_host, self.listen_port):
+            if _port_open(
+                self.listen_host, self.listen_port, tls=self.public_scheme == "https"
+            ):
                 return None
             time.sleep(0.05)
         # Deadline expired without the port opening — kill, return reason.
