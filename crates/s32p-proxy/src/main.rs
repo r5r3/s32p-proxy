@@ -967,7 +967,17 @@ async fn validate_sigv4_header_only_or_reject(
     }
 }
 
-fn rustls_prefer_fast_cipher() -> Result<()> {
+/// Install aws-lc-rs as the process-wide rustls provider, ordered so the
+/// fastest cipher is preferred.
+///
+/// Returns `false` if another component had already installed a provider,
+/// in which case that provider's cipher order applies instead. pingora
+/// installs `ring` from inside `TlsSettings::build()` (and ignores the
+/// error if one is already present), so losing this race is a normal
+/// condition, not a corrupted state — it costs a performance preference,
+/// which is not worth aborting startup over.
+#[must_use]
+fn rustls_prefer_fast_cipher() -> bool {
     // Prefer AES-128 first, then AES-256.
     //
     // NOTE: rustls uses the provider’s cipher_suites order as server preference.
@@ -992,15 +1002,19 @@ fn rustls_prefer_fast_cipher() -> Result<()> {
         //TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     ];
 
-    CryptoProvider::install_default(provider)
-        .expect("Failed to install aws-lc-rs as default TLS provider");
-    Ok(())
+    CryptoProvider::install_default(provider).is_ok()
 }
 
 fn main() -> Result<()> {
-    // ensure, that aws-lc-rs is our crypto provider
-    // aws_lc_rs::default_provider().install_default().expect("Failed to install aws-lc-rs as default TLS provider");
-    rustls_prefer_fast_cipher().unwrap();
+    // Must stay first. Every rustls consumer in this process reads the
+    // process-level provider rather than installing its own: the TLS
+    // listener, and reqwest inside the OpenBao directory client. Both
+    // `ring` and `aws-lc-rs` are linked, so there is no unambiguous
+    // built-in default for them to fall back on.
+    //
+    // Reported after the tracing subscriber is up — a warning here would
+    // be emitted before there is anything to receive it.
+    let cipher_pref_applied = rustls_prefer_fast_cipher();
 
     let cli = Cli::parse();
 
@@ -1034,6 +1048,13 @@ fn main() -> Result<()> {
         "json" => builder.json().init(),
         "text" => builder.init(),
         other => anyhow::bail!("server.log_format must be \"text\" or \"json\", got {other:?}"),
+    }
+
+    if !cipher_pref_applied {
+        tracing::warn!(
+            "a rustls CryptoProvider was already installed; \
+             AES-128-first cipher preference not applied"
+        );
     }
 
     // Build directory backend
