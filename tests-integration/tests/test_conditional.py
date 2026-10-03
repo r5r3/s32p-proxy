@@ -16,6 +16,7 @@ observable subset:
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 
 import pytest
@@ -68,6 +69,35 @@ def test_get_if_none_match_matching_returns_304(client, bucket):
         )
     except S3Error as e:
         assert e.status == 304, f"expected 304, got {e!r}"
+
+
+@pytest.mark.parametrize("new_body", [b"v2 longer", b"v2"], ids=["size-change", "same-size"])
+def test_posix_in_place_edit_invalidates_etag(client, bucket, bucket_fs, new_body):
+    """POSIX users edit files under the bucket directly; an in-place
+    rewrite keeps the inode. The ETag must still change, otherwise a sync
+    client revalidating with `If-None-Match: <old>` gets 304 and keeps the
+    stale copy. `same-size` pins the mtime term: on whole-second-mtime
+    filesystems a same-size rewrite could otherwise look unchanged, so the
+    mtime is moved explicitly as an editor would within a later second."""
+    put = client.put_object(bucket, "edited", b"v1")
+    path = bucket_fs.root / "edited"
+    ino = os.stat(path).st_ino
+    st = os.stat(path)
+
+    with open(path, "r+b") as f:  # in place: same inode
+        f.write(new_body)
+        f.truncate()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert os.stat(path).st_ino == ino
+
+    head = client.head_object(bucket, "edited")
+    assert head.etag != put.etag, "in-place POSIX edit must change the ETag"
+
+    got = client.get_object(
+        bucket, "edited", conditions=Conditions(if_none_match=put.etag)
+    )
+    assert got.body == new_body
+    assert got.etag == head.etag
 
 
 def test_get_if_none_match_mismatching_returns_content(client, bucket):

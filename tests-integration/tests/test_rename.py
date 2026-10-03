@@ -77,8 +77,8 @@ def _head_etag(endpoint, bucket: str, key: str) -> str:
 
     Conditional rename tests need a real ETag to round-trip through
     `If-Match`/`If-None-Match`/`x-amz-rename-source-if-match`. The
-    gateway's ETag is inode-based (`format!("\\\"{}\\\"", meta.ino())`),
-    so we can't predict it offline — read it from the wire instead.
+    gateway's ETag is derived from inode, mtime and size, so we can't
+    predict it offline — read it from the wire instead.
     """
     url = f"{endpoint.base_url}/{bucket}/{quote(key, safe='/')}"
     headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}

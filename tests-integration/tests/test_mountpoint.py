@@ -538,7 +538,7 @@ def test_mount_incremental_large_write_chains_appends(mount_incremental, bucket_
     """Write > 8 MiB through the mount in one go. Mountpoint-s3's default
     write-part-size is 8 MiB, so a single ~17 MiB write fans out into
     three chained appends (offset 0, 8 MiB, 16 MiB). The test fails if
-    any chunk lands at the wrong offset, or if the inode-based ETag
+    any chunk lands at the wrong offset, or if the per-append ETag
     chain breaks between chunks. Readback compares the full bytes —
     a mid-chunk corruption is visible in the assertion.
 

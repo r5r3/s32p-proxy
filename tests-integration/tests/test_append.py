@@ -87,9 +87,8 @@ def _rename_raw(
 def _head_etag(endpoint, bucket: str, key: str) -> str:
     """HEAD object and return its quoted ETag.
 
-    The gateway's ETag is inode-based and stable across in-place
-    appends, so chained `If-Match` tests can capture the ETag once and
-    pass it back on every subsequent append.
+    The ETag changes with every append, so chained `If-Match` tests
+    must feed each append's response ETag into the next request.
     """
     url = f"{endpoint.base_url}/{bucket}/{quote(key, safe='/')}"
     headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
@@ -148,9 +147,9 @@ def test_append_offset_zero_on_existing_key_replaces(endpoint, bucket, bucket_fs
 
 def test_append_chained_round_trip(endpoint, bucket, bucket_fs):
     """Emulate mountpoint's loop: four successive appends, each carrying
-    the prior ETag as `If-Match`. The inode-based ETag is stable across
-    appends so the chain reuses the same value. The final object is the
-    concatenation of all chunks."""
+    the prior response's ETag as `If-Match`. Each append yields a new
+    ETag (as on AWS), and the stale one must no longer match. The final
+    object is the concatenation of all chunks."""
     chunks = [b"alpha ", b"beta ", b"gamma ", b"delta"]
     initial = _put_raw(
         endpoint, bucket=bucket, key="chain.txt", body=chunks[0], write_offset=0,
@@ -165,9 +164,15 @@ def test_append_chained_round_trip(endpoint, bucket, bucket_fs):
             write_offset=offset, if_match=etag,
         )
         assert r.status_code == 200, (offset, r.text)
-        # Inode is stable, so the ETag chains as-is.
-        assert r.headers["ETag"] == etag, "inode-based ETag should not change on append"
+        assert r.headers["ETag"] != etag, "append must change the ETag"
+        stale, etag = etag, r.headers["ETag"]
         offset += len(chunk)
+
+    r = _put_raw(
+        endpoint, bucket=bucket, key="chain.txt", body=b"x",
+        write_offset=offset, if_match=stale,
+    )
+    assert r.status_code == 412, r.text
 
     assert bucket_fs.read("chain.txt") == b"".join(chunks)
 
