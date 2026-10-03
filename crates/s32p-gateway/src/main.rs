@@ -1856,6 +1856,11 @@ async fn handle_get_object(
                         }
                         return s32p_support::s3resp::no_such_key("not found", None);
                     }
+                    // `file.txt/x`: a path component is a regular file, so
+                    // the key cannot exist.
+                    Some(std::io::ErrorKind::NotADirectory) => {
+                        return s32p_support::s3resp::no_such_key("not found", None);
+                    }
                     Some(std::io::ErrorKind::PermissionDenied) => {
                         return s32p_support::s3resp::access_denied("permission denied", None);
                     }
@@ -1880,6 +1885,56 @@ async fn handle_get_object(
             );
         }
     };
+
+    // A directory is only addressable as a directory marker (`dir/`), which
+    // is a 0-byte object — the same shape PUT `dir/` creates and listings
+    // emit. Without the trailing slash it is not an object at all: answering
+    // 200 there makes clients that HEAD a name before using it (Finder-style
+    // file providers, Mountain Duck, S3 for iOS) see a file *and* a folder
+    // with the same name and rename one of them to "<name> 2".
+    if meta.is_dir() {
+        if !key.ends_with('/') {
+            return s32p_support::s3resp::no_such_key("not found", None);
+        }
+        let lm_st = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let last_modified = fmt_http_date(lm_st);
+        let etag_unquoted = format_inode_etag_unquoted(meta.ino());
+        let etag = format_inode_etag(meta.ino());
+        let cond = match parse_conditional_headers(req.headers()) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("invalid conditional headers: {e}");
+                return s32p_support::s3resp::invalid_request(&msg, Some(req.uri().path()));
+            }
+        };
+        match evaluate_read_preconditions(&cond, &etag_unquoted, lm_st) {
+            PreconditionOutcome::Proceed => {}
+            PreconditionOutcome::NotModified => {
+                return s32p_support::s3resp::not_modified(Some(&etag), Some(&last_modified));
+            }
+            PreconditionOutcome::PreconditionFailed => {
+                return s32p_support::s3resp::precondition_failed(
+                    "GET/HEAD precondition failed",
+                    Some(req.uri().path()),
+                );
+            }
+        }
+        return s32p_support::s3resp::object_response(
+            StatusCode::OK,
+            s32p_support::s3resp::empty_body(),
+            s32p_support::s3resp::OBJECT_CONTENT_TYPE,
+            0,
+            &etag,
+            &last_modified,
+            None,
+            &[],
+        );
+    }
+    // The converse: path joining drops a trailing slash, so `file.txt/`
+    // would otherwise open the regular file `file.txt`.
+    if key.ends_with('/') {
+        return s32p_support::s3resp::no_such_key("not found", None);
+    }
 
     let size = meta.len();
 

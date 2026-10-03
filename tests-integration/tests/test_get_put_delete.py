@@ -55,3 +55,27 @@ def test_user_metadata_roundtrip(client, bucket):
         assert got_meta.get(k.lower()) == v, f"missing/wrong meta {k!r}: {head.metadata!r}"
 
     client.delete_object(bucket, key)
+
+
+def test_directory_is_not_an_object(client, bucket):
+    """A directory on disk is reachable only as the `dir/` marker (0 bytes),
+    never as the bare name `dir`. If HEAD `dir` answered 200, file-provider
+    clients would see a file and a folder with
+    the same name and show one of them as "dir 2"."""
+    client.put_object(bucket, "dirs/sub/file.txt", b"payload")
+
+    for key in ("dirs/sub", "dirs/sub/file.txt/", "dirs/sub/file.txt/x"):
+        with pytest.raises(S3Error) as exc:
+            client.head_object(bucket, key)
+        assert exc.value.status == 404, f"HEAD {key!r}: {exc.value!r}"
+        with pytest.raises(S3Error) as exc:
+            client.get_object(bucket, key)
+        assert exc.value.status == 404, f"GET {key!r}: {exc.value!r}"
+
+    head = client.head_object(bucket, "dirs/sub/")
+    assert head.content_length == 0
+    got = client.get_object(bucket, "dirs/sub/")
+    assert got.body == b""
+    assert got.etag == head.etag
+
+    client.delete_object(bucket, "dirs/sub/file.txt")
