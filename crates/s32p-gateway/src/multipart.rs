@@ -137,6 +137,16 @@ fn sanitize_upload_id(upload_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// URL-safe base64 of `buf`, guaranteed not to start with `-`. A leading
+/// `-` makes CLIs (aws-cli `--upload-id <id>`, any getopt parser) read
+/// the upload ID as an option. The first base64 character encodes the
+/// top six bits of `buf[0]`; clearing the top bit keeps it in `A`..`f`,
+/// which also rules out `_`.
+fn encode_upload_id(buf: &mut [u8]) -> String {
+    buf[0] &= 0x7f;
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
 fn gen_upload_id() -> String {
     let mut buf = [0u8; 20];
 
@@ -144,7 +154,7 @@ fn gen_upload_id() -> String {
     {
         let rc = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if rc == buf.len() as isize {
-            return URL_SAFE_NO_PAD.encode(buf);
+            return encode_upload_id(&mut buf);
         }
     }
 
@@ -155,7 +165,7 @@ fn gen_upload_id() -> String {
     fallback[8..16].copy_from_slice(&now.subsec_nanos().to_le_bytes());
     fallback[16..24].copy_from_slice(&n.to_le_bytes());
     fallback[24..32].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
-    URL_SAFE_NO_PAD.encode(fallback)
+    encode_upload_id(&mut fallback)
 }
 
 fn lock_exclusive(path: &Path) -> Result<std::fs::File> {
@@ -2327,6 +2337,21 @@ async fn handle_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_id_never_starts_with_option_dash() {
+        // 0xf8.. / 0xfc.. would encode to a leading `-` / `_`.
+        for first in [0xf8u8, 0xfb, 0xfc, 0xff] {
+            let mut buf = [first; 20];
+            let id = encode_upload_id(&mut buf);
+            assert!(!id.starts_with(['-', '_']), "{id}");
+        }
+        for _ in 0..1000 {
+            let id = gen_upload_id();
+            assert!(!id.starts_with('-'), "{id}");
+            sanitize_upload_id(&id).unwrap();
+        }
+    }
 
     #[test]
     fn max_parts_per_upload_matches_aws_spec() {
